@@ -1,0 +1,32 @@
+{
+  "configurations": [
+    {
+      "name": "Win32",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "//wsl.localhost/Ubuntu/usr/lib/gcc/x86_64-linux-gnu/13/include",
+        "//wsl.localhost/Ubuntu/usr/local/include",
+        "//wsl.localhost/Ubuntu/usr/include/x86_64-linux-gnu",
+        "//wsl.localhost/Ubuntu/usr/include"
+      ],
+      "defines": [
+        "__linux__",
+        "__unix__",
+        "__x86_64__",
+        "__GNUC__=13",
+        "__GNUC_MINOR__=3"
+      ],
+      "compilerPath": "",
+      "cStandard": "c11",
+      "intelliSenseMode": "linux-gcc-x64"
+    },
+    {
+      "name": "Linux",
+      "includePath": ["${workspaceFolder}/**"],
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "c11",
+      "intelliSenseMode": "linux-gcc-x64"
+    }
+  ],
+  "version": 4
+}

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 int tcp_listen(uint16_t port, int backlog)
@@ -104,10 +105,46 @@ ssize_t tcp_recv_request(int fd, char *buf, size_t cap)
         if (n == 0) /* 상대가 연결을 닫음 */
             break;
 
+        /* 새로 받은 구간만 검사한다. 단 "\r\n\r\n" 이 이전 데이터와 걸칠 수
+         * 있으므로 3바이트 앞부터. (매번 처음부터 strstr 하면 O(n^2)) */
+        size_t scan_from = used >= 3 ? used - 3 : 0;
         used += (size_t)n;
         buf[used] = '\0';
-        if (strstr(buf, "\r\n\r\n") != NULL)
+        if (strstr(buf + scan_from, "\r\n\r\n") != NULL)
             break;
     }
     return (ssize_t)used;
+}
+
+int tcp_set_timeout(int fd, int ms)
+{
+    struct timeval tv = {.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0)
+        return -1;
+    return 0;
+}
+
+#define DRAIN_TIMEOUT_MS 500
+#define DRAIN_MAX_BYTES (64 * 1024)
+
+void tcp_close_graceful(int fd)
+{
+    /* 1. 더 보낼 게 없다고 알림(FIN). 상대는 응답을 다 읽고 연결을 닫는다. */
+    shutdown(fd, SHUT_WR);
+
+    /* 2. 상대가 닫을 때(recv == 0)까지 남은 데이터를 읽어 버린다.
+     *    악의적 클라이언트에 붙잡히지 않도록 시간·바이트 상한을 둔다. */
+    tcp_set_timeout(fd, DRAIN_TIMEOUT_MS);
+    char junk[4096];
+    size_t total = 0;
+    while (total < DRAIN_MAX_BYTES) {
+        ssize_t n = recv(fd, junk, sizeof(junk), 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) /* EOF, 타임아웃(EAGAIN), 오류 */
+            break;
+        total += (size_t)n;
+    }
+    close(fd);
 }

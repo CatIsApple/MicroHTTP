@@ -12,6 +12,7 @@
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
 #define RECV_BUF_SIZE 8192
+#define CLIENT_TIMEOUT_MS 5000
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -56,7 +57,10 @@ static void handle_client(int cfd, const char *peer)
     char buf[RECV_BUF_SIZE];
     ssize_t n = tcp_recv_request(cfd, buf, sizeof(buf));
     if (n < 0) {
-        fprintf(stderr, "[%s] recv error: %s\n", peer, strerror(errno));
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            fprintf(stderr, "[%s] recv timeout\n", peer);
+        else
+            fprintf(stderr, "[%s] recv error: %s\n", peer, strerror(errno));
         return;
     }
     if (n == 0) {
@@ -112,8 +116,11 @@ int main(int argc, char *argv[])
             perror("accept");
             continue;
         }
+        /* 반복 서버라 클라이언트 하나가 멈추면 전체가 멈춘다 → 타임아웃 필수 */
+        if (tcp_set_timeout(cfd, CLIENT_TIMEOUT_MS) < 0)
+            perror("setsockopt(timeout)");
         handle_client(cfd, peer);
-        close(cfd);
+        tcp_close_graceful(cfd);
     }
 
     close(lfd);

@@ -20,4 +20,13 @@ int tcp_send_all(int fd, const void *buf, size_t len);
  * 반환: 읽은 바이트 수(>=0), 오류 시 -1. buf 는 항상 NUL 종료된다. */
 ssize_t tcp_recv_request(int fd, char *buf, size_t cap);
 
+/* 송수신 타임아웃(SO_RCVTIMEO/SO_SNDTIMEO) 설정. 응답 없는 클라이언트가
+ * 서버를 무한정 붙잡지 못하게 한다. 성공 0, 실패 -1 */
+int tcp_set_timeout(int fd, int ms);
+
+/* 정상 종료: shutdown(SHUT_WR) 로 FIN 을 먼저 보내고, 남은 수신 데이터를
+ * 짧게 비운 뒤 close(). 읽지 않은 데이터가 남은 채 close 하면 커널이
+ * RST 를 보내 이미 보낸 응답이 유실될 수 있기 때문. */
+void tcp_close_graceful(int fd);
+
 #endif
