@@ -5,10 +5,11 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 int tcp_listen(uint16_t port, int backlog)
@@ -69,13 +70,51 @@ int tcp_accept(int listen_fd, char *client_addr_buf, size_t buf_len)
     return cfd;
 }
 
-int tcp_send_all(int fd, const void *buf, size_t len)
+/* ---- 전체 마감 시간(deadline) 도우미 ----
+ * SO_RCVTIMEO 는 "recv 한 번" 의 대기 시간만 제한한다. 1바이트씩 천천히
+ * 보내는 클라이언트(slowloris)는 매번 시간 안에 도착하므로 끝없이 버틴다.
+ * 그래서 시작 시각 기준으로 남은 시간을 계산해 poll() 에 넘긴다. */
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* deadline 까지 fd 에 events 가 생기길 기다린다.
+ * 1 = 준비됨, 0 = 마감 초과(errno = ETIMEDOUT), -1 = 오류 */
+static int wait_until(int fd, short events, long long deadline)
+{
+    for (;;) {
+        long long left = deadline - now_ms();
+        if (left <= 0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        struct pollfd pfd = {.fd = fd, .events = events};
+        int r = poll(&pfd, 1, (int)left);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r == 0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        return r < 0 ? -1 : 1;
+    }
+}
+
+int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms)
 {
     const char *p = buf;
+    long long deadline = now_ms() + timeout_ms;
     while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
+        if (wait_until(fd, POLLOUT, deadline) <= 0)
+            return -1;
+        /* MSG_DONTWAIT: 송신 버퍼가 일부만 비어 있어도 블로킹하지 않고
+         * 들어간 만큼만 복사한다 → 마감 시간을 넘겨 붙잡히지 않는다 */
+        ssize_t n = send(fd, p, len, MSG_DONTWAIT);
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             return -1; /* EPIPE 등: 상대가 끊음 (SIGPIPE 는 main 에서 무시) */
         }
@@ -85,20 +124,23 @@ int tcp_send_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-ssize_t tcp_recv_request(int fd, char *buf, size_t cap)
+ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms)
 {
     if (cap == 0)
         return -1;
 
     size_t used = 0;
     buf[0] = '\0';
+    long long deadline = now_ms() + timeout_ms;
 
     /* TCP 는 바이트 스트림이라 한 번의 recv 로 요청이 다 온다는 보장이 없다.
-     * 헤더 끝 표시(빈 줄)가 보일 때까지 누적해서 읽는다. */
+     * 헤더 끝 표시(빈 줄)가 보일 때까지 누적해서 읽되, 전체 마감 시간을 지킨다. */
     while (used < cap - 1) {
-        ssize_t n = recv(fd, buf + used, cap - 1 - used, 0);
+        if (wait_until(fd, POLLIN, deadline) <= 0)
+            return -1;
+        ssize_t n = recv(fd, buf + used, cap - 1 - used, MSG_DONTWAIT);
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             return -1;
         }
@@ -116,33 +158,32 @@ ssize_t tcp_recv_request(int fd, char *buf, size_t cap)
     return (ssize_t)used;
 }
 
-int tcp_set_timeout(int fd, int ms)
-{
-    struct timeval tv = {.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0)
-        return -1;
-    return 0;
-}
-
 #define DRAIN_TIMEOUT_MS 500
 #define DRAIN_MAX_BYTES (64 * 1024)
 
 void tcp_close_graceful(int fd)
 {
+    /* 읽지 않은 수신 데이터가 없으면 그냥 close 해도 RST 가 나가지 않는다.
+     * 이때는 상대의 FIN 을 기다릴 이유가 없으므로 바로 닫는다. */
+    char peek;
+    if (recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) <= 0) {
+        close(fd);
+        return;
+    }
+
     /* 1. 더 보낼 게 없다고 알림(FIN). 상대는 응답을 다 읽고 연결을 닫는다. */
     shutdown(fd, SHUT_WR);
 
-    /* 2. 상대가 닫을 때(recv == 0)까지 남은 데이터를 읽어 버린다.
-     *    악의적 클라이언트에 붙잡히지 않도록 시간·바이트 상한을 둔다. */
-    tcp_set_timeout(fd, DRAIN_TIMEOUT_MS);
+    /* 2. 남은 데이터를 읽어 버린다. 시간 상한은 호출당이 아니라 "전체" 기준이고,
+     *    바이트 상한도 함께 둬서 악의적 클라이언트에 붙잡히지 않게 한다. */
+    long long deadline = now_ms() + DRAIN_TIMEOUT_MS;
     char junk[4096];
     size_t total = 0;
-    while (total < DRAIN_MAX_BYTES) {
-        ssize_t n = recv(fd, junk, sizeof(junk), 0);
-        if (n < 0 && errno == EINTR)
+    while (total < DRAIN_MAX_BYTES && wait_until(fd, POLLIN, deadline) > 0) {
+        ssize_t n = recv(fd, junk, sizeof(junk), MSG_DONTWAIT);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
-        if (n <= 0) /* EOF, 타임아웃(EAGAIN), 오류 */
+        if (n <= 0) /* 상대가 닫음(FIN) 또는 오류 */
             break;
         total += (size_t)n;
     }

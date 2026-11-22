@@ -12,7 +12,7 @@
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
 #define RECV_BUF_SIZE 8192
-#define CLIENT_TIMEOUT_MS 5000
+#define CLIENT_TIMEOUT_MS 5000 /* 요청 수신, 응답 송신 각각의 전체 마감 시간 */
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -52,20 +52,21 @@ static int parse_port(const char *s, uint16_t *out)
 
 /* 연결 하나 처리: 요청 수신 → 응답 송신 → close
  * (HTTP 파싱/응답 생성은 다음 단계에서 구현. 지금은 고정 응답) */
-static void handle_client(int cfd, const char *peer)
+/* 반환: 응답까지 보냈으면 0, 타임아웃·오류·빈 연결이면 -1 */
+static int handle_client(int cfd, const char *peer)
 {
     char buf[RECV_BUF_SIZE];
-    ssize_t n = tcp_recv_request(cfd, buf, sizeof(buf));
+    ssize_t n = tcp_recv_request(cfd, buf, sizeof(buf), CLIENT_TIMEOUT_MS);
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        if (errno == ETIMEDOUT)
             fprintf(stderr, "[%s] recv timeout\n", peer);
         else
             fprintf(stderr, "[%s] recv error: %s\n", peer, strerror(errno));
-        return;
+        return -1;
     }
     if (n == 0) {
         printf("[%s] closed without data\n", peer);
-        return;
+        return -1;
     }
 
     /* 첫 줄(요청 라인)만 로그 */
@@ -83,8 +84,11 @@ static void handle_client(int cfd, const char *peer)
                        "%s",
                        sizeof(body) - 1, body);
 
-    if (tcp_send_all(cfd, resp, (size_t)len) < 0)
+    if (tcp_send_all(cfd, resp, (size_t)len, CLIENT_TIMEOUT_MS) < 0) {
         fprintf(stderr, "[%s] send error: %s\n", peer, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -116,11 +120,12 @@ int main(int argc, char *argv[])
             perror("accept");
             continue;
         }
-        /* 반복 서버라 클라이언트 하나가 멈추면 전체가 멈춘다 → 타임아웃 필수 */
-        if (tcp_set_timeout(cfd, CLIENT_TIMEOUT_MS) < 0)
-            perror("setsockopt(timeout)");
-        handle_client(cfd, peer);
-        tcp_close_graceful(cfd);
+        /* 반복 서버라 클라이언트 하나가 멈추면 전체가 멈춘다.
+         * recv/send 에 "전체" 마감 시간을 줘서 한 연결이 쓸 수 있는 시간을 묶는다. */
+        if (handle_client(cfd, peer) == 0)
+            tcp_close_graceful(cfd); /* 응답을 보낸 경우만 RST 방지용 정상 종료 */
+        else
+            close(cfd); /* 이미 포기한 연결은 기다리지 않고 바로 닫음 */
     }
 
     close(lfd);
