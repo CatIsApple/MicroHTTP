@@ -124,8 +124,9 @@ int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms)
     return 0;
 }
 
-ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms)
+ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len)
 {
+    *header_len = 0;
     if (cap == 0)
         return -1;
 
@@ -152,8 +153,11 @@ ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms)
         size_t scan_from = used >= 3 ? used - 3 : 0;
         used += (size_t)n;
         buf[used] = '\0';
-        if (strstr(buf + scan_from, "\r\n\r\n") != NULL)
+        char *end = strstr(buf + scan_from, "\r\n\r\n");
+        if (end != NULL) {
+            *header_len = (size_t)(end - buf) + 4; /* 빈 줄까지 포함한 헤더 길이 */
             break;
+        }
     }
     return (ssize_t)used;
 }

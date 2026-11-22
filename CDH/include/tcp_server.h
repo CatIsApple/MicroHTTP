@@ -20,8 +20,10 @@ int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms);
 /* 요청 헤더 끝("\r\n\r\n") 또는 EOF 또는 버퍼가 찰 때까지 수신.
  * timeout_ms 는 호출 "전체" 의 마감 시간(천천히 보내는 클라이언트 대비).
  * 반환: 읽은 바이트 수(>=0), 오류·초과 시 -1 (초과 시 errno = ETIMEDOUT).
+ * *header_len: 헤더 끝(빈 줄 포함)까지의 길이. 헤더 끝을 못 찾았으면 0
+ *   → 버퍼가 가득 찼다면 헤더가 너무 큰 것, 아니면 상대가 도중에 닫은 것.
  * buf 는 항상 NUL 종료된다. */
-ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms);
+ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len);
 
 /* 정상 종료. 읽지 않은 수신 데이터가 없으면 바로 close().
  * 남아 있으면 shutdown(SHUT_WR) 로 FIN 을 먼저 보내고 최대 0.5초·64KB 비운 뒤 close().
