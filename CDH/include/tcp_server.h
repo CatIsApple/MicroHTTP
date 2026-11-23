@@ -28,6 +28,11 @@ int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms); /* buf �
  * buf 는 항상 NUL 종료된다. */
 ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len); /* cap: buf 크기 */
 
+/* 정확히 len 바이트를 받을 때까지 반복 recv() (본문 수신용).
+ * timeout_ms 는 호출 "전체" 의 마감 시간. 성공 0, 실패 -1
+ * (초과 시 errno = ETIMEDOUT, 다 받기 전에 상대가 닫으면 errno = ECONNRESET) */
+int tcp_recv_exact(int fd, void *buf, size_t len, int timeout_ms); /* buf 에 len 바이트를 채움 */
+
 /* 정상 종료. 읽지 않은 수신 데이터가 없으면 바로 close().
  * 남아 있으면 shutdown(SHUT_WR) 로 FIN 을 먼저 보내고 최대 0.5초·64KB 비운 뒤 close().
  * 읽지 않은 데이터가 남은 채 close 하면 커널이 RST 를 보내 응답이 유실될 수 있기 때문. */

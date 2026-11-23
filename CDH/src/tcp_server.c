@@ -166,6 +166,29 @@ ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *
     return (ssize_t)used; /* 받은 총 바이트 수 (헤더 뒤 본문 일부가 섞여 있을 수 있음) */
 }
 
+int tcp_recv_exact(int fd, void *buf, size_t len, int timeout_ms) /* 정확히 len 바이트를 받을 때까지 반복 수신 */
+{
+    char *p = buf;                              /* 아직 안 채운 부분의 시작 위치. void* 는 산술 연산이 안 돼서 char* 로 받음 */
+    long long deadline = now_ms() + timeout_ms; /* 이 호출 전체의 마감 시각 (slowloris 대비) */
+    while (len > 0) {                           /* 남은 바이트가 있는 동안 (recv 는 일부만 줄 수 있으므로) */
+        if (wait_until(fd, POLLIN, deadline) <= 0) /* 데이터가 올 때까지 마감 시간 안에서 기다림 */
+            return -1;                          /* 시간 초과(errno=ETIMEDOUT) 또는 오류 */
+        ssize_t n = recv(fd, p, len, MSG_DONTWAIT); /* 커널 수신 버퍼 → p 로 복사. 남은 길이만큼만 (다음 요청을 먹지 않게) */
+        if (n < 0) {                            /* 실패한 경우 */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) /* 시그널 / 지금은 데이터 없음 → 일시적 */
+                continue;                       /* 다시 기다림 */
+            return -1;                          /* ECONNRESET 등 진짜 오류 */
+        }
+        if (n == 0) {                           /* 다 받기 전에 상대가 연결을 닫음 */
+            errno = ECONNRESET;                 /* 호출자가 "도중에 끊김" 으로 알 수 있게 */
+            return -1;                          /* 실패 */
+        }
+        p += n;           /* 받은 만큼 위치를 앞으로 */
+        len -= (size_t)n; /* 남은 길이 감소 */
+    }
+    return 0; /* 전부 받음 */
+}
+
 #define DRAIN_TIMEOUT_MS 500          /* 남은 데이터 비우기에 쓸 수 있는 최대 시간 (전체 기준) */
 #define DRAIN_MAX_BYTES (64 * 1024)   /* 비우기로 읽어 버릴 최대 바이트 수 */
 

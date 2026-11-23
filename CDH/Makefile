@@ -10,15 +10,17 @@ CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
 # CFLAGS 와 분리한 이유: make asan 이 CFLAGS 를 통째로 바꿔도 이 경로는 유지되도록
 CPPFLAGS += -Iinclude
 
-# 소스 파일 목록
-SRCS := src/main.c src/tcp_server.c
+# 라이브러리 소스: main 을 뺀 모듈들 (서버 실행 파일과 단위 테스트가 함께 씀)
+LIB_SRCS := src/tcp_server.c src/http_parser.c src/http_body.c src/http_response.c
+# 서버 소스 목록 = main + 라이브러리
+SRCS := src/main.c $(LIB_SRCS)
 # 오브젝트 파일 목록: src/xxx.c → build/xxx.o 로 이름만 바꿔서 만듦
 OBJS := $(SRCS:src/%.c=build/%.o)
 # 최종 실행 파일 이름
 BIN  := microhttp
 
 # 실제 파일 이름이 아닌 "명령" 타깃이라고 표시 (같은 이름의 파일이 있어도 항상 실행)
-.PHONY: all clean asan
+.PHONY: all clean asan test
 
 # 기본 타깃: 그냥 make 하면 실행 파일을 만든다
 all: $(BIN)
@@ -27,9 +29,9 @@ all: $(BIN)
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-# 컴파일: .c 하나 → .o 하나. 헤더가 바뀌어도 다시 컴파일되도록 의존성에 헤더 포함.
+# 컴파일: .c 하나 → .o 하나. include/ 의 헤더가 바뀌어도 다시 컴파일되도록 의존성에 헤더 포함.
 # "| build" = build 폴더가 있어야 함(order-only: 폴더 시각이 바뀌었다고 다시 컴파일하지는 않음). $< = 첫 번째 의존 파일(.c)
-build/%.o: src/%.c include/tcp_server.h | build
+build/%.o: src/%.c $(wildcard include/*.h) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 # build 폴더 만들기 (-p: 이미 있어도 에러 없음)
@@ -40,6 +42,25 @@ build:
 # -O1 + -fno-omit-frame-pointer 는 오류 발생 시 호출 스택을 정확히 보여 주기 위함
 asan: clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address,undefined"
+
+# ---- 단위 테스트 ----
+# tests/test_*.c 하나가 실행 파일 하나 (build/tests/test_xxx).
+# 항상 sanitizer 를 켜서 빌드 → 메모리 오류·정의되지 않은 동작도 테스트 실패로 잡는다.
+TEST_SRCS := $(wildcard tests/test_*.c)
+TEST_BINS := $(TEST_SRCS:tests/%.c=build/tests/%)
+TEST_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+
+# make test: 모든 테스트를 빌드한 뒤 차례로 실행. 하나라도 실패하면 make 도 실패(종료 코드 != 0)
+test: $(TEST_BINS)
+	@for t in $(TEST_BINS); do ./$$t || exit 1; done
+	@echo "all tests passed"
+
+# 테스트 실행 파일 하나 = 테스트 .c + 라이브러리 소스 전부 (main.c 제외)
+build/tests/%: tests/%.c $(LIB_SRCS) $(wildcard include/*.h) tests/test.h | build/tests
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ $< $(LIB_SRCS)
+
+build/tests:
+	mkdir -p build/tests
 
 # 빌드 산출물(build 폴더, 실행 파일) 삭제
 clean:

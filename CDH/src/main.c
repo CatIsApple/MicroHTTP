@@ -1,9 +1,13 @@
 /* main.c — 서버 프로그램의 진입점.
  * 명령줄 인자 처리, 시그널 설정, 연결을 하나씩 받아 처리하는 메인 루프,
- * 그리고 지금은 고정된 HTTP 응답(200/400/431)을 보내는 일을 맡는다. */
+ * 그리고 요청을 파싱(http_parser)·본문 수신(http_body)한 뒤 응답을 보내는 일을 맡는다.
+ * 지금 응답은 요청 내용을 그대로 보여 주는 echo (정적 파일·프록시는 다음 단계). */
 
 #define _POSIX_C_SOURCE 200809L /* POSIX 2008 함수(sigaction, nanosleep 등)를 헤더에서 보이게 함. include 보다 먼저 */
 
+#include "http_body.h"     /* http_read_body (Content-Length 만큼 본문 받기) */
+#include "http_parser.h"   /* http_parse_request, http_request (요청 헤더 파싱) */
+#include "http_response.h" /* http_format_head, http_reason (응답 머리 만들기) */
 #include "tcp_server.h" /* tcp_listen, tcp_accept, tcp_send_all, tcp_recv_request, tcp_close_graceful */
 
 #include <errno.h>      /* errno, EINTR, ETIMEDOUT, EMFILE, ENFILE */
@@ -59,23 +63,6 @@ static int parse_port(const char *s, uint16_t *out) /* 문자열 → 포트 번�
     return 0;                          /* 성공 */
 }
 
-/* ---- 고정 응답: 내용이 바뀌지 않으므로 컴파일 시점에 완성해 둔다 ----
- * (요청마다 snprintf 로 다시 만들 필요 없음. 길이도 sizeof 로 구함) */
-#define OK_BODY "Hello from MicroHTTP TCP server\n" /* 200 응답 본문 */
-static const char RESP_200[] =                     /* 200 응답 전체. 인접한 문자열 리터럴은 컴파일러가 하나로 이어 붙임 */
-    "HTTP/1.1 200 OK\r\n"                          /* 상태 줄: 버전, 상태 코드, 이유 문구. 줄 끝은 HTTP 규칙대로 CRLF */
-    "Content-Type: text/plain; charset=utf-8\r\n"  /* 본문 종류: UTF-8 일반 텍스트 */
-    "Content-Length: 32\r\n" /* = sizeof(OK_BODY) - 1, 아래 _Static_assert 로 검증 */
-    "Connection: close\r\n"                        /* 응답 후 연결을 닫겠다고 알림 (keep-alive 미지원) */
-    "\r\n" OK_BODY;                                /* 빈 줄 = 헤더 끝, 그 뒤가 본문 */
-_Static_assert(sizeof(OK_BODY) - 1 == 32, "Content-Length 와 OK_BODY 길이가 다름"); /* 컴파일 시점 검사: 본문을 바꾸고 숫자를 안 바꾸면 빌드 실패 */
-
-/* 본문 없는 오류 응답 */
-#define ERROR_RESP(status) \
-    "HTTP/1.1 " status "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" /* 상태 코드만 바꿔 끼우는 응답 틀 */
-static const char RESP_400[] = ERROR_RESP("400 Bad Request");                     /* 요청이 잘못됨(헤더가 끝나기 전에 끊김) */
-static const char RESP_431[] = ERROR_RESP("431 Request Header Fields Too Large"); /* 헤더가 버퍼보다 큼 */
-
 static int g_quiet = 0; /* -q: 요청마다 찍는 로그 끔 (부하 테스트용) */
 
 static int send_resp(int cfd, const char *peer, const char *resp, size_t len) /* 응답 전송 + 실패 로그. 성공 0, 실패 -1 */
@@ -87,12 +74,65 @@ static int send_resp(int cfd, const char *peer, const char *resp, size_t len) /*
     return 0; /* 성공 */
 }
 
-/* 연결 하나 처리: 요청 수신 → 응답 송신
- * (HTTP 파싱/응답 생성은 다음 단계에서 구현. 지금은 고정 응답)
+/* 오류 응답: 상태 줄 + 헤더 + "<코드> <이유>\n" 본문을 한 번에 보낸다 */
+static int send_error(int cfd, const char *peer, int status) /* status: 400, 413 등 */
+{
+    char body[64];                                                          /* 본문: 예) "404 Not Found\n" */
+    int blen = snprintf(body, sizeof(body), "%d %s\n", status, http_reason(status)); /* 본문 문자열 만들기 */
+    if (blen < 0 || (size_t)blen >= sizeof(body))                           /* 만들기 실패나 잘림 (이유 문구는 짧아서 사실상 없음) */
+        blen = 0;                                                           /* 본문 없이 보냄 */
+    char resp[256];                                                         /* 응답 머리 + 본문 전체 */
+    int hlen = http_format_head(resp, sizeof(resp), status, "text/plain; charset=utf-8", (size_t)blen, 0); /* 오류 후엔 항상 연결 종료 */
+    if (hlen < 0 || (size_t)hlen + (size_t)blen >= sizeof(resp))            /* 머리 생성 실패 또는 자리 부족 */
+        return -1;                                                          /* 보낼 수 없음 */
+    memcpy(resp + hlen, body, (size_t)blen);                                /* 머리 뒤에 본문을 이어 붙임 */
+    if (!g_quiet)                                                           /* 조용 모드가 아니면 */
+        printf("[%s] -> %d %s\n", peer, status, http_reason(status));      /* 결과 로그 */
+    return send_resp(cfd, peer, resp, (size_t)hlen + (size_t)blen);         /* 전송 */
+}
+
+/* 정상 요청에 대한 echo 응답: 파싱 결과 요약 + 받은 본문 그대로.
+ * (정적 파일·동적 처리·프록시는 다음 단계에서 이 자리를 대체한다) */
+static int send_echo(int cfd, const char *peer, const http_request *req) /* req: 파싱 + 본문 수신이 끝난 요청 */
+{
+    char summary[4096]; /* 요약 텍스트 (URI 최대 2048 + 나머지 여유) */
+    int slen = snprintf(summary, sizeof(summary),               /* 요약 만들기 */
+                        "method: %s\n"                          /* 메서드 */
+                        "uri: %s\n"                             /* 요청 대상 */
+                        "version: HTTP/1.%d\n"                  /* 버전 */
+                        "host: %.256s\n"                        /* Host (너무 길면 256 글자까지만) */
+                        "headers: %zu\n"                        /* 헤더 개수 */
+                        "keep-alive: %s\n"                      /* 클라이언트가 원한 연결 유지 여부 (아직 실제 유지는 안 함) */
+                        "body-length: %zu\n"                    /* 본문 길이 */
+                        "\n",                                   /* 빈 줄 뒤에 본문 원문 */
+                        req->method_str, req->uri, req->version_minor,              /* 메서드, URI, 버전 */
+                        req->host ? req->host : "(none)", req->header_count,       /* Host (HTTP/1.0 이면 없을 수 있음), 헤더 수 */
+                        req->keep_alive ? "yes" : "no", req->body_len);            /* keep-alive, 본문 길이 */
+    if (slen < 0)                                                /* 형식 오류 (사실상 없음) */
+        return -1;                                               /* 실패 */
+    if ((size_t)slen >= sizeof(summary))                         /* 잘렸으면 */
+        slen = (int)sizeof(summary) - 1;                         /* 실제로 버퍼에 들어간 길이만 보냄 */
+
+    char head[256];                                              /* 응답 머리 */
+    int hlen = http_format_head(head, sizeof(head), 200, "text/plain; charset=utf-8", /* 200 OK, 일반 텍스트 */
+                                (size_t)slen + req->body_len, 0); /* 길이 = 요약 + 본문. keep-alive 는 아직 미구현이라 close */
+    if (hlen < 0)                                                /* 머리 생성 실패 */
+        return -1;                                               /* 실패 */
+    if (send_resp(cfd, peer, head, (size_t)hlen) < 0 ||          /* 머리 전송 */
+        send_resp(cfd, peer, summary, (size_t)slen) < 0)         /* 요약 전송 */
+        return -1;                                               /* 실패 */
+    if (req->body_len > 0 && send_resp(cfd, peer, req->body, req->body_len) < 0) /* 본문이 있으면 그대로 돌려줌 */
+        return -1;                                               /* 실패 */
+    if (!g_quiet)                                                /* 조용 모드가 아니면 */
+        printf("[%s] -> 200 OK\n", peer);                        /* 결과 로그 */
+    return 0;                                                    /* 성공 */
+}
+
+/* 연결 하나 처리: 헤더 수신 → 파싱 → 본문 수신 → 응답
  * 반환: 응답까지 보냈으면 0, 타임아웃·오류·빈 연결이면 -1 */
 static int handle_client(int cfd, const char *peer) /* cfd: 클라이언트 연결 소켓, peer: 로그용 "IP:포트" */
 {
-    char buf[RECV_BUF_SIZE];  /* 요청을 받을 버퍼 (스택에 8KB) */
+    char buf[RECV_BUF_SIZE];  /* 요청을 받을 버퍼 (스택에 8KB). 작은 본문도 여기 이어서 받음 */
     size_t header_len;        /* 헤더 길이를 tcp_recv_request 가 채워 줌 (못 찾으면 0) */
     ssize_t n = tcp_recv_request(cfd, buf, sizeof(buf), CLIENT_TIMEOUT_MS, &header_len); /* 헤더 끝까지 받기 */
     if (n < 0) {                                                             /* 수신 실패 */
@@ -111,21 +151,39 @@ static int handle_client(int cfd, const char *peer) /* cfd: 클라이언트 연�
     /* 헤더 끝(빈 줄)을 못 찾은 경우: 잘린 요청을 정상으로 처리하지 않는다 */
     if (header_len == 0) {                                 /* 헤더 끝을 못 찾고 수신이 끝남 */
         if ((size_t)n >= sizeof(buf) - 1) { /* 버퍼가 꽉 참 = 헤더가 너무 큼 */
-            fprintf(stderr, "[%s] header too large (> %zu bytes) -> 431\n", peer, sizeof(buf) - 1); /* 로그 */
-            return send_resp(cfd, peer, RESP_431, sizeof(RESP_431) - 1); /* 431 응답. sizeof - 1 = 끝의 '\0' 제외 길이 */
+            fprintf(stderr, "[%s] header too large (> %zu bytes)\n", peer, sizeof(buf) - 1); /* 로그 */
+            return send_error(cfd, peer, 431);             /* 431 Request Header Fields Too Large */
         }
         /* 헤더가 끝나기 전에 상대가 송신을 닫음(half-close) */
-        fprintf(stderr, "[%s] incomplete request (%zd bytes) -> 400\n", peer, n); /* 로그 */
-        return send_resp(cfd, peer, RESP_400, sizeof(RESP_400) - 1);             /* 400 응답 */
+        fprintf(stderr, "[%s] incomplete request (%zd bytes)\n", peer, n); /* 로그 */
+        return send_error(cfd, peer, 400);                 /* 400 Bad Request */
     }
 
-    /* 첫 줄(요청 라인)만 로그 */
+    /* 첫 줄(요청 라인)만 로그 — 파싱이 '\0' 을 써 넣기 전에 찍는다 */
     if (!g_quiet) {                                  /* 조용 모드가 아니면 */
         size_t line_len = strcspn(buf, "\r\n");      /* 첫 \r 또는 \n 까지의 길이 = 요청 라인("GET / HTTP/1.1") 길이 */
-        printf("[%s] %zu bytes header | %.*s\n", peer, header_len, (int)line_len, buf); /* %.*s: 문자열을 line_len 글자까지만 출력 */
+        if (line_len > 200)                          /* 긴 URI 로 로그가 도배되지 않게 */
+            line_len = 200;                          /* 200 글자까지만 */
+        printf("[%s] %.*s\n", peer, (int)line_len, buf); /* %.*s: 문자열을 line_len 글자까지만 출력 */
     }
 
-    return send_resp(cfd, peer, RESP_200, sizeof(RESP_200) - 1); /* 정상 요청 → 고정 200 응답 */
+    http_request req;                                     /* 파싱 결과 (buf 안을 가리키는 포인터들) */
+    int rc = http_parse_request(buf, header_len, &req);   /* 요청 라인 + 헤더 파싱 */
+    if (rc != 0)                                          /* 문법 오류·미지원 등 */
+        return send_error(cfd, peer, rc);                 /* 파서가 정한 상태 코드로 응답 */
+
+    char *heap = NULL;                                    /* 본문이 버퍼에 안 들어가면 http_read_body 가 malloc 한 포인터 */
+    rc = http_read_body(cfd, &req, buf, sizeof(buf), (size_t)n, header_len, CLIENT_TIMEOUT_MS, &heap); /* 본문 마저 받기 */
+    if (rc < 0) {                                         /* 본문 수신 중 타임아웃·끊김 (heap 은 이미 반납됨) */
+        fprintf(stderr, "[%s] body recv failed: %s\n", peer, strerror(errno)); /* 로그 */
+        return -1;                                        /* 응답 없이 닫기 */
+    }
+    if (rc > 0)                                           /* 411 / 413 / 417 / 500 */
+        return send_error(cfd, peer, rc);                 /* 오류 응답 (heap 은 NULL) */
+
+    rc = send_echo(cfd, peer, &req);                      /* 정상 요청 → echo 응답 */
+    free(heap);                                           /* 힙 본문 반납 (NULL 이면 아무 일 없음) */
+    return rc;                                            /* 0 = 응답 보냄, -1 = 전송 실패 */
 }
 
 /* ---- accept() 실패 처리 ----
