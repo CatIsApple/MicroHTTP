@@ -27,6 +27,26 @@ check "closed before blank line -> 400" "HTTP/1.1 400" "$(send_raw 'GET / HTTP/1
 check "header over 8KB -> 431" "HTTP/1.1 431" \
     "$(send_raw "GET / HTTP/1.1\r\nX: $(head -c 9000 /dev/zero | tr '\0' a)\r\n\r\n")"
 
+# ---- L2 파서 ----
+check "garbage -> 400"            "HTTP/1.1 400" "$(send_raw 'HELLO\r\n\r\n')"
+check "HTTP/1.1 without Host -> 400" "HTTP/1.1 400" "$(send_raw 'GET / HTTP/1.1\r\n\r\n')"
+check "HTTP/1.0 without Host -> 200" "HTTP/1.1 200" "$(send_raw 'GET / HTTP/1.0\r\n\r\n')"
+check "PUT -> 501"                "HTTP/1.1 501" "$(send_raw 'PUT / HTTP/1.1\r\nHost: x\r\n\r\n')"
+check "HTTP/2.0 -> 505"           "HTTP/1.1 505" "$(send_raw 'GET / HTTP/2.0\r\nHost: x\r\n\r\n')"
+check "bad Content-Length -> 400" "HTTP/1.1 400" "$(send_raw 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n')"
+check "body over 1MB -> 413"      "HTTP/1.1 413" "$(send_raw 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n')"
+check "path with .. -> 400"       "HTTP/1.1 400" "$(curl -s -i --path-as-is "http://127.0.0.1:$PORT/../etc/passwd" | status_of)"
+check "curl POST form"            "HTTP/1.1 200" "$(curl -s -i -d 'name=da0nn' "http://127.0.0.1:$PORT/form" | status_of)"
+check "curl POST 500KB"           "HTTP/1.1 200" \
+    "$(head -c 500000 /dev/zero | curl -s -i --data-binary @- "http://127.0.0.1:$PORT/upload" | status_of)"
+check "POST body arrives in two pieces" "HTTP/1.1 200" \
+    "$( { printf 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello'; sleep 0.3; printf 'world'; } | nc -q 2 127.0.0.1 "$PORT" | status_of)"
+check "body shorter than Content-Length -> 400" "HTTP/1.1 400" \
+    "$(send_raw 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc')"
+head_resp=$(curl -s -I "http://127.0.0.1:$PORT/" | tr -d '\r')
+if [[ "$head_resp" == "HTTP/1.1 200"* && "$head_resp" != *Hello* ]]; then echo "  ok   HEAD has no body"; pass=$((pass + 1))
+else echo "  FAIL HEAD: '$head_resp'"; fail=$((fail + 1)); fi
+
 # 헤더를 끝내지 않고 버티는 클라이언트는 마감(5초)에 응답 없이 끊긴다
 slow=$(python3 -c '
 import socket, sys, time
