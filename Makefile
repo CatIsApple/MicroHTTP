@@ -9,10 +9,11 @@
 CC       ?= cc
 CFLAGS   ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
 CPPFLAGS += -Iinclude -MMD -MP
+LDLIBS   += -pthread
 SAN      := -fsanitize=address,undefined -fno-omit-frame-pointer
 
 BIN      := microhttp
-LIB_SRCS := src/tcp.c src/http_request.c src/http_response.c src/mime.c src/static.c src/cgi.c src/router.c src/conn.c src/server.c
+LIB_SRCS := src/tcp.c src/http_request.c src/http_response.c src/mime.c src/static.c src/cgi.c src/router.c src/threadpool.c src/conn.c src/server.c
 LIB_OBJS := $(LIB_SRCS:src/%.c=build/%.o)
 TESTS    := build/test_tcp build/test_http_request build/test_http_response build/test_mime
 
@@ -20,16 +21,16 @@ TESTS    := build/test_tcp build/test_http_request build/test_http_response buil
 all: $(BIN)
 
 $(BIN): build/main.o $(LIB_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -pthread -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 build/%.o: src/%.c | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -c -o $@ $<
 
 build/test_%.o: tests/test_%.c | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -c -o $@ $<
 
 build/test_%: build/test_%.o $(LIB_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -pthread -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 build:
 	mkdir -p build
