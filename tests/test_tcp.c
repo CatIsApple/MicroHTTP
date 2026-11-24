@@ -1,6 +1,8 @@
 /* test_tcp.c — L1 단위 테스트.
  * socketpair() 로 서로 연결된 소켓 한 쌍을 만들어 네트워크 없이 L1 함수를 확인한다.
  *
+ * 마감 시각 검사 하나(send_timeout_tcp)는 실제 TCP 루프백 연결로도 확인한다.
+ *
  * 구성: 테스트 함수 하나가 한 가지 성질을 확인한다 (읽기, cap, EOF, 마감 시각, 보내기 실패, errno).
  * EXPECT 가 실패하면 위치를 찍고 failures 를 늘리며, main 은 실패가 하나라도 있으면 1 을 돌려준다. */
 #define _POSIX_C_SOURCE 200809L
@@ -120,6 +122,32 @@ static void send_timeout(void)
     unpair(sv);
 }
 
+/* 실제 TCP 연결(127.0.0.1)에서도 상대가 읽지 않으면 마감에서 멈춘다.
+ * macOS 는 send 의 MSG_DONTWAIT 를 무시해서, fd 를 논블로킹으로 두기 전에는 여기서 영영 멈췄다 */
+static void send_timeout_tcp(void)
+{
+    int lfd = tcp_listen(0, 8);
+    EXPECT(lfd >= 0);
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof addr;
+    EXPECT(getsockname(lfd, (struct sockaddr *)&addr, &alen) == 0);
+    addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 (INADDR_LOOPBACK 은 macOS 에서 POSIX 모드로 숨겨짐) */
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT(cfd >= 0 && connect(cfd, (struct sockaddr *)&addr, sizeof addr) == 0);
+    int sfd = tcp_accept(lfd, NULL, 0);
+    EXPECT(sfd >= 0);
+
+    static char big[32 << 20]; /* 커널 송수신 버퍼보다 훨씬 크게 */
+    long long t0 = tcp_now_ms();
+    errno = 0;
+    EXPECT(tcp_send_all(sfd, big, sizeof big, t0 + 200) == -1);
+    EXPECT(errno == ETIMEDOUT);
+    EXPECT(tcp_now_ms() - t0 < 1500);
+    close(sfd);
+    close(cfd);
+    close(lfd);
+}
+
 /* 상대가 이미 닫은 소켓에 보내면 프로세스가 죽지 않고 -1 */
 static void send_to_closed_peer(void)
 {
@@ -167,6 +195,7 @@ int main(void)
     recv_timeout();
     deadline_is_shared();
     send_timeout();
+    send_timeout_tcp();
     send_to_closed_peer();
     zero_cap_is_einval();
     listen_keeps_errno();
