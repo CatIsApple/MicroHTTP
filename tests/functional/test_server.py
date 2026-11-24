@@ -288,6 +288,80 @@ def test_sudden_client_disconnect(server):
     assert get("/")[0] == 200
 
 
+# ── 동시 처리 (스레드 풀) ─────────────────────────────────────────────────
+
+def test_concurrent_slow_client_does_not_block_others(server):
+    # 느린 클라이언트가 작업 스레드 하나를 붙잡고 있어도 다른 요청은 바로 처리되어야 함
+    slow = connect()
+    slow.sendall(b"GET / HTTP/1.1\r\nHost:")         # 헤더를 보내다 멈춤
+    time.sleep(0.2)
+    start = time.time()
+    assert get("/index.html")[0] == 200
+    assert time.time() - start < 1.0, "blocked behind slow client"
+    slow.close()
+
+
+def test_concurrent_many_clients(server):
+    import concurrent.futures
+    expected = file_bytes("css/style.css")
+
+    def client(_):
+        results = []
+        with connect() as sock:                       # 연결 하나로 keep-alive 10회
+            for _ in range(10):
+                sock.sendall(b"GET /css/style.css HTTP/1.1\r\nHost: a\r\n\r\n")
+                status, _, body = read_response(sock)
+                results.append(status == 200 and body == expected)
+        return all(results)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+        assert all(pool.map(client, range(200)))     # 200 연결 × 10 요청 = 2000 요청
+
+
+def test_queue_full_returns_503(server):
+    # 작업 스레드 1개 + 대기열 64개가 모두 찬 상태에서 새 연결은 503
+    busy = Server("-t", "1", port=PORT + 1)
+    held = []
+    try:
+        for _ in range(66):
+            held.append(connect(PORT + 1))           # 아무것도 보내지 않고 붙잡아 둠
+        time.sleep(0.3)
+        status, headers, _ = request(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", port=PORT + 1)
+        assert status == 503 and headers["connection"] == "close"
+    finally:
+        for sock in held:
+            sock.close()
+        busy.stop()
+
+
+# ── 시그널 / 셧다운 ──────────────────────────────────────────────────────
+
+def test_graceful_shutdown_finishes_inflight_request(server):
+    import signal
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        target = Server(port=PORT + 2)
+        try:
+            sock = connect(PORT + 2)
+            sock.sendall(b"GET /index.html HTTP/1.1\r\nHost: a\r\n")   # 요청을 보내는 도중
+            time.sleep(0.2)
+            target.process.send_signal(signal_number)                    # 셧다운 시작
+            time.sleep(0.3)
+            sock.sendall(b"\r\n")                                       # 요청 마저 보내기
+            status, headers, body = read_response(sock)
+            assert status == 200 and body == file_bytes("index.html")
+            assert headers["connection"] == "close"                     # 마지막 응답
+            assert target.process.wait(timeout=IDLE_TIMEOUT + 3) == 0   # 정상 종료 코드
+            assert "shutdown complete" in target.logs()
+            try:
+                connect(PORT + 2, timeout=1).close()
+                raise AssertionError("listener still open")
+            except ConnectionRefusedError:
+                pass
+            sock.close()
+        finally:
+            target.stop()
+
+
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
 
 

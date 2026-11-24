@@ -16,6 +16,7 @@ make
 |---|---|---|
 | `-p port` | 리스닝 포트 | 8080 |
 | `-r root` | 정적 파일 루트 디렉터리 | `./www` |
+| `-t threads` | 작업 스레드 수 (스레드 풀) | 8 |
 | `-b address` | 바인딩할 IPv4 주소 | `127.0.0.1` |
 | `-v` | 파서/수신 상세 로그 | 끔 |
 
@@ -30,7 +31,7 @@ make asan   # AddressSanitizer/UBSan 빌드로 전체 테스트
 
 | 파일 | 역할 |
 |---|---|
-| `src/server.c` | main, 리스너 생성, 연결 처리(keep-alive), 요청 처리 |
+| `src/server.c` | main, 리스너, 스레드 풀(작업 큐), 시그널 셧다운, 연결 처리(keep-alive), 요청 처리 |
 | `src/http.c` | HTTP 요청 파서, 응답 헤더 생성 (소켓 I/O 없음) |
 | `src/static_file.c` | 루트 안에서 파일 찾기(403/404), MIME 타입 매핑 |
 | `src/net.c` | `send_all`, 소켓 타임아웃, 오류 응답 송신 |
