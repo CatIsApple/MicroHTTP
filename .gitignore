@@ -1,4 +1,5 @@
 /server
-/tests/test_send
 *.dSYM/
 __pycache__/
+/tests/
+/football_page.inc
