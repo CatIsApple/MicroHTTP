@@ -4,7 +4,7 @@
  * 요청이 어디서 끝나는지(빈 줄, Content-Length 만큼의 본문)는 파서가 판단한다.
  *
  * 응답은 L3(http_response)로 만든다. 오류는 파서 결과에 맞는 상태 코드의 HTML 오류 페이지.
- * 정상 요청은 L4 static_handle 이 응답을 채운다.
+ * 정상 요청은 L5 router_dispatch 가 CGI 또는 정적 파일 핸들러로 보낸다.
  * [임시] 연결은 요청 하나를 처리하고 닫는다(keep-alive 는 L6 단계).
  */
 #define _POSIX_C_SOURCE 200809L
@@ -12,7 +12,7 @@
 #include "conn.h"
 #include "http_request.h"
 #include "http_response.h"
-#include "static.h"
+#include "router.h"
 #include "tcp.h"
 
 #include <errno.h>
@@ -79,7 +79,7 @@ void conn_serve(int fd, const char *peer, const server_config *cfg, int quiet)
     if (r == HTTP_PARSE_OK) {
         req->remote_addr = peer;
         http_response_init(&res, 200);
-        static_handle(cfg, req, &res); /* L4 */
+        router_dispatch(cfg, req, &res); /* L5: CGI 또는 L4 정적 파일 */
     } else {
         http_response_init(&res, 400);
         http_response_error(&res, http_parse_status(r));

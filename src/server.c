@@ -75,7 +75,8 @@ int server_run(const server_config *cfg, uint16_t port, int quiet)
     }
     g_reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
-    printf("MicroHTTP listening on 0.0.0.0:%u (root %s)\n", (unsigned)port, cfg->doc_root);
+    printf("MicroHTTP listening on 0.0.0.0:%u (root %s, cgi %s)\n", (unsigned)port, cfg->doc_root,
+           cfg->cgi_dir ? cfg->cgi_dir : "off");
     fflush(stdout);
 
     while (!g_stop) {

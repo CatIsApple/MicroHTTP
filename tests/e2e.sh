@@ -10,7 +10,7 @@ cp -R www/. "$ROOT"/
 ln -s /etc "$ROOT/etc-link"
 pass=0 fail=0
 
-"$BIN" -q -r "$ROOT" "$PORT" >"$LOG" 2>&1 &
+"$BIN" -q -r "$ROOT" -c cgi-bin "$PORT" >"$LOG" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$LOG" "$ROOT"' EXIT
 for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.1; done
@@ -71,6 +71,28 @@ check "dir without index -> 403" "403" "$(code /img/)"
 check "symlink out of root -> 403" "403" "$(code /etc-link/passwd)"
 check "encoded space in path -> 404" "404" "$(code '/no%20such')"
 check "HEAD on file" "HTTP/1.1 200" "$(curl -s -I "http://127.0.0.1:$PORT/style.css" | status_of)"
+
+# ---- L5 CGI ----
+url="http://127.0.0.1:$PORT"
+out=$(curl -s "$url/cgi-bin/hello.sh/extra/path?name=da0nn")
+check "CGI GET body"      "Hello from CGI" "$out"
+check "CGI QUERY_STRING"  "yes" "$([[ "$out" == *"QUERY_STRING=name=da0nn"* ]] && echo yes)"
+check "CGI PATH_INFO"     "yes" "$([[ "$out" == *"PATH_INFO=/extra/path"* && "$out" == *"SCRIPT_NAME=/cgi-bin/hello.sh"* ]] && echo yes)"
+check "CGI REMOTE_ADDR"   "yes" "$([[ "$out" == *"REMOTE_ADDR=127.0.0.1"* ]] && echo yes)"
+check "CGI POST echo"     "method=POST" "$(curl -s -d 'msg=hello' "$url/cgi-bin/echo.py")"
+check "CGI POST body"     "yes" "$(curl -s -d 'msg=hello' "$url/cgi-bin/echo.py" | grep -qx 'body=msg=hello' && echo yes)"
+check "CGI POST 500KB"    "X-Body-Length: 500000" \
+    "$(head -c 500000 /dev/zero | curl -s -D - -o /dev/null --data-binary @- "$url/cgi-bin/echo.py" | grep -i x-body-length | tr -d '\r')"
+check "CGI Status header -> 404" "404" "$(code /cgi-bin/status.sh)"
+check "CGI Location -> 302" "302" "$(code /cgi-bin/redirect.sh)"
+check "CGI missing -> 404"   "404" "$(code /cgi-bin/nope.sh)"
+check "CGI not executable -> 403" "403" "$(code /cgi-bin/noexec.sh)"
+check "CGI bad output -> 502" "502" "$(code /cgi-bin/broken.sh)"
+check "CGI prefix itself -> 403" "403" "$(code /cgi-bin/)"
+start=$(date +%s)
+check "CGI timeout -> 504"   "504" "$(code /cgi-bin/slow.sh)"
+took=$(( $(date +%s) - start ))
+check "CGI timeout took ~5s" "yes" "$([[ $took -ge 4 && $took -le 7 ]] && echo yes)"
 
 # 헤더를 끝내지 않고 버티는 클라이언트는 마감(5초)에 응답 없이 끊긴다
 slow=$(python3 -c '
