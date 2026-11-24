@@ -1,5 +1,8 @@
 /* test_http_response.c — L3 단위 테스트.
- * socketpair 한쪽으로 http_response_send 를 하고, 다른 쪽에서 받은 바이트를 검사한다. */
+ * socketpair 한쪽으로 http_response_send 를 하고, 다른 쪽에서 받은 바이트를 검사한다.
+ *
+ * 구성: send_and_capture 가 받은 응답 전체를 전역 out 에 담고, body_of 가 그 안의 본문 위치를 찾는다.
+ * 테스트 함수마다 본문 종류(없음/메모리/파일/owned), HEAD, 오류 페이지, 헤더 검사 중 하나를 확인한다. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "http_response.h"
@@ -49,12 +52,14 @@ static int send_and_capture(http_response *res, int head_only)
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
 }
 
+/* 마지막으로 받은 응답(out)에서 빈 줄 뒤 본문의 시작. 빈 줄이 없으면 NULL */
 static const char *body_of(void)
 {
     char *p = strstr(out, "\r\n\r\n");
     return p ? p + 4 : NULL;
 }
 
+/* 알려진 상태 코드의 문구와, 모르는 코드의 "Unknown" */
 static void status_texts(void)
 {
     EXPECT(strcmp(http_status_text(200), "OK") == 0);
@@ -63,6 +68,7 @@ static void status_texts(void)
     EXPECT(strcmp(http_status_text(799), "Unknown") == 0);
 }
 
+/* 메모리 본문: 상태 줄, 자동 헤더(Content-Length, Connection, Date, Server), 추가 헤더, 본문 */
 static void memory_body(void)
 {
     http_response res;
@@ -81,6 +87,7 @@ static void memory_body(void)
     http_response_free(&res);
 }
 
+/* HEAD: Content-Length 는 그대로 알리고 본문은 보내지 않음. keep_alive = 0 이면 Connection: close */
 static void head_only_and_close(void)
 {
     http_response res;
@@ -93,6 +100,7 @@ static void head_only_and_close(void)
     EXPECT(body_of() && *body_of() == '\0');                  /* 본문은 안 보냄 */
 }
 
+/* 본문이 없는 응답(204)은 Content-Length: 0 */
 static void no_body(void)
 {
     http_response res;
@@ -102,6 +110,7 @@ static void no_body(void)
     EXPECT(strstr(out, "\r\nContent-Length: 0\r\n") != NULL);
 }
 
+/* http_response_error: 이전 헤더를 버리고 HTML 오류 페이지와 맞는 Content-Length 를 보냄 */
 static void error_page(void)
 {
     http_response res;
@@ -118,6 +127,7 @@ static void error_page(void)
     EXPECT(strstr(out, want) != NULL);
 }
 
+/* CR/LF 가 든 헤더 이름·값은 거절하고, 헤더 배열이 가득 차면 -1 */
 static void header_injection_rejected(void)
 {
     http_response res;
@@ -130,6 +140,7 @@ static void header_injection_rejected(void)
     EXPECT(http_response_header(&res, "X", "v") == -1); /* 가득 참 */
 }
 
+/* header_copy 는 값을 복사해 두므로 원본을 바꿔도 그대로이고, scratch 를 넘으면 -1 */
 static void header_copy(void)
 {
     http_response res;
@@ -146,6 +157,7 @@ static void header_copy(void)
     EXPECT(http_response_header_copy(&res, "X", big) == -1); /* scratch 초과 */
 }
 
+/* 파일 본문을 64KB 조각으로 나눠 끝까지 보내고, free 가 fd 를 닫으며 두 번 불러도 안전한지 */
 static void file_body(void)
 {
     char path[] = "/tmp/microhttp_test_XXXXXX";
@@ -169,6 +181,7 @@ static void file_body(void)
     http_response_free(&res);          /* 두 번 불러도 안전 */
 }
 
+/* owned 본문: malloc 한 버퍼의 일부를 보내고 free 가 버퍼를 해제하는지 (ASan 으로 누수 확인) */
 static void owned_body(void)
 {
     char *base = malloc(16);
@@ -181,6 +194,7 @@ static void owned_body(void)
     http_response_free(&res); /* ASan 으로 누수가 없는지 확인 */
 }
 
+/* 모든 테스트를 실행하고, 실패가 있으면 개수를 찍고 1 을 돌려준다 */
 int main(void)
 {
     status_texts();

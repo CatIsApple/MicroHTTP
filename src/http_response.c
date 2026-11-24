@@ -1,4 +1,14 @@
-/* http_response.c — L3: HTTP 응답 생성 구현. 인터페이스 설명은 include/http_response.h */
+/* http_response.c — L3: HTTP 응답 생성 구현. 인터페이스 설명은 include/http_response.h
+ *
+ * 레이어 구조에서의 위치
+ *   핸들러(L4 정적 파일, L5 CGI) 가 http_response 를 채운다 → [L3 이 파일] 이 직렬화 → L1 tcp_send_all 로 전송
+ *
+ * 구성
+ *   - 상태 문구: http_status_text
+ *   - 응답 만들기: http_response_init, header / header_copy, body_mem / body_owned / body_file, error
+ *   - 정리: drop_body (이전 본문 정리), http_response_free
+ *   - 보내기: format_date(Date 헤더) → build_head(상태 줄 + 헤더) → send_file(파일 본문) → http_response_send
+ */
 #define _POSIX_C_SOURCE 200809L
 
 #include "http_response.h"
@@ -13,6 +23,7 @@
 
 #define FILE_CHUNK (64 * 1024) /* 파일 본문을 읽어서 보내는 단위 */
 
+/* 상태 코드에 맞는 이유 문구(reason phrase). 상태 줄 "HTTP/1.1 404 Not Found" 에 쓴다 */
 const char *http_status_text(int status)
 {
     switch (status) {
@@ -40,6 +51,7 @@ const char *http_status_text(int status)
     }
 }
 
+/* 구조체를 0 으로 비우고 기본값을 넣는다: 본문 없음, fd -1(파일 없음), keep-alive 켬 */
 void http_response_init(http_response *res, int status)
 {
     memset(res, 0, sizeof *res);
@@ -49,8 +61,10 @@ void http_response_init(http_response *res, int status)
     res->keep_alive = 1;
 }
 
+/* 문자열에 CR 이나 LF 가 있는가 (헤더 값에 있으면 응답이 쪼개질 수 있음) */
 static int has_crlf(const char *s) { return strpbrk(s, "\r\n") != NULL; }
 
+/* 헤더 배열 끝에 (이름, 값) 포인터를 추가한다. 값은 복사하지 않는다 */
 int http_response_header(http_response *res, const char *name, const char *value)
 {
     if (res->n_headers == HTTP_RESPONSE_MAX_HEADERS || has_crlf(name) || has_crlf(value))
@@ -61,6 +75,7 @@ int http_response_header(http_response *res, const char *name, const char *value
     return 0;
 }
 
+/* 값을 res->scratch 에 복사한 뒤 그 복사본으로 헤더를 추가한다. scratch 가 모자라면 -1 */
 int http_response_header_copy(http_response *res, const char *name, const char *value)
 {
     size_t n = strlen(value) + 1;
@@ -88,6 +103,7 @@ static void drop_body(http_response *res)
     res->file_len = 0;
 }
 
+/* 이전 본문을 정리하고 메모리 [p, p+n) 를 본문으로 정한다 (복사하지 않음) */
 void http_response_body_mem(http_response *res, const void *p, size_t n, const char *ctype)
 {
     drop_body(res);
@@ -98,12 +114,14 @@ void http_response_body_mem(http_response *res, const void *p, size_t n, const c
         http_response_header(res, "Content-Type", ctype);
 }
 
+/* body_mem 과 같지만 base 의 소유권도 넘겨받아 http_response_free 에서 free 한다 */
 void http_response_body_owned(http_response *res, void *base, const void *p, size_t n, const char *ctype)
 {
     http_response_body_mem(res, p, n, ctype);
     res->owned = base;
 }
 
+/* 이전 본문을 정리하고 열린 파일 fd 를 본문으로 정한다. fd 소유권은 res 로 넘어온다 */
 void http_response_body_file(http_response *res, int fd, off_t len, const char *ctype)
 {
     drop_body(res);
@@ -114,6 +132,7 @@ void http_response_body_file(http_response *res, int fd, off_t len, const char *
         http_response_header(res, "Content-Type", ctype);
 }
 
+/* 응답을 오류 응답으로 바꾼다: 본문·헤더를 비우고 "<h1>404 Not Found</h1>" 같은 HTML 을 error_page 에 만든다 */
 void http_response_error(http_response *res, int status)
 {
     drop_body(res);
@@ -128,6 +147,7 @@ void http_response_error(http_response *res, int status)
     http_response_body_mem(res, res->error_page, (size_t)n, "text/html; charset=utf-8");
 }
 
+/* 응답이 가진 자원(파일 fd, owned 메모리)을 돌려준다 */
 void http_response_free(http_response *res) { drop_body(res); }
 
 /* RFC 9110 형식의 현재 시각: "Tue, 24 Nov 2026 05:00:00 GMT" */
@@ -205,6 +225,8 @@ static int send_file(int sock, int fd, off_t len, long long deadline_ms)
     return rc;
 }
 
+/* 헤더를 만들어 보내고 이어서 본문을 보낸다.
+ * 헤더가 head 버퍼를 넘치면 500 으로 바꿔 보내고, 작은 메모리 본문은 헤더와 한 번에 보낸다 */
 int http_response_send(int fd, http_response *res, int head_only, long long deadline_ms)
 {
     char head[4096];
