@@ -3,11 +3,15 @@
  * RST 없이 닫기를 맡는다. HTTP 내용은 전혀 모르고 바이트만 다룬다. */
 
 #define _POSIX_C_SOURCE 200809L /* POSIX 2008 함수(clock_gettime, strtol 등)를 헤더에서 보이게 함. include 보다 먼저 와야 함 */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE /* macOS: _POSIX_C_SOURCE 를 켜면 MSG_DONTWAIT 같은 BSD 확장이 숨겨짐 → 다시 보이게 */
+#endif
 
 #include "tcp_server.h" /* 이 파일이 구현할 함수들의 선언 (선언과 구현이 일치하는지 컴파일러가 검사) */
 
 #include <arpa/inet.h>  /* htons/htonl/ntohs(바이트 순서 변환), inet_ntop(IP 숫자 → 문자열) */
 #include <errno.h>      /* errno 변수와 EINTR, EAGAIN, ETIMEDOUT 같은 에러 코드 */
+#include <fcntl.h>      /* fcntl, O_NONBLOCK (sendfile 동안 소켓을 잠깐 논블로킹으로) */
 #include <netinet/in.h> /* struct sockaddr_in(IPv4 주소 구조체), INADDR_ANY, INET_ADDRSTRLEN */
 #include <poll.h>       /* poll(), struct pollfd, POLLIN/POLLOUT (fd 가 준비될 때까지 기다리기) */
 #include <stdio.h>      /* perror, snprintf */
@@ -15,7 +19,10 @@
 #include <sys/socket.h> /* socket, bind, listen, accept, send, sendmsg, recv, shutdown, setsockopt, MSG_* 플래그 */
 #include <sys/uio.h>    /* struct iovec (sendmsg 에 넘길 "여러 덩어리" 목록) */
 #include <time.h>       /* clock_gettime, struct timespec, CLOCK_MONOTONIC */
-#include <unistd.h>     /* close */
+#include <unistd.h>     /* close, pread */
+#if defined(__linux__) && !defined(MICROHTTP_NO_SENDFILE) /* -DMICROHTTP_NO_SENDFILE 로 다른 OS 용 경로를 리눅스에서도 테스트 */
+#include <sys/sendfile.h> /* sendfile (리눅스 전용 시그니처) */
+#endif
 
 int tcp_listen(uint16_t port, int backlog) /* 리스닝 소켓을 만들어 fd 를 돌려줌, 실패 시 -1 */
 {
@@ -108,34 +115,14 @@ static int wait_until(int fd, short events, long long deadline) /* events: POLLI
     }
 }
 
-int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms) /* buf 의 len 바이트를 마감 시간 안에 전부 보냄 */
-{
-    const char *p = buf;                        /* 아직 안 보낸 부분의 시작 위치. void* 는 산술 연산이 안 돼서 char* 로 받음 */
-    long long deadline = now_ms() + timeout_ms; /* 이 호출 전체의 마감 시각 */
-    while (len > 0) {                           /* 남은 바이트가 있는 동안 반복 (send 가 일부만 보낼 수 있으므로) */
-        if (wait_until(fd, POLLOUT, deadline) <= 0) /* 송신 버퍼에 자리가 날 때까지 마감 시간 안에서 기다림 */
-            return -1;                          /* 시간 초과(errno=ETIMEDOUT) 또는 오류 */
-        /* MSG_DONTWAIT: 송신 버퍼가 일부만 비어 있어도 블로킹하지 않고
-         * 들어간 만큼만 복사한다 → 마감 시간을 넘겨 붙잡히지 않는다 */
-        ssize_t n = send(fd, p, len, MSG_DONTWAIT); /* 유저 버퍼 → 커널 송신 버퍼로 복사. n = 실제로 복사한 바이트 수 */
-        if (n < 0) {                                /* 실패한 경우 */
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) /* 시그널로 중단 / 지금은 버퍼가 꽉 참 → 일시적 상황 */
-                continue;                           /* 다시 기다렸다가 재시도 */
-            return -1; /* EPIPE 등: 상대가 끊음 (SIGPIPE 는 main 에서 무시) */
-        }
-        p += n;           /* 보낸 만큼 시작 위치를 앞으로 */
-        len -= (size_t)n; /* 남은 길이 감소 */
-    }
-    return 0; /* 전부 보냄 (= 커널 송신 버퍼에 다 넣음. 상대가 받았다는 뜻은 아님) */
-}
+/* ---- 송신: 모든 송신은 sendv_until 한 곳을 지난다 ---- */
 
-int tcp_send_all2(int fd, const void *a, size_t alen, const void *b, size_t blen, int timeout_ms) /* a 다음 b 를 한 번에 이어서 전송 */
+/* iov[0..cnt) 를 순서대로 deadline 까지 전부 보낸다. 성공 0, 실패·초과 -1.
+ * iov 는 진행 상황을 기록하느라 수정된다 (보낸 만큼 base 전진, len 감소). */
+static int sendv_until(int fd, struct iovec *iov, int cnt, long long deadline)
 {
-    struct iovec iov[2] = {{.iov_base = (void *)a, .iov_len = alen},  /* 첫 덩어리 (예: 응답 머리). iovec 은 const 가 아니라서 캐스팅 */
-                           {.iov_base = (void *)b, .iov_len = blen}}; /* 둘째 덩어리 (예: 본문) */
-    size_t idx = 0;                             /* 아직 다 안 보낸 첫 덩어리의 번호 */
-    long long deadline = now_ms() + timeout_ms; /* 두 덩어리 전체의 마감 시각 */
-    while (idx < 2) {                           /* 덩어리가 남은 동안 */
+    int idx = 0;                                /* 아직 다 안 보낸 첫 덩어리의 번호 */
+    while (idx < cnt) {                         /* 덩어리가 남은 동안 */
         if (iov[idx].iov_len == 0) {            /* 길이 0 (처음부터 비었거나 다 보냄) */
             idx++;                              /* 다음 덩어리로 */
             continue;
@@ -145,15 +132,17 @@ int tcp_send_all2(int fd, const void *a, size_t alen, const void *b, size_t blen
         struct msghdr msg;                      /* sendmsg 에 넘길 "여러 덩어리 + 옵션" 묶음 */
         memset(&msg, 0, sizeof(msg));           /* 안 쓰는 필드(주소 등)는 0 */
         msg.msg_iov = &iov[idx];                /* 남은 덩어리들의 시작 */
-        msg.msg_iovlen = 2 - idx;               /* 남은 덩어리 수 */
-        ssize_t n = sendmsg(fd, &msg, MSG_DONTWAIT); /* 일부만 들어가도 블로킹하지 않고 돌아옴 (tcp_send_all 과 같은 이유) */
+        msg.msg_iovlen = cnt - idx;             /* 남은 덩어리 수 */
+        /* MSG_DONTWAIT: 송신 버퍼가 일부만 비어 있어도 블로킹하지 않고
+         * 들어간 만큼만 복사한다 → 마감 시간을 넘겨 붙잡히지 않는다 */
+        ssize_t n = sendmsg(fd, &msg, MSG_DONTWAIT); /* 남은 덩어리들을 한 번에 커널 송신 버퍼로 */
         if (n < 0) {                            /* 실패한 경우 */
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) /* 일시적 상황 */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) /* 시그널 / 버퍼 꽉 참 → 일시적 */
                 continue;                       /* 다시 기다렸다가 재시도 */
-            return -1;                          /* EPIPE 등: 상대가 끊음 */
+            return -1;                          /* EPIPE 등: 상대가 끊음 (SIGPIPE 는 main 에서 무시) */
         }
         size_t left = (size_t)n;                /* 보낸 바이트 수를 덩어리 앞에서부터 차례로 차감 */
-        while (idx < 2 && left > 0) {           /* 보낸 양이 남아 있는 동안 */
+        while (idx < cnt && left > 0) {         /* 보낸 양이 남아 있는 동안 */
             if (left >= iov[idx].iov_len) {     /* 이 덩어리를 통째로 보냈으면 */
                 left -= iov[idx].iov_len;       /* 그만큼 차감 */
                 iov[idx].iov_len = 0;           /* 이 덩어리는 끝 */
@@ -165,7 +154,95 @@ int tcp_send_all2(int fd, const void *a, size_t alen, const void *b, size_t blen
             }
         }
     }
-    return 0; /* 둘 다 커널 송신 버퍼에 넣음 */
+    return 0; /* 전부 커널 송신 버퍼에 넣음 (상대가 받았다는 뜻은 아님) */
+}
+
+int tcp_sendv_all(int fd, struct iovec *iov, int iovcnt, int timeout_ms) /* 여러 덩어리를 이어서 전송 */
+{
+    return sendv_until(fd, iov, iovcnt, now_ms() + timeout_ms); /* 전체 마감 = 지금 + timeout */
+}
+
+int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms) /* 덩어리 하나 = sendv 의 특수한 경우 */
+{
+    struct iovec iov = {.iov_base = (void *)buf, .iov_len = len}; /* iovec 은 const 가 아니라서 캐스팅 (읽기만 함) */
+    return tcp_sendv_all(fd, &iov, 1, timeout_ms);                 /* 같은 송신 루프 사용 */
+}
+
+#if defined(__linux__) && !defined(MICROHTTP_NO_SENDFILE) /* -DMICROHTTP_NO_SENDFILE 로 다른 OS 용 경로를 리눅스에서도 테스트 */
+/* 리눅스: sendfile() 로 파일 → 소켓을 커널 안에서 바로 복사 (유저 공간 버퍼 복사 0번).
+ * sendfile 에는 MSG_DONTWAIT 같은 플래그가 없어서, 마감 시간을 지키려면 소켓을 잠깐 논블로킹으로 바꾼다. */
+static int sendfile_until(int sock, int file_fd, off_t offset, size_t len, long long deadline)
+{
+    int flags = fcntl(sock, F_GETFL, 0);        /* 소켓의 현재 상태 플래그 */
+    if (flags < 0)                              /* 조회 실패 */
+        return -1;
+    int was_blocking = !(flags & O_NONBLOCK);   /* 원래 블로킹이었는지 (끝나고 되돌리기 위해) */
+    if (was_blocking && fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) /* 논블로킹으로: 버퍼가 차면 기다리지 않고 돌아옴 */
+        return -1;
+
+    int rc = 0;                                 /* 결과 (0 = 성공) */
+    while (len > 0) {                           /* 남은 바이트가 있는 동안 */
+        if (wait_until(sock, POLLOUT, deadline) <= 0) { /* 송신 버퍼에 자리가 날 때까지 */
+            rc = -1;                            /* 시간 초과 또는 오류 */
+            break;
+        }
+        ssize_t n = sendfile(sock, file_fd, &offset, len); /* offset 은 커널이 보낸 만큼 전진시켜 줌 (파일 자체 위치는 안 바뀜) */
+        if (n < 0) {                            /* 실패 */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) /* 일시적 */
+                continue;                       /* 다시 기다림 */
+            rc = -1;                            /* EPIPE 등 */
+            break;
+        }
+        if (n == 0) {                           /* 파일이 예상보다 짧음 (보내는 도중 잘림 등) */
+            errno = EIO;                        /* Content-Length 를 지킬 수 없음 → 오류 */
+            rc = -1;
+            break;
+        }
+        len -= (size_t)n;                       /* 남은 길이 감소 */
+    }
+
+    int saved = errno;                          /* 아래 fcntl 이 errno 를 바꾸지 않게 보관 */
+    if (was_blocking)                           /* 원래 블로킹이었으면 */
+        fcntl(sock, F_SETFL, flags);            /* 원래 플래그로 복구 */
+    errno = saved;                              /* 실패 이유 복원 */
+    return rc;
+}
+#else
+/* 그 밖의 OS (macOS 등): sendfile 시그니처가 OS 마다 달라서, 이식성을 위해 pread + send 로 대신한다.
+ * 64KB 씩 읽어서 보낸다 (유저 공간 복사 1번, 메모리는 64KB 고정). */
+static int sendfile_until(int sock, int file_fd, off_t offset, size_t len, long long deadline)
+{
+    char chunk[64 * 1024];                      /* 읽어 올 조각 버퍼 */
+    while (len > 0) {                           /* 남은 바이트가 있는 동안 */
+        size_t want = len < sizeof(chunk) ? len : sizeof(chunk); /* 이번에 읽을 양 */
+        ssize_t r = pread(file_fd, chunk, want, offset);          /* offset 위치에서 읽기 (파일 위치는 안 바뀜) */
+        if (r < 0) {                            /* 읽기 실패 */
+            if (errno == EINTR)                 /* 시그널 */
+                continue;                       /* 다시 */
+            return -1;
+        }
+        if (r == 0) {                           /* 파일이 예상보다 짧음 */
+            errno = EIO;
+            return -1;
+        }
+        struct iovec iov = {.iov_base = chunk, .iov_len = (size_t)r}; /* 읽은 만큼 */
+        if (sendv_until(sock, &iov, 1, deadline) < 0) /* 같은 마감 시간 안에서 전송 */
+            return -1;
+        offset += r;                            /* 다음 읽을 위치 */
+        len -= (size_t)r;                       /* 남은 길이 */
+    }
+    return 0;
+}
+#endif
+
+int tcp_sendfile_all(int sock, const void *head, size_t head_len,
+                     int file_fd, off_t offset, size_t len, int timeout_ms) /* 머리 + 파일 구간 전송 */
+{
+    long long deadline = now_ms() + timeout_ms;                         /* 머리와 파일 "전체" 의 마감 시각 */
+    struct iovec iov = {.iov_base = (void *)head, .iov_len = head_len}; /* 응답 머리 */
+    if (sendv_until(sock, &iov, 1, deadline) < 0)                       /* 머리 먼저 */
+        return -1;
+    return sendfile_until(sock, file_fd, offset, len, deadline);        /* 이어서 파일 내용 (같은 마감) */
 }
 
 ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len) /* HTTP 헤더 끝까지 받기 */

@@ -8,7 +8,7 @@
 #include "http_body.h"     /* http_read_body (Content-Length 만큼 본문 받기) */
 #include "http_parser.h"   /* http_parse_request, http_request (요청 헤더 파싱) */
 #include "http_response.h" /* http_response, http_send_response, http_send_error, http_reason */
-#include "tcp_server.h" /* tcp_listen, tcp_accept, tcp_recv_request, tcp_close_graceful */
+#include "tcp_server.h" /* tcp_listen, tcp_accept, tcp_recv_request, tcp_sendv_all, tcp_close_graceful */
 
 #include <errno.h>      /* errno, EINTR, ETIMEDOUT, EMFILE, ENFILE */
 #include <fcntl.h>      /* open, O_RDONLY (예비 fd 용) */
@@ -17,7 +17,8 @@
 #include <stdlib.h>     /* strtol, EXIT_SUCCESS, EXIT_FAILURE */
 #include <string.h>     /* memset, strcmp, strcspn, strerror */
 #include <sys/socket.h> /* accept (handle_accept_error 에서 직접 호출) */
-#include <time.h>       /* nanosleep, struct timespec */
+#include <sys/uio.h>    /* struct iovec (echo 응답 세 조각) */
+#include <time.h>       /* nanosleep, struct timespec, time */
 #include <unistd.h>     /* close */
 
 #define DEFAULT_PORT 8080      /* 포트 인자를 안 주면 쓰는 기본 포트 */
@@ -65,28 +66,20 @@ static int parse_port(const char *s, uint16_t *out) /* 문자열 → 포트 번�
 
 static int g_quiet = 0; /* -q: 요청마다 찍는 로그 끔 (부하 테스트용) */
 
-/* 응답 전송 + 결과 로그. 성공 0, 실패 -1 */
-static int send_resp(int cfd, const char *peer, const http_response *res) /* res: 보낼 응답 */
+/* 송신 결과 로그 (모든 응답 경로가 여기로). rc: 송신 함수의 반환값. 그대로 돌려준다 */
+static int log_sent(int rc, const char *peer, int status)
 {
-    if (http_send_response(cfd, res, CLIENT_TIMEOUT_MS) < 0) {           /* 마감 시간 안에 머리 + 본문 전송 시도 */
-        fprintf(stderr, "[%s] send error: %s\n", peer, strerror(errno)); /* 실패 이유 출력 (EPIPE, ETIMEDOUT 등) */
-        return -1;                                                       /* 실패 */
-    }
-    if (!g_quiet)                                                        /* 조용 모드가 아니면 */
-        printf("[%s] -> %d %s\n", peer, res->status, http_reason(res->status)); /* 결과 로그 */
-    return 0;                                                            /* 성공 */
+    if (rc < 0)                                                          /* 전송 실패 */
+        fprintf(stderr, "[%s] send error: %s\n", peer, strerror(errno)); /* 실패 이유 (EPIPE, ETIMEDOUT 등) */
+    else if (!g_quiet)                                                   /* 성공 + 조용 모드가 아니면 */
+        printf("[%s] -> %d %s\n", peer, status, http_reason(status));   /* 결과 로그 */
+    return rc;                                                           /* 0 = 성공, -1 = 실패 */
 }
 
 /* 오류 응답: 상태 줄 + 헤더 + "<코드> <이유>\n" 본문 (오류 뒤에는 연결을 닫는다) */
 static int send_error(int cfd, const char *peer, int status) /* status: 400, 413 등 */
 {
-    if (http_send_error(cfd, status, NULL, CLIENT_TIMEOUT_MS) < 0) {     /* 오류 응답 전송 */
-        fprintf(stderr, "[%s] send error: %s\n", peer, strerror(errno)); /* 실패 이유 출력 */
-        return -1;                                                       /* 실패 */
-    }
-    if (!g_quiet)                                                        /* 조용 모드가 아니면 */
-        printf("[%s] -> %d %s\n", peer, status, http_reason(status));   /* 결과 로그 */
-    return 0;                                                            /* 성공 */
+    return log_sent(http_send_error(cfd, status, NULL, CLIENT_TIMEOUT_MS), peer, status); /* 전송 + 로그 */
 }
 
 /* 정상 요청에 대한 echo 응답: 파싱 결과 요약 + 받은 본문 그대로.
@@ -111,25 +104,24 @@ static int send_echo(int cfd, const char *peer, const http_request *req) /* req:
     if ((size_t)slen >= sizeof(summary))                         /* 잘렸으면 */
         slen = (int)sizeof(summary) - 1;                         /* 실제로 버퍼에 들어간 길이만 보냄 */
 
-    size_t total = (size_t)slen + req->body_len;                 /* 응답 본문 = 요약 + 받은 본문 */
-    char *out = malloc(total);                                   /* 두 조각을 이어 붙일 버퍼 (total >= 요약 길이 > 0) */
-    if (out == NULL)                                             /* 메모리 부족 */
-        return send_error(cfd, peer, 500);                       /* 500 Internal Server Error */
-    memcpy(out, summary, (size_t)slen);                          /* 앞부분: 요약 */
-    if (req->body_len > 0)                                       /* 본문이 있으면 */
-        memcpy(out + slen, req->body, req->body_len);            /* 뒷부분: 받은 본문 그대로 */
-
-    http_response res = {                                        /* 응답 내용 */
+    /* 본문이 두 조각(요약 + 받은 본문)이라 http_send_response(본문 1개) 대신
+     * 머리만 만들고 tcp_sendv_all 로 세 조각을 한 번에 보낸다 → 합치는 malloc·복사 없음 */
+    http_response res = {                                        /* 머리에 들어갈 내용 */
         .status = 200,                                           /* 200 OK */
         .content_type = "text/plain; charset=utf-8",             /* 일반 텍스트 */
-        .body = out,                                             /* 본문 */
-        .body_len = total,                                       /* 본문 길이 */
+        .body_len = (size_t)slen + req->body_len,                /* 본문 길이 = 요약 + 받은 본문 */
         .keep_alive = 0,                                         /* keep-alive 는 동시성 단계에서 같이 다룸 → 지금은 close */
-        .extra_headers = NULL,                                   /* 추가 헤더 없음 */
     };
-    int rc = send_resp(cfd, peer, &res);                         /* 전송 + 로그 */
-    free(out);                                                   /* 임시 버퍼 반납 */
-    return rc;                                                   /* 0 = 성공, -1 = 전송 실패 */
+    char head[HTTP_HEAD_MAX];                                    /* 응답 머리 */
+    int hlen = http_format_head(head, sizeof(head), &res, time(NULL)); /* 지금 시각으로 머리 만들기 */
+    if (hlen < 0)                                                /* 만들 수 없음 (사실상 없음) */
+        return send_error(cfd, peer, 500);                       /* 서버 오류로 응답 */
+    struct iovec iov[3] = {                                      /* 보낼 순서대로 세 조각 */
+        {.iov_base = head, .iov_len = (size_t)hlen},             /* 머리 */
+        {.iov_base = summary, .iov_len = (size_t)slen},          /* 요약 */
+        {.iov_base = (void *)req->body, .iov_len = req->body_len}, /* 받은 본문 (없으면 길이 0 → 건너뜀) */
+    };
+    return log_sent(tcp_sendv_all(cfd, iov, 3, CLIENT_TIMEOUT_MS), peer, 200); /* 전송 + 로그 */
 }
 
 /* 연결 하나 처리: 헤더 수신 → 파싱 → 본문 수신 → 응답

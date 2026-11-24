@@ -6,7 +6,8 @@
 
 #include <stddef.h>    /* size_t (바이트 수·길이를 나타내는 부호 없는 정수 타입) */
 #include <stdint.h>    /* uint16_t (포트 번호용 16비트 부호 없는 정수) */
-#include <sys/types.h> /* ssize_t (바이트 수 또는 -1 에러를 담는 부호 있는 정수, POSIX) */
+#include <sys/types.h> /* ssize_t (바이트 수 또는 -1 에러를 담는 부호 있는 정수, POSIX), off_t (파일 위치) */
+#include <sys/uio.h>   /* struct iovec (여러 덩어리 송신용 { 시작 주소, 길이 }) */
 
 /* 리스닝 소켓 생성: socket() → setsockopt(SO_REUSEADDR) → bind() → listen()
  * 성공 시 리스닝 fd, 실패 시 -1 */
@@ -20,12 +21,19 @@ int tcp_accept(int listen_fd, char *client_addr_buf, size_t buf_len); /* 반환:
  * timeout_ms 는 호출 "전체" 의 마감 시간. 성공 0, 실패·초과 -1 (초과 시 errno = ETIMEDOUT) */
 int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms); /* buf 의 len 바이트를 fd 로 전부 전송 */
 
-/* 두 덩어리(a 다음 b)를 sendmsg() 한 번에 이어서 보낸다 — 응답 머리 + 본문용.
- * 두 번 send 하면 작은 패킷 둘로 갈라져 Nagle + delayed ACK 로 40ms 지연이 생길 수 있고,
+/* 여러 덩어리 iov[0..iovcnt) 를 순서대로 sendmsg() 로 이어서 보낸다 (응답 머리 + 본문 조각들).
+ * 따로 send 하면 작은 패킷으로 갈라져 Nagle + delayed ACK 로 40ms 지연이 생길 수 있고,
  * 하나로 합치려고 복사하면 큰 본문에서 메모리가 낭비된다. 복사 없이 한 번에 보낸다.
- * timeout_ms 는 두 덩어리 "전체" 의 마감 시간. 성공 0, 실패·초과 -1 (초과 시 errno = ETIMEDOUT).
- * 길이가 0 인 덩어리는 건너뛴다 (a, b 가 NULL 이어도 길이가 0 이면 OK). */
-int tcp_send_all2(int fd, const void *a, size_t alen, const void *b, size_t blen, int timeout_ms);
+ * timeout_ms 는 전체 마감 시간. 성공 0, 실패·초과 -1 (초과 시 errno = ETIMEDOUT).
+ * 길이 0 인 덩어리는 건너뜀. 주의: 진행 상황 기록용으로 iov 배열 내용을 바꾼다 (재사용 금지). */
+int tcp_sendv_all(int fd, struct iovec *iov, int iovcnt, int timeout_ms);
+
+/* 머리(head) 를 보낸 뒤 파일 file_fd 의 [offset, offset+len) 구간을 보낸다 (정적 파일 응답용).
+ * 리눅스: sendfile() 로 커널 안에서 바로 복사 (zero-copy). 그 밖의 OS: pread + send 64KB 씩.
+ * timeout_ms 는 머리 + 파일 "전체" 의 마감 시간. 성공 0, 실패 -1
+ * (초과 ETIMEDOUT, 파일이 len 보다 짧으면 EIO). 파일 위치(lseek)는 바꾸지 않는다. */
+int tcp_sendfile_all(int sock, const void *head, size_t head_len,
+                     int file_fd, off_t offset, size_t len, int timeout_ms);
 
 /* 요청 헤더 끝("\r\n\r\n") 또는 EOF 또는 버퍼가 찰 때까지 수신.
  * timeout_ms 는 호출 "전체" 의 마감 시간(천천히 보내는 클라이언트 대비).

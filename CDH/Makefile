@@ -20,7 +20,7 @@ OBJS := $(SRCS:src/%.c=build/%.o)
 BIN  := microhttp
 
 # 실제 파일 이름이 아닌 "명령" 타깃이라고 표시 (같은 이름의 파일이 있어도 항상 실행)
-.PHONY: all clean asan test
+.PHONY: all clean asan test ftest-asan
 
 # 기본 타깃: 그냥 make 하면 실행 파일을 만든다
 all: $(BIN)
@@ -51,7 +51,8 @@ TEST_BINS := $(TEST_SRCS:tests/%.c=build/tests/%)
 TEST_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 
 # make test: 모든 테스트를 빌드한 뒤 차례로 실행. 하나라도 실패하면 make 도 실패(종료 코드 != 0)
-test: $(TEST_BINS)
+# test_functional 은 서버 실행 파일을 띄워서 검사하므로 $(BIN) 도 먼저 빌드
+test: $(BIN) $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done
 	@echo "all tests passed"
 
@@ -61,6 +62,12 @@ build/tests/%: tests/%.c $(LIB_SRCS) $(wildcard include/*.h) tests/test.h | buil
 
 build/tests:
 	mkdir -p build/tests
+
+# 기능 테스트를 ASan 서버로 실행: 서버가 SIGINT 로 끝날 때 누수가 있으면 ASan 이 종료 코드를 바꾸므로
+# test_functional 의 "종료 코드 0" 검사가 실패한다 → 서버 바이너리의 누수·메모리 오류 검사
+ftest-asan: asan
+	$(MAKE) build/tests/test_functional
+	./build/tests/test_functional
 
 # 빌드 산출물(build 폴더, 실행 파일) 삭제
 clean:
