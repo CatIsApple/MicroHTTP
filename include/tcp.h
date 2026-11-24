@@ -9,6 +9,8 @@
  *     1바이트씩 찔끔찔끔 보내는 클라이언트(slowloris)가 시간을 늘릴 수 없다.
  *     마감 시각 = tcp_now_ms() + 제한 시간
  *   - 마감이 지나면 -1, errno = ETIMEDOUT.
+ *   - tcp_recv_some / tcp_send_all 은 넘겨받은 fd 를 논블로킹(O_NONBLOCK)으로 바꾼다.
+ *     그래야 운영체제와 상관없이 마감 시각을 지킬 수 있다. 이 fd 는 이 레이어의 함수로만 읽고 쓴다.
  */
 #ifndef MICROHTTP_TCP_H
 #define MICROHTTP_TCP_H

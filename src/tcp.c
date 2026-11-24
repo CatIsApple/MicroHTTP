@@ -8,7 +8,7 @@
  *   - 시간: tcp_now_ms (단조 시계)
  *   - 내부 도우미: fail_close, set_cloexec, wait_ready(poll 로 마감 시각까지 대기)
  *   - 공개 함수: tcp_listen → tcp_accept → tcp_recv_some / tcp_send_all → tcp_close_graceful
- * 모든 입출력은 "poll 로 기다린 뒤 MSG_DONTWAIT 로 한 번 시도" 하는 방식이라
+ * 모든 입출력은 "fd 를 논블로킹으로 두고, poll 로 기다린 뒤 한 번 시도" 하는 방식이라
  * 마감 시각을 넘겨서 붙잡히는 일이 없다.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -63,6 +63,18 @@ static int set_cloexec(int fd)
 {
     int flags = fcntl(fd, F_GETFD);
     return flags < 0 ? -1 : fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+/* fd 를 논블로킹(O_NONBLOCK)으로 바꾼다. 이미 논블로킹이면 그대로 둔다.
+ * MSG_DONTWAIT 만으로는 부족하다: macOS 는 send 에 준 MSG_DONTWAIT 를 무시하고,
+ * 송신 버퍼가 차면 send 안에서 무한정 기다린다 (TCP, 유닉스 소켓 모두). 그러면 마감 시각이 소용없다.
+ * fd 자체를 논블로킹으로 두면 리눅스와 macOS 모두 send 가 EAGAIN 으로 바로 돌아온다. */
+static int set_nonblock(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0)
+        return -1;
+    return (flags & O_NONBLOCK) ? 0 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 /* fd 가 events(POLLIN/POLLOUT) 상태가 될 때까지 마감 시각까지 기다린다.
@@ -136,7 +148,7 @@ int tcp_accept(int lfd, char *peer, size_t peer_len)
     return fd;
 }
 
-/* 읽을 데이터가 올 때까지 마감 시각까지 기다린 뒤, 와 있는 만큼(최대 cap) 한 번 읽는다.
+/* fd 를 논블로킹으로 두고, 읽을 데이터가 올 때까지 마감 시각까지 기다린 뒤, 와 있는 만큼(최대 cap) 한 번 읽는다.
  * 시그널(EINTR)이나 헛깨어남(EAGAIN)은 다시 기다리고, 그 밖의 오류는 -1 */
 ssize_t tcp_recv_some(int fd, void *buf, size_t cap, long long deadline_ms)
 {
@@ -144,6 +156,8 @@ ssize_t tcp_recv_some(int fd, void *buf, size_t cap, long long deadline_ms)
         errno = EINVAL;
         return -1;
     }
+    if (set_nonblock(fd) < 0)
+        return -1;
     for (;;) {
         if (wait_ready(fd, POLLIN, deadline_ms) < 0)
             return -1;
@@ -156,11 +170,13 @@ ssize_t tcp_recv_some(int fd, void *buf, size_t cap, long long deadline_ms)
     }
 }
 
-/* 송신 버퍼에 자리가 날 때마다 보낼 수 있는 만큼 보내기를 반복해서 len 바이트를 다 보낸다.
+/* fd 를 논블로킹으로 두고, 송신 버퍼에 자리가 날 때마다 보낼 수 있는 만큼 보내기를 반복해서 len 바이트를 다 보낸다.
  * 마감 시각이 지나거나 상대가 끊으면 -1 */
 int tcp_send_all(int fd, const void *buf, size_t len, long long deadline_ms)
 {
     const char *p = buf;
+    if (len > 0 && set_nonblock(fd) < 0)
+        return -1;
     while (len > 0) {
         if (wait_ready(fd, POLLOUT, deadline_ms) < 0)
             return -1;
