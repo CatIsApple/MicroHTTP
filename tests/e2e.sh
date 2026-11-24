@@ -5,11 +5,14 @@ set -u
 BIN=${1:-./microhttp}
 PORT=${2:-18080}
 LOG=$(mktemp)
+ROOT=$(mktemp -d) # www/ 사본 + 테스트용 심볼릭 링크 (저장소의 www/ 는 건드리지 않음)
+cp -R www/. "$ROOT"/
+ln -s /etc "$ROOT/etc-link"
 pass=0 fail=0
 
-"$BIN" -q "$PORT" >"$LOG" 2>&1 &
+"$BIN" -q -r "$ROOT" "$PORT" >"$LOG" 2>&1 &
 pid=$!
-trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -f "$LOG"' EXIT
+trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$LOG" "$ROOT"' EXIT
 for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.1; done
 
 check() { # check <설명> <기대값 앞부분> <실제값>
@@ -20,7 +23,7 @@ status_of() { head -1 | tr -d '\r'; }
 send_raw() { printf "$1" | nc -q 2 127.0.0.1 "$PORT" | status_of; }
 
 check "curl GET /"      "HTTP/1.1 200" "$(curl -s -i "http://127.0.0.1:$PORT/" | status_of)"
-check "curl body"       "Hello from MicroHTTP" "$(curl -s "http://127.0.0.1:$PORT/")"
+check "curl body is index.html" "yes" "$(curl -s "http://127.0.0.1:$PORT/" | grep -q '<h1>MicroHTTP</h1>' && echo yes)"
 check "request arrives in two pieces" "HTTP/1.1 200" \
     "$( { printf 'GET / HTTP/1.1\r\nHo'; sleep 0.3; printf 'st: x\r\n\r\n'; } | nc -q 2 127.0.0.1 "$PORT" | status_of)"
 check "closed before blank line -> 400" "HTTP/1.1 400" "$(send_raw 'GET / HTTP/1.1\r\nHost: x\r\n')"
@@ -36,21 +39,38 @@ check "HTTP/2.0 -> 505"           "HTTP/1.1 505" "$(send_raw 'GET / HTTP/2.0\r\n
 check "bad Content-Length -> 400" "HTTP/1.1 400" "$(send_raw 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n')"
 check "body over 1MB -> 413"      "HTTP/1.1 413" "$(send_raw 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n')"
 check "path with .. -> 400"       "HTTP/1.1 400" "$(curl -s -i --path-as-is "http://127.0.0.1:$PORT/../etc/passwd" | status_of)"
-check "curl POST form"            "HTTP/1.1 200" "$(curl -s -i -d 'name=da0nn' "http://127.0.0.1:$PORT/form" | status_of)"
-check "curl POST 500KB"           "HTTP/1.1 200" \
+check "curl POST to static file -> 405" "HTTP/1.1 405" "$(curl -s -i -d 'name=da0nn' "http://127.0.0.1:$PORT/form" | status_of)"
+check "curl POST 500KB (read, then 405)" "HTTP/1.1 405" \
     "$(head -c 500000 /dev/zero | curl -s -i --data-binary @- "http://127.0.0.1:$PORT/upload" | status_of)"
-check "POST body arrives in two pieces" "HTTP/1.1 200" \
+check "POST body arrives in two pieces" "HTTP/1.1 405" \
     "$( { printf 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello'; sleep 0.3; printf 'world'; } | nc -q 2 127.0.0.1 "$PORT" | status_of)"
 check "body shorter than Content-Length -> 400" "HTTP/1.1 400" \
     "$(send_raw 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc')"
 head_resp=$(curl -s -I "http://127.0.0.1:$PORT/" | tr -d '\r')
-if [[ "$head_resp" == "HTTP/1.1 200"* && "$head_resp" != *Hello* ]]; then echo "  ok   HEAD has no body"; pass=$((pass + 1))
+if [[ "$head_resp" == "HTTP/1.1 200"* && "$head_resp" != *"<h1>"* ]]; then echo "  ok   HEAD has no body"; pass=$((pass + 1))
 else echo "  FAIL HEAD: '$head_resp'"; fail=$((fail + 1)); fi
 
 # ---- L3 응답 ----
 resp=$(printf 'HELLO\r\n\r\n' | nc -q 2 127.0.0.1 "$PORT" | tr -d '\r')
 check "error page is HTML" "yes" "$([[ "$resp" == *"Content-Type: text/html"* && "$resp" == *"<h1>400 Bad Request</h1>"* ]] && echo yes)"
 check "Date and Server headers" "yes" "$(curl -s -I "http://127.0.0.1:$PORT/" | grep -c -E '^(Date|Server):' | grep -q 2 && echo yes)"
+
+# ---- L4 정적 파일 ----
+ctype() { curl -s -o /dev/null -w '%{content_type}' "http://127.0.0.1:$PORT$1"; }
+code() { curl -s -o /dev/null --path-as-is -w '%{http_code}' "http://127.0.0.1:$PORT$1"; }
+check "index.html type"  "text/html"       "$(ctype /index.html)"
+check "style.css type"   "text/css"        "$(ctype /style.css)"
+check "app.js type"      "text/javascript" "$(ctype /app.js)"
+check "logo.png type"    "image/png"       "$(ctype /img/logo.png)"
+check "png bytes match"  "yes" "$(curl -s "http://127.0.0.1:$PORT/img/logo.png" | cmp -s - www/img/logo.png && echo yes)"
+check "dir without slash -> 301" "301 /docs/" \
+    "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "http://127.0.0.1:$PORT/docs" | sed "s#http://127.0.0.1:$PORT##")"
+check "dir/ -> index.html" "200" "$(code /docs/)"
+check "missing file -> 404" "404" "$(code /nope.html)"
+check "dir without index -> 403" "403" "$(code /img/)"
+check "symlink out of root -> 403" "403" "$(code /etc-link/passwd)"
+check "encoded space in path -> 404" "404" "$(code '/no%20such')"
+check "HEAD on file" "HTTP/1.1 200" "$(curl -s -I "http://127.0.0.1:$PORT/style.css" | status_of)"
 
 # 헤더를 끝내지 않고 버티는 클라이언트는 마감(5초)에 응답 없이 끊긴다
 slow=$(python3 -c '

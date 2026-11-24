@@ -3,9 +3,11 @@
 #ifndef MICROHTTP_SERVER_H
 #define MICROHTTP_SERVER_H
 
+#include "handler.h"
+
 #include <stdint.h>
 
 /* Ctrl+C / SIGTERM 을 받을 때까지 실행. 정상 종료 0, 시작 실패 -1 */
-int server_run(uint16_t port, int quiet);
+int server_run(const server_config *cfg, uint16_t port, int quiet);
 
 #endif

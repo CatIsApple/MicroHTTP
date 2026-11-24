@@ -4,14 +4,15 @@
  * 요청이 어디서 끝나는지(빈 줄, Content-Length 만큼의 본문)는 파서가 판단한다.
  *
  * 응답은 L3(http_response)로 만든다. 오류는 파서 결과에 맞는 상태 코드의 HTML 오류 페이지.
- * [임시] 핸들러(L4/L5)가 아직 없어서 정상 요청에는 인사말을 돌려준다.
- *        연결은 요청 하나를 처리하고 닫는다(keep-alive 는 L6 단계).
+ * 정상 요청은 L4 static_handle 이 응답을 채운다.
+ * [임시] 연결은 요청 하나를 처리하고 닫는다(keep-alive 는 L6 단계).
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "conn.h"
 #include "http_request.h"
 #include "http_response.h"
+#include "static.h"
 #include "tcp.h"
 
 #include <errno.h>
@@ -24,8 +25,6 @@
 #define CONN_BUF_SIZE (HTTP_MAX_HEADER_BYTES + MAX_BODY) /* 헤더 + 본문이 다 들어가는 크기 */
 #define RECV_TIMEOUT_MS 5000                          /* 요청 전체를 받는 데 주는 시간 */
 #define SEND_TIMEOUT_MS 5000                          /* 응답 전체를 보내는 데 주는 시간 */
-
-#define HELLO_BODY "Hello from MicroHTTP\n"
 
 /* 요청 하나를 받아 파싱한다.
  * 반환: 1 응답할 것이 있음(*result 채움), 0 응답 없이 닫을 것(타임아웃, 오류, 빈 연결) */
@@ -57,7 +56,7 @@ static int receive_request(int fd, const char *peer, char *buf, http_request *re
     }
 }
 
-void conn_serve(int fd, const char *peer, int quiet)
+void conn_serve(int fd, const char *peer, const server_config *cfg, int quiet)
 {
     /* 1MB 버퍼는 스택 대신 힙에 (나중에 스레드마다 스택을 작게 잡아도 안전하도록) */
     char *buf = malloc(CONN_BUF_SIZE);
@@ -79,7 +78,7 @@ void conn_serve(int fd, const char *peer, int quiet)
     http_response res;
     if (r == HTTP_PARSE_OK) {
         http_response_init(&res, 200);
-        http_response_body_mem(&res, HELLO_BODY, sizeof HELLO_BODY - 1, "text/plain; charset=utf-8");
+        static_handle(cfg, req, &res); /* L4 */
     } else {
         http_response_init(&res, 400);
         http_response_error(&res, http_parse_status(r));

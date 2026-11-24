@@ -62,7 +62,7 @@ static void on_accept_error(int lfd)
     nanosleep(&pause, NULL);
 }
 
-int server_run(uint16_t port, int quiet)
+int server_run(const server_config *cfg, uint16_t port, int quiet)
 {
     if (setup_signals() < 0) {
         perror("sigaction");
@@ -75,7 +75,7 @@ int server_run(uint16_t port, int quiet)
     }
     g_reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
-    printf("MicroHTTP listening on 0.0.0.0:%u\n", (unsigned)port);
+    printf("MicroHTTP listening on 0.0.0.0:%u (root %s)\n", (unsigned)port, cfg->doc_root);
     fflush(stdout);
 
     while (!g_stop) {
@@ -87,7 +87,7 @@ int server_run(uint16_t port, int quiet)
             continue;
         }
         /* 한 번에 하나씩 처리하므로, 한 연결이 오래 붙잡지 못하게 conn_serve 가 마감 시각을 건다 */
-        conn_serve(fd, peer, quiet);
+        conn_serve(fd, peer, cfg, quiet);
     }
 
     close(lfd);

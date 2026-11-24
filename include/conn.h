@@ -3,6 +3,8 @@
 #ifndef MICROHTTP_CONN_H
 #define MICROHTTP_CONN_H
 
-void conn_serve(int fd, const char *peer, int quiet);
+#include "handler.h"
+
+void conn_serve(int fd, const char *peer, const server_config *cfg, int quiet);
 
 #endif
