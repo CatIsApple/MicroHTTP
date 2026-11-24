@@ -475,6 +475,12 @@ def main():
                 print(server.logs()[-3000:])
                 server.stop()
                 server = Server(*PROXY_ARGS)
+        # 새니타이저 빌드(make asan)에서 서버 로그에 메모리 오류나 UB 보고가 있으면 실패로 처리
+        for marker in ("AddressSanitizer", "LeakSanitizer", "runtime error:"):
+            if marker in server.logs():
+                failures += 1
+                print(f"FAIL sanitizer report in server log: {marker}")
+                print(server.logs()[-5000:])
     finally:
         server.stop()
         for backend in backends:
