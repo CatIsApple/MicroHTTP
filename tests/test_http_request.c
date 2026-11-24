@@ -1,4 +1,7 @@
-/* test_http_request.c — L2 파서 단위 테스트. 소켓 없이 문자열만으로 http_parse() 를 확인한다. */
+/* test_http_request.c — L2 파서 단위 테스트. 소켓 없이 문자열만으로 http_parse() 를 확인한다.
+ *
+ * 구성: 정상 요청 → 덜 온 요청(INCOMPLETE) → 400 → 413/431/501/505 순서로 묶여 있다.
+ * parse()/parse_len() 이 리터럴을 쓰기 가능한 전역 buf 에 복사해 파싱하고, 결과는 전역 req, used 에 남는다. */
 #include "http_request.h"
 
 #include <stdio.h>
@@ -24,10 +27,12 @@ static http_parse_result parse_len(const char *s, size_t n)
     memcpy(buf, s, n);
     return http_parse(buf, n, MAX_BODY, &req, &used);
 }
+/* NUL 로 끝나는 문자열 요청을 파싱한다 (parse_len 의 줄임) */
 static http_parse_result parse(const char *s) { return parse_len(s, strlen(s)); }
 
 /* ---- 정상 요청 ---- */
 
+/* 기본 GET: 메서드, 대상, 디코드한 경로, 쿼리, 버전, Host, keep-alive, consumed 확인 */
 static void get_request(void)
 {
     const char *s = "GET /docs/index.html?lang=ko&x=1 HTTP/1.1\r\n"
@@ -51,6 +56,7 @@ static void get_request(void)
     EXPECT(req.content_length == 0 && req.body == NULL && req.body_len == 0);
 }
 
+/* POST 본문이 Content-Length 만큼 잡히고 consumed 에 본문까지 포함되는지 */
 static void post_request(void)
 {
     const char *s = "POST /form HTTP/1.1\r\n"
@@ -75,6 +81,7 @@ static void binary_body(void)
     EXPECT(req.body_len == 6 && memcmp(req.body, "a\0\r\n\r\n", 6) == 0);
 }
 
+/* HEAD 메서드, 그리고 HTTP/1.0 의 Host 생략·기본 연결 닫기 */
 static void head_and_http10(void)
 {
     EXPECT(parse("HEAD / HTTP/1.1\r\nHost: x\r\n\r\n") == HTTP_PARSE_OK && req.method == HTTP_HEAD);
@@ -83,6 +90,7 @@ static void head_and_http10(void)
     EXPECT(req.version_minor == 0 && req.host == NULL && req.keep_alive == 0);
 }
 
+/* http_header_get: 대소문자 무시, 빈 값, 같은 이름이 여러 개면 첫 값 */
 static void header_lookup(void)
 {
     EXPECT(parse("GET / HTTP/1.1\r\nhost: a\r\nX-Empty:\r\nX-Dup: 1\r\nx-dup: 2\r\n\r\n") == HTTP_PARSE_OK);
@@ -93,6 +101,7 @@ static void header_lookup(void)
     EXPECT(http_header_get(&req, "Cookie") == NULL);
 }
 
+/* Connection 헤더(close, keep-alive, 쉼표 목록)에 따른 keep_alive 값 */
 static void connection_header(void)
 {
     EXPECT(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") == HTTP_PARSE_OK);
@@ -105,6 +114,7 @@ static void connection_header(void)
     EXPECT(req.keep_alive == 1);
 }
 
+/* %XX 디코드 결과가 path 에 들어가고 쿼리·target 은 그대로인지. "a..b" 같은 이름은 허용 */
 static void path_decoding(void)
 {
     EXPECT(parse("GET /hello%20world/%ED%95%9C?q=%20 HTTP/1.1\r\nHost: x\r\n\r\n") == HTTP_PARSE_OK);
@@ -123,6 +133,7 @@ static void leading_blank_lines(void)
 
 /* ---- 덜 온 요청: INCOMPLETE, 그리고 버퍼를 건드리지 않음 ---- */
 
+/* 요청의 모든 앞부분(0..n-1 바이트)이 INCOMPLETE 이고 버퍼를 바꾸지 않는지, 전체는 OK 인지 */
 static void every_prefix_is_incomplete(void)
 {
     const char *s = "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd";
@@ -157,6 +168,7 @@ static void two_requests_in_buffer(void)
 
 /* ---- 400 ---- */
 
+/* 요청 라인 문법 오류들이 400 이 되는지 */
 static void bad_request_line(void)
 {
     EXPECT(parse("HELLO\r\n\r\n") == HTTP_PARSE_BAD_REQUEST);
@@ -170,6 +182,7 @@ static void bad_request_line(void)
     EXPECT(parse("GET /\x01 HTTP/1.1\r\nHost: x\r\n\r\n") == HTTP_PARSE_BAD_REQUEST);
 }
 
+/* CRLF 가 아닌 줄바꿈(LF 만, 줄 중간 CR)이 400 이 되는지 */
 static void bad_line_endings(void)
 {
     EXPECT(parse("GET / HTTP/1.1\nHost: x\r\n\r\n") == HTTP_PARSE_BAD_REQUEST);   /* LF 만 */
@@ -177,6 +190,7 @@ static void bad_line_endings(void)
     EXPECT(parse("GET / HTTP/1.1\nHost: x\n\n") == HTTP_PARSE_INCOMPLETE); /* CRLF 빈 줄이 없으면 아직 안 끝남 */
 }
 
+/* Host 누락·중복, 잘못된 헤더 이름/값이 400 이 되는지 */
 static void bad_headers(void)
 {
     EXPECT(parse("GET / HTTP/1.1\r\n\r\n") == HTTP_PARSE_BAD_REQUEST);                       /* Host 없음 */
@@ -189,6 +203,7 @@ static void bad_headers(void)
     EXPECT(parse_len(nul, sizeof nul - 1) == HTTP_PARSE_BAD_REQUEST);
 }
 
+/* 숫자가 아니거나, 넘치거나, 서로 다른 Content-Length 가 400 이 되는지 */
 static void bad_content_length(void)
 {
     EXPECT(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ten\r\n\r\n") == HTTP_PARSE_BAD_REQUEST);
@@ -205,6 +220,7 @@ static void bad_content_length(void)
            HTTP_PARSE_OK);
 }
 
+/* ".." 세그먼트(인코딩한 것 포함), 잘못된 %XX, %00 이 400 이 되는지 */
 static void bad_paths(void)
 {
     EXPECT(parse("GET /../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n") == HTTP_PARSE_BAD_REQUEST);
@@ -219,6 +235,7 @@ static void bad_paths(void)
 
 /* ---- 413 / 431 / 501 / 505 ---- */
 
+/* 본문 크기 초과는 413, 헤더 크기·개수 초과는 431 */
 static void too_large(void)
 {
     static char s[HTTP_MAX_HEADER_BYTES * 2];
@@ -252,6 +269,7 @@ static void too_large(void)
     EXPECT(parse_len(s, n) == HTTP_PARSE_HEADER_TOO_LARGE);
 }
 
+/* 지원하지 않는 메서드·Transfer-Encoding 은 501, HTTP/1.x 가 아니면 505 */
 static void not_supported(void)
 {
     EXPECT(parse("PUT / HTTP/1.1\r\nHost: x\r\n\r\n") == HTTP_PARSE_NOT_IMPLEMENTED);
@@ -262,6 +280,7 @@ static void not_supported(void)
     EXPECT(parse("GET / HTTP/0.9\r\n\r\n") == HTTP_PARSE_BAD_VERSION);
 }
 
+/* http_parse_status 가 결과마다 맞는 상태 코드를 돌려주는지 */
 static void status_codes(void)
 {
     EXPECT(http_parse_status(HTTP_PARSE_OK) == 0);
@@ -273,6 +292,7 @@ static void status_codes(void)
     EXPECT(http_parse_status(HTTP_PARSE_BAD_VERSION) == 505);
 }
 
+/* 모든 테스트를 실행하고, 실패가 있으면 개수를 찍고 1 을 돌려준다 */
 int main(void)
 {
     get_request();

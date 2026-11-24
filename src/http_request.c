@@ -1,5 +1,16 @@
 /* http_request.c — L2: HTTP 요청 파서 구현. 인터페이스 설명은 include/http_request.h
  *
+ * 레이어 구조에서의 위치
+ *   L1(tcp) 이 받은 바이트 → [L2 이 파일] → http_request 구조체 → 라우터/핸들러(L4, L5)
+ *   소켓을 전혀 모르는 순수 함수라서 문자열만으로 테스트한다 (tests/test_http_request.c).
+ *
+ * 구성
+ *   - slice: 버퍼 안의 한 구간 (복사하지 않고 위치만 기록)
+ *   - 문자 도우미: is_token_char, is_space, to_lower, slice_ieq, trim, list_contains, hex_digit
+ *   - 줄 단위 파서: parse_request_line, classify_method, parse_header_line
+ *   - 값 검사: parse_size(Content-Length), decode_path(%XX, ".."), find_blank_line
+ *   - 본체: http_parse, 그리고 결과 조회용 http_header_get, http_parse_status
+ *
  * 흐름
  *   1) 빈 줄("\r\n\r\n")을 찾아 헤더 영역의 끝을 정한다. 없으면 INCOMPLETE.
  *   2) 헤더 영역을 줄 단위로 읽으며 문법을 검사한다. 이때는 위치(slice)만 기록하고 버퍼는 안 바꾼다.
@@ -32,8 +43,10 @@ static int is_token_char(unsigned char c)
     return c != 0 && strchr("!#$%&'*+-.^_`|~", c) != NULL;
 }
 
+/* 헤더 값 앞뒤에 올 수 있는 공백 (SP, HTAB) 인가 */
 static int is_space(char c) { return c == ' ' || c == '\t'; }
 
+/* ASCII 대문자만 소문자로 바꾼다 (locale 영향 없음) */
 static char to_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
 /* 구간 s 와 문자열 word 가 대소문자 무시하고 같은가 */
@@ -46,6 +59,7 @@ static int slice_ieq(slice s, const char *word)
     return word[i] == '\0';
 }
 
+/* 구간 앞뒤의 공백·탭을 잘라 낸 구간을 돌려준다 (버퍼는 그대로) */
 static slice trim(slice s)
 {
     while (s.n > 0 && is_space(s.p[0]))
@@ -71,6 +85,7 @@ static int list_contains(slice list, const char *word)
     return 0;
 }
 
+/* 16진수 문자 한 개를 0~15 로. 16진수가 아니면 -1 (%XX 디코드용) */
 static int hex_digit(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -81,6 +96,8 @@ static int hex_digit(char c)
 
 /* ---------- 요청 라인: 메서드 SP 대상 SP 버전 ---------- */
 
+/* 요청 라인을 공백 두 개로 메서드/대상/버전으로 나누고 각각 문법을 검사한다.
+ * 성공하면 *method, *target 에 위치를, *minor 에 HTTP/1.x 의 x(0 또는 1)를 넣는다 */
 static http_parse_result parse_request_line(slice line, slice *method, slice *target, int *minor)
 {
     const char *sp1 = memchr(line.p, ' ', line.n);
@@ -134,6 +151,8 @@ static http_parse_result classify_method(slice m, http_method *out)
 
 /* ---------- 헤더 줄: 이름 ":" 공백 값 공백 ---------- */
 
+/* 헤더 한 줄을 첫 ':' 기준으로 이름/값으로 나눈다.
+ * 이름은 token 문자만, 값은 앞뒤 공백을 자르고 제어 문자가 없어야 한다 */
 static http_parse_result parse_header_line(slice line, raw_header *h)
 {
     const char *colon = memchr(line.p, ':', line.n);
@@ -218,6 +237,8 @@ static size_t find_blank_line(const char *buf, size_t from, size_t len)
 
 /* ---------- 본체 ---------- */
 
+/* 파서 본체. 위 파일 머리말의 1)~5) 순서대로 진행한다.
+ * 마지막 5) 전까지는 버퍼를 바꾸지 않으므로 INCOMPLETE 뒤에 같은 버퍼로 다시 불러도 된다 */
 http_parse_result http_parse(char *buf, size_t len, size_t max_body, http_request *req, size_t *consumed)
 {
     *consumed = 0;
@@ -331,6 +352,7 @@ http_parse_result http_parse(char *buf, size_t len, size_t max_body, http_reques
     return HTTP_PARSE_OK;
 }
 
+/* 저장된 헤더를 앞에서부터 보며 이름이 같은(대소문자 무시) 첫 값을 돌려준다 */
 const char *http_header_get(const http_request *req, const char *name)
 {
     for (size_t i = 0; i < req->n_headers; i++)
@@ -339,6 +361,7 @@ const char *http_header_get(const http_request *req, const char *name)
     return NULL;
 }
 
+/* 파싱 실패 종류를 응답할 상태 코드로 바꾼다 (400/413/431/501/505) */
 int http_parse_status(http_parse_result r)
 {
     switch (r) {
