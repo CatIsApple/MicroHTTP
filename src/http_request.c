@@ -319,6 +319,7 @@ http_parse_result http_parse(char *buf, size_t len, size_t max_body, http_reques
         req->headers[i].value = hdr[i].value.p;
     }
     req->n_headers = n_hdr;
+    req->remote_addr = NULL;
     req->host = host ? host->value.p : NULL;
     req->content_length = length;
     req->body = length ? buf + body_start : NULL;

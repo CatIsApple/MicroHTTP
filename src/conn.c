@@ -77,6 +77,7 @@ void conn_serve(int fd, const char *peer, const server_config *cfg, int quiet)
 
     http_response res;
     if (r == HTTP_PARSE_OK) {
+        req->remote_addr = peer;
         http_response_init(&res, 200);
         static_handle(cfg, req, &res); /* L4 */
     } else {

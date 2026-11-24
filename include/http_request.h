@@ -44,6 +44,7 @@ typedef struct {
     int         keep_alive;     /* 응답 후 연결을 유지할지 (버전 기본값 + Connection 헤더) */
     const char *body;           /* 본문 시작 (NUL 로 끝나지 않음). 없으면 NULL */
     size_t      body_len;
+    const char *remote_addr;    /* 클라이언트 "ip:port". 파서는 NULL 로 두고 연결 처리(conn)가 채운다 (CGI 의 REMOTE_ADDR) */
     http_header headers[HTTP_MAX_HEADERS];
     size_t      n_headers;
     char        path_buf[HTTP_MAX_HEADER_BYTES]; /* path 가 가리키는 곳 (디코드 결과는 원본보다 길지 않음) */
