@@ -11,9 +11,9 @@ CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc
 LDLIBS  += -lpthread
 PYTHON  ?= python3
 
-SOURCES = src/http.c src/net.c src/static_file.c
+SOURCES = src/http.c src/net.c src/static_file.c src/proxy.c
 HEADERS = $(wildcard src/*.h)
-UNIT_TESTS = build/test_http build/test_mime build/test_static build/test_net
+UNIT_TESTS = build/test_http build/test_mime build/test_static build/test_net build/test_proxy
 
 .PHONY: all test unit functional asan clean
 
