@@ -10,7 +10,7 @@
  *    ├─ pthread_create × N    : worker_main 스레드 풀 시작
  *    ├─ 반복 (stop_requested가 될 때까지)
  *    │   ├─ accept()          : 연결 하나 수락 (3-way handshake가 끝난 연결)
- *    │   └─ queue_push(fd)    : 작업 큐에 넣음. 가득 찼으면 503 후 닫기
+ *    │   └─ queue_push(fd)    : 작업 큐에 넣음. 가득 찼으면 빈자리가 날 때까지 기다림
  *    └─ 종료: 리스너 닫기 → 큐 닫기 → pthread_join으로 작업 스레드 기다리기
  *
  *   worker_main()                [작업 스레드 = 소비자]
@@ -70,17 +70,20 @@ static volatile sig_atomic_t stop_requested = 0;
 
 /*
  * 작업 큐: main 스레드가 accept한 연결(fd)을 넣고, 작업 스레드가 꺼내 갑니다.
- * 여러 스레드가 동시에 만지므로 mutex로 보호하고,
- * 큐가 비었을 때 작업 스레드는 condition variable에서 잠들어 CPU를 쓰지 않고 기다립니다.
+ * 여러 스레드가 동시에 만지므로 mutex로 보호하고, 두 개의 condition variable로 기다립니다.
+ *   not_empty : 큐가 비면 작업 스레드(소비자)가 여기서 잠듦
+ *   not_full  : 큐가 가득 차면 main 스레드(생산자)가 여기서 잠듦
+ *               → 그동안 새 연결은 커널의 listen 대기열(BACKLOG)에 쌓여 기다립니다.
  */
 static struct {
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
+    pthread_cond_t not_full;
     int fds[QUEUE_CAPACITY];  /* 원형 배열: head부터 count개가 대기 중 */
     size_t head;
     size_t count;
     int closing;              /* 1이면 더 이상 새 연결을 받지 않음 (셧다운 중) */
-} queue = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, {0}, 0, 0, 0 };
+} queue = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, {0}, 0, 0, 0 };
 
 /*
  * 리스닝 소켓을 만듭니다: socket() → setsockopt(SO_REUSEADDR) → bind() → listen()
@@ -268,19 +271,21 @@ static void handle_connection(int client_fd)
 
 /*
  * 연결 fd를 작업 큐에 넣고 잠든 작업 스레드 하나를 깨웁니다.
- * 큐가 가득 찼거나 셧다운 중이면 -1 (호출자가 503으로 거절).
+ * 큐가 가득 찼으면 작업 스레드가 하나를 꺼내 갈 때까지 기다립니다(배압, backpressure).
+ *
+ * 가득 찼을 때 바로 503을 보내고 닫는 방법도 있지만, 아직 읽지 않은 요청 바이트가 남은 소켓을
+ * close하면 커널이 RST를 보내 클라이언트가 503 응답조차 받지 못할 수 있습니다.
+ * 기다리는 쪽이 더 단순하고, 대기 중인 연결은 커널 listen 대기열이 맡아 줍니다.
  */
-static int queue_push(int client_fd)
+static void queue_push(int client_fd)
 {
     pthread_mutex_lock(&queue.lock);
-    int accepted = !queue.closing && queue.count < QUEUE_CAPACITY;
-    if (accepted) {
-        queue.fds[(queue.head + queue.count) % QUEUE_CAPACITY] = client_fd;
-        ++queue.count;
-        pthread_cond_signal(&queue.not_empty);
-    }
+    while (queue.count == QUEUE_CAPACITY)
+        pthread_cond_wait(&queue.not_full, &queue.lock);
+    queue.fds[(queue.head + queue.count) % QUEUE_CAPACITY] = client_fd;
+    ++queue.count;
+    pthread_cond_signal(&queue.not_empty);
     pthread_mutex_unlock(&queue.lock);
-    return accepted ? 0 : -1;
 }
 
 /*
@@ -299,6 +304,7 @@ static int queue_pop(void)
         client_fd = queue.fds[queue.head];
         queue.head = (queue.head + 1) % QUEUE_CAPACITY;
         --queue.count;
+        pthread_cond_signal(&queue.not_full); /* 기다리던 main 스레드를 깨움 */
     }
     pthread_mutex_unlock(&queue.lock);
     return client_fd;
@@ -490,11 +496,7 @@ int main(int argc, char **argv)
             nanosleep(&pause, NULL);
             continue;
         }
-        if (queue_push(client_fd) == -1) {
-            /* 작업 스레드가 모두 바쁘고 대기열도 가득 참 → 오래 기다리게 하는 대신 바로 거절 */
-            send_error_response(client_fd, 503, 0, 0, NULL);
-            close_socket(client_fd);
-        }
+        queue_push(client_fd);
     }
 
     fprintf(stderr, "shutting down: closing listener and waiting for %d workers\n", started);

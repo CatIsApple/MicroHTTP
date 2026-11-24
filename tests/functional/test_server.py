@@ -318,20 +318,23 @@ def test_concurrent_many_clients(server):
         assert all(pool.map(client, range(200)))     # 200 연결 × 10 요청 = 2000 요청
 
 
-def test_queue_full_returns_503(server):
-    # 작업 스레드 1개 + 대기열 64개가 모두 찬 상태에서 새 연결은 503
-    busy = Server("-t", "1", port=PORT + 1)
-    held = []
+def test_pool_exhausted_requests_wait_not_fail(server):
+    # 작업 스레드가 1개뿐이고 그 스레드를 느린 클라이언트가 붙잡으면, 다음 요청은 실패하지 않고
+    # 큐에서 기다렸다가 스레드가 풀려난 뒤(유휴 타임아웃 5초) 처리됩니다. → 스레드 풀 크기의 한계
+    single = Server("-t", "1", port=PORT + 1)
     try:
-        for _ in range(66):
-            held.append(connect(PORT + 1))           # 아무것도 보내지 않고 붙잡아 둠
-        time.sleep(0.3)
-        status, headers, _ = request(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", port=PORT + 1)
-        assert status == 503 and headers["connection"] == "close"
+        slow = connect(PORT + 1)
+        slow.sendall(b"GET / HTTP/1.1\r\nHost:")              # 유일한 작업 스레드를 점유
+        time.sleep(0.2)
+        start = time.time()
+        status, _, _ = request(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", port=PORT + 1)
+        waited = time.time() - start
+        assert status == 200
+        assert IDLE_TIMEOUT - 1 <= waited <= IDLE_TIMEOUT + 2, waited
+        assert read_response(slow)[0] == 408                    # 느린 쪽은 타임아웃
+        slow.close()
     finally:
-        for sock in held:
-            sock.close()
-        busy.stop()
+        single.stop()
 
 
 # ── 시그널 / 셧다운 ──────────────────────────────────────────────────────
