@@ -1,4 +1,8 @@
 /server
-/tests/test_send
+/build/
 *.dSYM/
 __pycache__/
+# 이전 실험의 로컬 파일들은 커밋하지 않습니다. 새 테스트는 unit/, functional/ 아래에 둡니다.
+/tests/*
+!/tests/unit/
+!/tests/functional/

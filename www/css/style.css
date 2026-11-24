@@ -1,0 +1,5 @@
+/* text/css로 전달되어야 브라우저가 스타일을 적용합니다. */
+body { font-family: system-ui, sans-serif; margin: 0; background: #f6f7f9; color: #1d2433; }
+main { max-width: 640px; margin: 48px auto; padding: 0 16px; }
+code { background: #e7eaf0; padding: 1px 4px; border-radius: 4px; }
+img { image-rendering: pixelated; border: 1px solid #c9ced8; margin-right: 8px; }
