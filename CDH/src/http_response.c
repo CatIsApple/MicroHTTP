@@ -8,6 +8,7 @@
 #include <errno.h>  /* errno, EINVAL */
 #include <stdarg.h> /* va_list (appendf 의 가변 인자) */
 #include <stdio.h>  /* snprintf, vsnprintf */
+#include <string.h> /* strlen, strcmp, memcmp (http_parse_date) */
 
 /* 상태 코드와 이유 문구 쌍 (RFC 7231 6장 등) */
 static const struct {
@@ -67,6 +68,50 @@ int http_format_date(char *out, size_t cap, time_t t) /* t → "Sun, 06 Nov 1994
     if (n < 0 || (size_t)n >= cap)        /* 형식 오류 또는 잘림 */
         return -1;                        /* 버퍼 부족 */
     return n;                             /* 쓴 바이트 수 */
+}
+
+/* 1970-01-01 부터 y-m-d 까지의 일수 (그레고리력, 음수 연도도 됨). timegm 은 POSIX 가 아니라서 직접 계산.
+ * 3월을 한 해의 시작으로 두면 윤일(2/29)이 해의 끝에 와서 식이 단순해진다 (Howard Hinnant 의 days_from_civil) */
+static long long days_from_civil(int y, int m, int d)
+{
+    y -= m <= 2;                                                     /* 1·2월은 전년도의 13·14월로 */
+    long long era = (y >= 0 ? y : y - 399) / 400;                    /* 400년 주기 번호 */
+    long long yoe = y - era * 400;                                   /* 주기 안의 연도 [0, 399] */
+    long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;  /* 3월 1일부터의 날짜 [0, 365] */
+    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;           /* 주기 안의 날짜 [0, 146096] */
+    return era * 146097 + doe - 719468;                              /* 719468 = 0000-03-01 → 1970-01-01 */
+}
+
+static int two_digits(const char *s) /* "07" → 7, 숫자가 아니면 -1 */
+{
+    if (s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9')
+        return -1;
+    return (s[0] - '0') * 10 + (s[1] - '0');
+}
+
+int http_parse_date(const char *s, time_t *out) /* "Sun, 06 Nov 1994 08:49:37 GMT" → time_t */
+{
+    static const char MONTHS[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    /* 고정 위치:  0123456789012345678901234567 8
+     *            "Sun, 06 Nov 1994 08:49:37 GMT" (29글자) */
+    if (strlen(s) != 29 || s[3] != ',' || s[4] != ' ' || s[7] != ' ' || s[11] != ' ' || s[16] != ' ' ||
+        s[19] != ':' || s[22] != ':' || strcmp(s + 25, " GMT") != 0)
+        return -1;
+    int mon = -1;
+    for (int i = 0; i < 12; i++)
+        if (memcmp(s + 8, MONTHS + i * 3, 3) == 0)
+            mon = i + 1;
+    int day = two_digits(s + 5), yh = two_digits(s + 12), yl = two_digits(s + 14);
+    int hh = two_digits(s + 17), mm = two_digits(s + 20), ss = two_digits(s + 23);
+    if (mon < 0 || day < 1 || yh < 0 || yl < 0 || hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 60)
+        return -1;                                                   /* ss == 60: 윤초 */
+    int year = yh * 100 + yl;
+    static const int MDAYS[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (day > MDAYS[mon - 1] + (mon == 2 && leap))                   /* 2월 30일 같은 날짜 */
+        return -1;
+    *out = (time_t)(days_from_civil(year, mon, day) * 86400 + hh * 3600 + mm * 60 + ss);
+    return 0;
 }
 
 /* ---- 헤더 값 검증 (응답 분할 / 헤더 주입 방지) ---- */
@@ -170,7 +215,7 @@ int http_send_response(int fd, const http_response *res, int timeout_ms) /* 머�
         errno = EINVAL;                                              /* 호출자가 "송신 실패" 와 구분할 수 있게 */
         return -1;
     }
-    size_t blen = http_status_has_body(res->status) ? res->body_len : 0; /* 204 / 304 는 본문을 보내지 않음 */
+    size_t blen = http_status_has_body(res->status) && !res->head_only ? res->body_len : 0; /* 204 / 304 / HEAD 는 본문을 보내지 않음 */
 
     if (res->use_file && blen > 0)                                   /* 파일 본문: 머리 뒤에 파일 구간을 커널이 바로 복사 */
         return tcp_sendfile_all(fd, head, (size_t)hlen, res->file_fd, res->file_offset, blen, timeout_ms);
@@ -183,6 +228,11 @@ int http_send_response(int fd, const http_response *res, int timeout_ms) /* 머�
 
 int http_send_error(int fd, int status, const char *extra_headers, int timeout_ms) /* "<코드> <이유>\n" 오류 응답 */
 {
+    return http_send_error_ex(fd, status, extra_headers, 0, timeout_ms);
+}
+
+int http_send_error_ex(int fd, int status, const char *extra_headers, int head_only, int timeout_ms)
+{
     char body[64];                                                   /* 본문: 예) "404 Not Found\n" */
     int blen = snprintf(body, sizeof(body), "%d %s\n", status, http_reason(status)); /* 본문 문자열 만들기 */
     if (blen < 0 || (size_t)blen >= sizeof(body))                    /* 만들기 실패나 잘림 (이유 문구는 짧아서 사실상 없음) */
@@ -193,7 +243,8 @@ int http_send_error(int fd, int status, const char *extra_headers, int timeout_m
         .body = body,                                                /* 위에서 만든 본문 */
         .body_len = (size_t)blen,                                    /* 본문 길이 */
         .keep_alive = 0,                                             /* 오류 후엔 항상 연결 종료 */
-        .extra_headers = extra_headers,                              /* 405 의 Allow 등 */
+        .head_only = head_only,                                      /* HEAD 요청이면 머리만 */
+        .extra_headers = extra_headers,                              /* 405 의 Allow, 301 의 Location 등 */
     };
     return http_send_response(fd, &res, timeout_ms);                 /* 보내기 */
 }

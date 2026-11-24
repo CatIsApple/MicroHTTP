@@ -2,7 +2,8 @@
  *
  * curl 로 손으로 확인하던 것을 자동화한 것. 외부 도구(curl, nc) 없이 소켓으로 직접 보내서
  * macOS / Linux 어디서나 같은 결과가 나오게 했다. 단위 테스트가 못 보는 main.c 의 흐름
- * (431, 반쯤 닫힌 요청 400, echo, 100-continue, 비정상 종료 뒤 생존, SIGINT 종료) 을 검사한다.
+ * (정적 파일 200/301/304/403/404·HEAD·큰 파일, 431, 반쯤 닫힌 요청 400, echo, 100-continue,
+ *  비정상 종료 뒤 생존, SIGINT 종료) 을 검사한다. 문서 루트는 임시 디렉터리에 만들어 -r 로 넘긴다.
  *
  * 서버 경로: 환경 변수 MICROHTTP_BIN (기본 "./microhttp"). make test 가 먼저 빌드해 둔다. */
 
@@ -18,6 +19,7 @@
 #include <stdlib.h>     /* getenv, malloc, free, strtol, _Exit */
 #include <string.h>     /* strlen, strstr, strncmp, memset, memcpy */
 #include <sys/socket.h> /* socket, connect, shutdown, setsockopt, getsockname */
+#include <sys/stat.h>   /* mkdir */
 #include <sys/time.h>   /* struct timeval (SO_RCVTIMEO) */
 #include <sys/wait.h>   /* waitpid, WIFEXITED */
 #include <time.h>       /* nanosleep */
@@ -25,6 +27,7 @@
 
 static struct sockaddr_in g_addr; /* 서버 주소 (127.0.0.1:포트) */
 static pid_t g_server = -1;       /* 서버 프로세스 */
+static char g_root[] = "/tmp/microhttp_ft_XXXXXX"; /* 임시 문서 루트 */
 
 static void sleep_ms(long ms)
 {
@@ -91,7 +94,7 @@ static int start_server(const char *bin)
         int dn = open("/dev/null", O_WRONLY);
         dup2(dn, 1);
         dup2(dn, 2);
-        execl(bin, bin, "-q", ps, (char *)NULL);
+        execl(bin, bin, "-q", "-r", g_root, ps, (char *)NULL);
         _Exit(127);                              /* exec 실패 (경로 틀림 등) */
     }
     for (int i = 0; i < 300; i++) {              /* 최대 3초 동안 접속 시도 */
@@ -108,7 +111,7 @@ static int start_server(const char *bin)
     return -1;
 }
 
-static char g_resp[512 * 1024]; /* 마지막 응답 */
+static char g_resp[4 * 1024 * 1024]; /* 마지막 응답 (큰 파일 테스트용으로 넉넉히) */
 static size_t g_len;            /* 마지막 응답 길이 */
 static int g_read_err;          /* 읽다가 오류(ECONNRESET 등)가 났으면 errno, 아니면 0 */
 
@@ -154,6 +157,35 @@ static const char *body(void) /* 빈 줄 뒤 */
 }
 
 /* 응답 형식 검사: Content-Length 가 실제 본문 길이와 같고 Connection: close 이며 정상 EOF */
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* 문서 루트에 파일 만들기 */
+static void put_file(const char *name, const char *data, size_t len)
+{
+    char p[256];
+    snprintf(p, sizeof(p), "%s/%s", g_root, name);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        write_all(fd, data, len);
+        close(fd);
+    }
+}
+
+/* 응답 머리에서 헤더 값 위치 (없으면 NULL). 값은 다음 "\r\n" 까지 — 비교는 strncmp 로 */
+static const char *header(const char *name)
+{
+    char key[64];
+    snprintf(key, sizeof(key), "\r\n%s: ", name);
+    const char *b = body();
+    const char *h = strstr(g_resp, key);
+    return (h && b && h < b) ? h + strlen(key) : NULL;
+}
+
 static int framing_ok(void)
 {
     const char *b = body();
@@ -170,16 +202,125 @@ int main(void)
     const char *bin = getenv("MICROHTTP_BIN");
     if (bin == NULL)
         bin = "./microhttp";
+
+    /* 임시 문서 루트 */
+    if (mkdtemp(g_root) == NULL) {
+        perror("mkdtemp");
+        return 1;
+    }
+    static const char INDEX[] = "<h1>index</h1>\n";
+    put_file("index.html", INDEX, sizeof(INDEX) - 1);
+    put_file("style.css", "body{}", 6);
+    put_file("hello world.txt", "hi", 2);
+    char sub[256];
+    snprintf(sub, sizeof(sub), "%s/sub", g_root);
+    mkdir(sub, 0755);
+    put_file("sub/index.html", "sub", 3);
+    put_file(".secret", "no", 2);
+    size_t big_len = 3 * 1024 * 1024 + 123;                   /* 3MB + 조금: sendfile 이 여러 번 도는 크기 */
+    char *big = malloc(big_len);
+    for (size_t i = 0; i < big_len; i++)
+        big[i] = (char)(i * 31 + (i >> 12));
+    put_file("big.bin", big, big_len);
+
     if (start_server(bin) != 0) {
         fprintf(stderr, "cannot start server: %s (run `make` first)\n", bin);
         return 1;
     }
 
-    /* ---- 정상 요청 ---- */
-    send_str("GET /hello?a=1 HTTP/1.1\r\nHost: t\r\n\r\n");
+    /* ---- 정적 파일 ---- */
+    send_str("GET / HTTP/1.1\r\nHost: t\r\n\r\n");          /* "/" → index.html */
     CHECK_INT(status(), 200);
     CHECK(framing_ok());
     CHECK(strstr(g_resp, "\r\nDate: ") != NULL && strstr(g_resp, "\r\nServer: microhttp\r\n") != NULL);
+    CHECK_STR(body(), INDEX);
+    CHECK(header("Content-Type") && strncmp(header("Content-Type"), "text/html; charset=utf-8\r\n", 26) == 0);
+    CHECK(header("Last-Modified") != NULL);
+
+    send_str("GET /style.css?v=1 HTTP/1.1\r\nHost: t\r\n\r\n"); /* 쿼리는 무시 */
+    CHECK_INT(status(), 200);
+    CHECK(framing_ok());
+    CHECK_STR(body(), "body{}");
+    CHECK(header("Content-Type") && strncmp(header("Content-Type"), "text/css", 8) == 0);
+
+    send_str("GET /hello%20world.txt HTTP/1.1\r\nHost: t\r\n\r\n"); /* %20 디코딩 */
+    CHECK_INT(status(), 200);
+    CHECK_STR(body(), "hi");
+
+    send_str("GET /sub/ HTTP/1.1\r\nHost: t\r\n\r\n");      /* 하위 디렉터리 index */
+    CHECK_INT(status(), 200);
+    CHECK_STR(body(), "sub");
+
+    send_str("GET /sub?x=1 HTTP/1.1\r\nHost: t\r\n\r\n");   /* '/' 빠진 디렉터리 → 301 */
+    CHECK_INT(status(), 301);
+    CHECK(framing_ok());
+    CHECK(header("Location") && strncmp(header("Location"), "/sub/?x=1\r\n", 11) == 0);
+
+    send_str("GET /nope.html HTTP/1.1\r\nHost: t\r\n\r\n");
+    CHECK_INT(status(), 404);
+    CHECK(framing_ok());
+    CHECK_STR(body(), "404 Not Found\n");
+
+    send_str("GET /../../etc/passwd HTTP/1.1\r\nHost: t\r\n\r\n"); /* 디렉터리 탈출 */
+    CHECK_INT(status(), 403);
+    send_str("GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: t\r\n\r\n");
+    CHECK_INT(status(), 403);
+    send_str("GET /.secret HTTP/1.1\r\nHost: t\r\n\r\n");   /* 숨김 파일 */
+    CHECK_INT(status(), 403);
+    CHECK(body() && strstr(body(), "no") == NULL);
+
+    /* 조건부 GET: 받은 Last-Modified 를 그대로 보내면 304 (본문·Content-Length 없음) */
+    {
+        send_str("GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+        char lm[64] = {0};
+        const char *h = header("Last-Modified");
+        if (h)
+            snprintf(lm, sizeof(lm), "%.*s", (int)strcspn(h, "\r"), h);
+        char req[256];
+        snprintf(req, sizeof(req), "GET /style.css HTTP/1.1\r\nHost: t\r\nIf-Modified-Since: %s\r\n\r\n", lm);
+        send_str(req);
+        CHECK_INT(status(), 304);
+        CHECK(body() && *body() == '\0');                       /* 본문 없음 */
+        CHECK(header("Content-Length") == NULL);
+        CHECK(g_read_err == 0);
+    }
+
+    /* HEAD: 머리는 GET 과 같고 (Content-Length = 파일 크기) 본문은 없음 */
+    send_str("HEAD /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+    CHECK_INT(status(), 200);
+    CHECK(header("Content-Length") && strncmp(header("Content-Length"), "6\r\n", 3) == 0);
+    CHECK(body() && *body() == '\0');
+    send_str("HEAD /nope HTTP/1.1\r\nHost: t\r\n\r\n");
+    CHECK_INT(status(), 404);
+    CHECK(body() && *body() == '\0');
+
+    /* 큰 파일: 내용이 바이트 단위로 같아야 함 (sendfile 이 여러 번 나눠 보내는 경로) */
+    send_str("GET /big.bin HTTP/1.1\r\nHost: t\r\n\r\n");
+    CHECK_INT(status(), 200);
+    CHECK(framing_ok());
+    CHECK(header("Content-Type") && strncmp(header("Content-Type"), "application/octet-stream", 24) == 0);
+    CHECK(body() && g_len - (size_t)(body() - g_resp) == big_len && memcmp(body(), big, big_len) == 0);
+
+    /* 작은 파일 응답이 지연 없이 옴 (머리 MSG_MORE 가 sendfile 뒤에 밀려 나가지 않고 남아 있으면
+     * 커널 cork 타이머 200ms, Nagle + 지연 ACK 면 40ms 씩 걸린다) → 20번에 1초 미만 */
+    {
+        long long t0 = now_ms();
+        int ok = 1;
+        for (int i = 0; i < 20; i++) {
+            send_str("GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+            ok = ok && status() == 200;
+        }
+        long long dt = now_ms() - t0;
+        CHECK(ok);
+        CHECK(dt < 1000);
+        if (dt >= 1000)
+            fprintf(stderr, "20 small GETs took %lld ms\n", dt);
+    }
+
+    /* ---- POST → echo ---- */
+    send_str("POST /hello?a=1 HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    CHECK_INT(status(), 200);
+    CHECK(framing_ok());
     CHECK(body() && strstr(body(), "uri: /hello?a=1\n") != NULL);
 
     send_str("POST /p HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc");
@@ -295,7 +436,7 @@ int main(void)
         close(fd);
 
         sleep_ms(50);
-        send_str("GET /alive HTTP/1.1\r\nHost: t\r\n\r\n");
+        send_str("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
         CHECK_INT(status(), 200);                         /* 다음 요청은 정상 처리 */
     }
 
@@ -316,6 +457,17 @@ int main(void)
             waitpid(g_server, NULL, 0);
         }
     }
+
+    /* 문서 루트 정리 */
+    free(big);
+    const char *names[] = {"index.html", "style.css", "hello world.txt", "sub/index.html", ".secret", "big.bin"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char p[256];
+        snprintf(p, sizeof(p), "%s/%s", g_root, names[i]);
+        unlink(p);
+    }
+    rmdir(sub);
+    rmdir(g_root);
 
     return TEST_REPORT();
 }

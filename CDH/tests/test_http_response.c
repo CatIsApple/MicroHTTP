@@ -6,12 +6,16 @@
 #include "http_response.h" /* 테스트 대상 */
 #include "tcp_server.h"    /* tcp_sendv_all, tcp_sendfile_all */
 #include "test.h"          /* CHECK, CHECK_INT, CHECK_STR, TEST_REPORT */
+#include <arpa/inet.h>     /* htonl */
 #include <errno.h>         /* errno, ETIMEDOUT */
-#include <signal.h>        /* signal, SIGPIPE, SIG_IGN */
+#include <netinet/in.h>    /* struct sockaddr_in, INADDR_LOOPBACK */
+#include <signal.h>        /* signal, kill, SIGPIPE, SIGKILL, SIG_IGN */
+#include <stdio.h>         /* fprintf */
 #include <stdlib.h>        /* malloc, free, _Exit, mkstemp */
 #include <string.h>        /* strcmp, strlen, strstr, memcmp, memset */
-#include <sys/socket.h>    /* socketpair, AF_UNIX, SOCK_STREAM */
+#include <sys/socket.h>    /* socketpair, socket, connect, accept, AF_UNIX, SOCK_STREAM */
 #include <sys/wait.h>      /* waitpid */
+#include <time.h>          /* clock_gettime, nanosleep */
 #include <unistd.h>        /* fork, read, write, close, unlink */
 
 /* fd 에서 EOF 까지 전부 읽어 malloc 버퍼로 돌려준다. *len 에 길이 (끝에 '\0' 도 붙임) */
@@ -340,6 +344,49 @@ int main(void)
         close(sv[0]);
         CHECK_INT(tcp_sendfile_all(sv[1], "x", 1, file_fd, 0, blen, 1000), -1);
         close(sv[1]);
+
+        /* 찔끔찔끔 읽는 클라이언트 (진짜 TCP, 버퍼 작게): 512B / 100ms = 5KB/s < TCP_SEND_MIN_RATE.
+         * 진척은 계속 있어서 무진척 마감(2s)으로는 안 끊긴다 → 그것만 있으면 4MB 다 보낼 때까지 ~800초 붙잡힘.
+         * 최저 속도 마감이 있으면 약 (2s + 버퍼분) / (1 - 5/16) ≈ 4~5초에 ETIMEDOUT. */
+        {
+            int lfd = tcp_listen(0, 1);                          /* 포트 0 = 아무 빈 포트 */
+            struct sockaddr_in a;
+            socklen_t al = sizeof(a);
+            CHECK(lfd >= 0 && getsockname(lfd, (struct sockaddr *)&a, &al) == 0);
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            int cfd = socket(AF_INET, SOCK_STREAM, 0);
+            int small = 4096;
+            setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)); /* connect 전에 → 창 크기가 작게 잡힘 */
+            CHECK_INT(connect(cfd, (struct sockaddr *)&a, sizeof(a)), 0);
+            int sfd = accept(lfd, NULL, NULL);
+            setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+            pid_t pid = fork();
+            if (pid == 0) {                                      /* 자식: 느린 클라이언트 */
+                close(sfd);
+                close(lfd);
+                char b[512];
+                for (int i = 0; i < 600 && read(cfd, b, sizeof(b)) > 0; i++) /* 최대 60초 */
+                    nanosleep(&(struct timespec){.tv_nsec = 100 * 1000000L}, NULL);
+                _Exit(0);
+            }
+            close(cfd);
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            errno = 0;
+            int rc = tcp_sendfile_all(sfd, "H", 1, file_fd, 0, blen, 2000);
+            int err = errno;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long long dt = (t1.tv_sec - t0.tv_sec) * 1000LL + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+            CHECK_INT(rc, -1);
+            CHECK_INT(err, ETIMEDOUT);
+            CHECK(dt >= 2000 && dt < 12000);                     /* 무진척 마감보다는 길고, 다 보낼 때보다는 훨씬 짧게 */
+            if (dt < 2000 || dt >= 12000)
+                fprintf(stderr, "slow reader cut after %lld ms\n", dt);
+            close(sfd);
+            close(lfd);
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+        }
 
         close(file_fd);
     }

@@ -14,6 +14,7 @@
 int tcp_listen(uint16_t port, int backlog); /* port: 열 포트 번호, backlog: 접속 대기 큐 크기 */
 
 /* accept() 래퍼. EINTR 시 -1 반환(errno 유지) — 호출자가 종료 플래그 확인.
+ * 돌려주는 연결 소켓은 논블로킹 + CLOEXEC (이 모듈의 송수신 함수는 모두 마감 시간 안에서 poll 로 기다린다).
  * client_addr_buf 가 NULL 이 아니면 "ip:port" 문자열을 채운다. */
 int tcp_accept(int listen_fd, char *client_addr_buf, size_t buf_len); /* 반환: 새 연결 fd 또는 -1 */
 
@@ -28,10 +29,21 @@ int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms); /* buf �
  * 길이 0 인 덩어리는 건너뜀. 주의: 진행 상황 기록용으로 iov 배열 내용을 바꾼다 (재사용 금지). */
 int tcp_sendv_all(int fd, struct iovec *iov, int iovcnt, int timeout_ms);
 
+/* 파일 송신의 최저 평균 속도 (바이트/초). 이보다 느리게 받는 클라이언트는 끊는다 (tcp_sendfile_all 참고).
+ * 16 KiB/s = 128 kbit/s: 아주 느린 모바일 회선도 통과하지만, 바이트를 찔끔찔끔 받아
+ * 한 연결씩 처리하는 서버를 몇 시간씩 붙잡는 클라이언트는 막는다. */
+#ifndef TCP_SEND_MIN_RATE
+#define TCP_SEND_MIN_RATE (16 * 1024)
+#endif
+
 /* 머리(head) 를 보낸 뒤 파일 file_fd 의 [offset, offset+len) 구간을 보낸다 (정적 파일 응답용).
- * 리눅스: sendfile() 로 커널 안에서 바로 복사 (zero-copy). 그 밖의 OS: pread + send 64KB 씩.
- * timeout_ms 는 머리 + 파일 "전체" 의 마감 시간. 성공 0, 실패 -1
- * (초과 ETIMEDOUT, 파일이 len 보다 짧으면 EIO). 파일 위치(lseek)는 바꾸지 않는다. */
+ *   리눅스: 머리를 MSG_MORE 로 맡겨 두고 sendfile() → 커널 안에서 바로 복사 (zero-copy), 머리와 본문이 같은 패킷.
+ *   macOS : sendfile() 의 hdtr 로 머리까지 시스템콜 하나에 (zero-copy). TCP 가 아닌 소켓이면 아래 경로로.
+ *   그 밖  : pread + sendmsg 64KB 씩, 첫 조각은 머리와 같이 (작은 파일 = 시스템콜·패킷 하나).
+ * 마감은 두 개 중 이른 쪽 (큰 파일도 느린 회선에서 끝까지 가도록 "전체 고정" 마감은 쓰지 않는다):
+ *   무진척   : 마지막으로 바이트가 나간 뒤 timeout_ms 동안 진척 없음
+ *   최저 속도: 시작 후 timeout_ms + (보낸 바이트 / TCP_SEND_MIN_RATE) 초가 지남
+ * 성공 0, 실패 -1 (초과 ETIMEDOUT, 파일이 len 보다 짧으면 EIO). 파일 위치(lseek)는 바꾸지 않는다. */
 int tcp_sendfile_all(int sock, const void *head, size_t head_len,
                      int file_fd, off_t offset, size_t len, int timeout_ms);
 

@@ -14,10 +14,11 @@
 #define HTTP_MAX_HEADERS 64   /* 헤더 줄 최대 개수. 넘으면 431 (헤더 폭탄 방지 + 고정 크기 배열 크기) */
 #define HTTP_MAX_URI_LEN 2048 /* URI 최대 길이(바이트). 넘으면 414 (브라우저·서버들의 흔한 상한) */
 
-/* 요청 메서드. GET/POST 만 지원, 그 외 문법상 올바른 메서드는 OTHER(→ 501) */
+/* 요청 메서드. GET/POST/HEAD 만 지원, 그 외 문법상 올바른 메서드는 OTHER(→ 501) */
 typedef enum {          /* enum: 이름 붙은 정수 상수 묶음. 문자열 비교를 한 번만 하고 이후엔 정수로 분기 */
     HTTP_METHOD_GET,    /* "GET"  (= 0) : 리소스 조회 */
     HTTP_METHOD_POST,   /* "POST" (= 1) : 본문을 서버로 전송 */
+    HTTP_METHOD_HEAD,   /* "HEAD" (= 2) : GET 과 같은 머리, 본문 없음 (curl -I). 범용 서버는 GET·HEAD 필수 (RFC 7231 4.1) */
     HTTP_METHOD_OTHER   /* 그 외 ("PUT", "DELETE" 등) : 문법은 맞지만 구현 안 함 → 501 */
 } http_method;          /* 타입 이름 */
 

@@ -11,7 +11,7 @@ CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
 CPPFLAGS += -Iinclude
 
 # 라이브러리 소스: main 을 뺀 모듈들 (서버 실행 파일과 단위 테스트가 함께 씀)
-LIB_SRCS := src/tcp_server.c src/http_parser.c src/http_body.c src/http_response.c
+LIB_SRCS := src/tcp_server.c src/http_parser.c src/http_body.c src/http_response.c src/mime.c src/static_file.c
 # 서버 소스 목록 = main + 라이브러리
 SRCS := src/main.c $(LIB_SRCS)
 # 오브젝트 파일 목록: src/xxx.c → build/xxx.o 로 이름만 바꿔서 만듦

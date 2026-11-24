@@ -22,6 +22,7 @@ typedef struct {
     const char *content_type;  /* Content-Type 값. 예: "text/html; charset=utf-8". NULL 이면 헤더 생략 */
     size_t body_len;           /* 본문 길이 → Content-Length (204 / 304 는 본문·Content-Length 를 보내지 않음) */
     int keep_alive;            /* 1 이면 "Connection: keep-alive", 0 이면 "Connection: close" */
+    int head_only;             /* 1 이면 머리만 보냄 (HEAD 요청). Content-Length 는 GET 이었을 때의 길이 그대로 */
     const char *extra_headers; /* 추가 헤더들. "이름: 값\r\n" 줄의 연속 (예: "Allow: GET, POST\r\n"). 없으면 NULL */
 
     /* 본문 출처: use_file 이 0 이면 메모리(body), 1 이면 파일(file_fd 의 file_offset 부터 body_len 바이트) */
@@ -41,6 +42,11 @@ int http_status_has_body(int status);
  * (RFC 7231 7.1.1.1). 반환: 쓴 바이트 수('\0' 제외), out 이 모자라거나 변환 실패면 -1 */
 int http_format_date(char *out, size_t cap, time_t t);
 
+/* http_format_date 의 반대: "Sun, 06 Nov 1994 08:49:37 GMT" → *out (If-Modified-Since 용).
+ * IMF-fixdate 만 받는다 (RFC 7231 이 옛 형식 두 가지도 허용하지만 요즘 클라이언트는 이 형식만 보냄).
+ * 요일은 검사하지 않는다. 성공 0, 형식이 아니거나 값이 범위 밖(13월, 25시 등)이면 -1 */
+int http_parse_date(const char *s, time_t *out);
+
 /* 응답 머리를 out 에 쓴다:
  *   HTTP/1.1 <status> <reason>\r\n
  *   Date: <now>\r\n
@@ -57,7 +63,7 @@ int http_format_head(char *out, size_t cap, const http_response *res, time_t now
 
 /* 머리 + 본문을 마감 시간(timeout_ms) 안에 보낸다.
  * 메모리 본문: sendmsg 한 번 (복사 없음). 파일 본문: 머리 전송 후 sendfile (zero-copy, 리눅스).
- * 204 / 304 는 본문을 보내지 않는다.
+ * 204 / 304 와 head_only 응답은 본문을 보내지 않는다.
  * 성공 0, 실패 -1 (errno: 머리 만들기 실패면 EINVAL, 송신 실패면 EPIPE / ETIMEDOUT / EIO 등) */
 int http_send_response(int fd, const http_response *res, int timeout_ms);
 
@@ -65,5 +71,8 @@ int http_send_response(int fd, const http_response *res, int timeout_ms);
  * 항상 "Connection: close". extra_headers 는 http_response 와 같은 규칙 (405 의 "Allow: ..." 등), 없으면 NULL.
  * 반환은 http_send_response 와 같음 */
 int http_send_error(int fd, int status, const char *extra_headers, int timeout_ms);
+
+/* http_send_error + head_only (HEAD 요청에 대한 오류: 머리만, Content-Length 는 본문이 있었을 때 길이) */
+int http_send_error_ex(int fd, int status, const char *extra_headers, int head_only, int timeout_ms);
 
 #endif /* HTTP_RESPONSE_H — 인클루드 가드 끝 */

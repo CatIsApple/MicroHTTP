@@ -1,13 +1,15 @@
 /* main.c — 서버 프로그램의 진입점.
  * 명령줄 인자 처리, 시그널 설정, 연결을 하나씩 받아 처리하는 메인 루프,
  * 그리고 요청을 파싱(http_parser)·본문 수신(http_body)한 뒤 응답을 보내는 일을 맡는다.
- * 지금 응답은 요청 내용을 그대로 보여 주는 echo (정적 파일·프록시는 다음 단계). */
+ * GET / HEAD → 문서 루트의 정적 파일 (static_file + sendfile)
+ * POST       → 요청 내용을 그대로 보여 주는 echo (동적 처리·프록시는 다음 단계에서 이 자리를 대체) */
 
 #define _POSIX_C_SOURCE 200809L /* POSIX 2008 함수(sigaction, nanosleep 등)를 헤더에서 보이게 함. include 보다 먼저 */
 
 #include "http_body.h"     /* http_read_body (Content-Length 만큼 본문 받기) */
 #include "http_parser.h"   /* http_parse_request, http_request (요청 헤더 파싱) */
 #include "http_response.h" /* http_response, http_send_response, http_send_error, http_reason */
+#include "static_file.h"   /* static_open_root, static_lookup (URI → 파일) */
 #include "tcp_server.h" /* tcp_listen, tcp_accept, tcp_recv_request, tcp_sendv_all, tcp_close_graceful */
 
 #include <errno.h>      /* errno, EINTR, ETIMEDOUT, EMFILE, ENFILE */
@@ -22,6 +24,7 @@
 #include <unistd.h>     /* close */
 
 #define DEFAULT_PORT 8080      /* 포트 인자를 안 주면 쓰는 기본 포트 */
+#define DEFAULT_ROOT "./www"   /* -r 을 안 주면 쓰는 문서 루트 (정적 파일 디렉터리) */
 #define BACKLOG 128            /* listen() 대기 큐 크기: handshake 끝나고 accept 를 기다리는 연결 최대 수 */
 #define RECV_BUF_SIZE 8192     /* 요청 헤더를 받을 버퍼 크기 (헤더 최대 8191바이트 + '\0') */
 #define CLIENT_TIMEOUT_MS 5000 /* 요청 수신, 응답 송신 각각의 전체 마감 시간 */
@@ -80,6 +83,36 @@ static int log_sent(int rc, const char *peer, int status)
 static int send_error(int cfd, const char *peer, int status) /* status: 400, 413 등 */
 {
     return log_sent(http_send_error(cfd, status, NULL, CLIENT_TIMEOUT_MS), peer, status); /* 전송 + 로그 */
+}
+
+static int g_root_fd = -1; /* 문서 루트 디렉터리 fd. 시작할 때 한 번 열고 요청마다 openat 의 기준으로 씀 */
+
+/* GET / HEAD → 정적 파일.
+ * 파일 내용은 유저 공간으로 읽지 않는다: 연 fd 를 http_send_response 에 넘기면 sendfile 로 커널이 바로 보낸다. */
+static int serve_static(int cfd, const char *peer, const http_request *req)
+{
+    static_result r;                                               /* 상태 코드 + 열린 파일 + 추가 헤더 */
+    static_lookup(g_root_fd, req->uri, http_get_header(req, "If-Modified-Since"), &r);
+    int head_only = req->method == HTTP_METHOD_HEAD;               /* HEAD: 머리만 (Content-Length 는 그대로) */
+
+    if (r.status != 200 && r.status != 304)                        /* 301 (Location 헤더 포함) / 403 / 404 / 500 ... */
+        return log_sent(http_send_error_ex(cfd, r.status, r.headers, head_only, CLIENT_TIMEOUT_MS), peer, r.status);
+
+    http_response res = {
+        .status = r.status,                                        /* 200 또는 304 */
+        .content_type = r.content_type,                            /* 304 는 NULL → Content-Type 생략 */
+        .body_len = r.size,                                        /* Content-Length = 파일 크기 */
+        .keep_alive = 0,                                           /* keep-alive 는 동시성 단계에서 → 지금은 close */
+        .head_only = head_only,
+        .extra_headers = r.headers,                                /* Last-Modified */
+        .use_file = 1,                                             /* 본문 = 파일 (sendfile) */
+        .file_fd = r.fd,                                           /* 304 면 -1 이지만 본문을 안 보내서 쓰이지 않음 */
+        .file_offset = 0,
+    };
+    int rc = log_sent(http_send_response(cfd, &res, CLIENT_TIMEOUT_MS), peer, r.status);
+    if (r.fd >= 0)
+        close(r.fd);                                               /* 보냈든 실패했든 파일은 닫는다 */
+    return rc;
 }
 
 /* 정상 요청에 대한 echo 응답: 파싱 결과 요약 + 받은 본문 그대로.
@@ -177,7 +210,10 @@ static int handle_client(int cfd, const char *peer) /* cfd: 클라이언트 연�
     if (rc > 0)                                           /* 411 / 413 / 417 / 500 */
         return send_error(cfd, peer, rc);                 /* 오류 응답 (heap 은 NULL) */
 
-    rc = send_echo(cfd, peer, &req);                      /* 정상 요청 → echo 응답 */
+    if (req.method == HTTP_METHOD_POST)                   /* POST → echo (동적 처리 단계에서 대체) */
+        rc = send_echo(cfd, peer, &req);
+    else                                                  /* GET / HEAD → 정적 파일 */
+        rc = serve_static(cfd, peer, &req);
     free(heap);                                           /* 힙 본문 반납 (NULL 이면 아무 일 없음) */
     return rc;                                            /* 0 = 응답 보냄, -1 = 전송 실패 */
 }
@@ -210,13 +246,22 @@ static void handle_accept_error(int lfd) /* tcp_accept 가 EINTR 이외의 이�
 int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 배열 (argv[0] = 프로그램 이름) */
 {
     uint16_t port = DEFAULT_PORT;              /* 기본 포트로 시작 */
+    const char *root = DEFAULT_ROOT;           /* 기본 문서 루트 */
     for (int i = 1; i < argc; i++) {           /* argv[1] 부터 인자를 하나씩 확인 */
         if (strcmp(argv[i], "-q") == 0) {      /* "-q" 면 */
             g_quiet = 1;                       /* 조용 모드 켬 */
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) { /* "-r <디렉터리>" */
+            root = argv[++i];                  /* 다음 인자가 문서 루트 */
         } else if (parse_port(argv[i], &port) < 0) {              /* 아니면 포트로 해석, 실패하면 */
-            fprintf(stderr, "usage: %s [-q] [port]\n", argv[0]);  /* 사용법 출력 */
+            fprintf(stderr, "usage: %s [-q] [-r docroot] [port]\n", argv[0]); /* 사용법 출력 */
             return EXIT_FAILURE;                                  /* 종료 코드 1 */
         }
+    }
+
+    g_root_fd = static_open_root(root);        /* 문서 루트를 한 번 열어 둠 (요청마다 경로를 다시 해석하지 않게) */
+    if (g_root_fd < 0) {
+        fprintf(stderr, "docroot %s: %s\n", root, strerror(errno)); /* 없는 디렉터리 등 */
+        return EXIT_FAILURE;
     }
 
     if (install_signal_handlers() < 0) { /* Ctrl+C·kill 처리, SIGPIPE 무시 등록 */
@@ -232,7 +277,7 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
 
     /* stdout 버퍼링은 기본값 사용: 터미널이면 줄 단위, 파일·파이프면 블록 단위로
      * 모아서 쓴다(요청마다 write 시스템콜 X). 시작 메시지만 즉시 내보낸다. */
-    printf("listening on 0.0.0.0:%u (Ctrl+C to stop)%s\n", (unsigned)port, /* 시작 메시지 */
+    printf("listening on 0.0.0.0:%u, docroot %s (Ctrl+C to stop)%s\n", (unsigned)port, root, /* 시작 메시지 */
            g_quiet ? " [quiet]" : "");                                      /* 조용 모드면 표시 추가 */
     fflush(stdout);                                                         /* 버퍼에 쌓인 시작 메시지를 즉시 출력 */
 
@@ -256,6 +301,7 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
     close(lfd);                   /* 리스닝 소켓 닫기 → 더 이상 새 연결을 받지 않음 */
     if (g_spare_fd >= 0)          /* 예비 fd 가 열려 있으면 */
         close(g_spare_fd);        /* 반납 */
+    close(g_root_fd);             /* 문서 루트 */
     printf("\nshutdown complete\n"); /* 종료 메시지 (exit 시 stdout 버퍼도 자동으로 비워짐) */
     return EXIT_SUCCESS;          /* 종료 코드 0 */
 }

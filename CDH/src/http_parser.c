@@ -156,6 +156,8 @@ static int parse_request_line(char *line, char *eol, http_request *req) /* eol: 
         req->method = HTTP_METHOD_GET;    /* GET */
     else if (strcmp(line, "POST") == 0)   /* POST 인지 */
         req->method = HTTP_METHOD_POST;   /* POST */
+    else if (strcmp(line, "HEAD") == 0)   /* HEAD 인지 */
+        req->method = HTTP_METHOD_HEAD;   /* HEAD */
     else                                  /* 그 밖의 메서드 */
         req->method = HTTP_METHOD_OTHER;  /* 나중에 501 로 거절 (헤더까지 다 검사한 뒤) */
     return 0; /* 성공 */
