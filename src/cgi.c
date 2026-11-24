@@ -1,4 +1,15 @@
-/* cgi.c — L5: CGI 실행 */
+/* cgi.c — L5: CGI 실행
+ *
+ * 레이어 구조에서의 위치
+ *   L5 라우터(router.c) 가 /cgi-bin/ 으로 시작하는 요청을 cgi_handle 로 보낸다.
+ *   스크립트 출력을 L3 응답(BODY_MEM, owned)으로 바꿔 돌려주고, 보내는 일은 연결 처리(conn.c)가 한다.
+ *
+ * 구성 (위에서 아래 순서)
+ *   1) 환경 변수 만들기: cgi_env, env_add, build_env  (fork 전에 부모가 전부 준비)
+ *   2) 실행: make_pipe, run_script  (fork → 자식은 dup2/chdir/execve, 부모는 poll 로 본문 쓰기와 출력 읽기를 함께)
+ *   3) 출력 → 응답: find_header_end, ieq, apply_output  (Status / Content-Type / Location 해석)
+ *   4) 진입점: cgi_handle  (경로 검증 → 1 → 2 → 3, 실패 종류에 따라 403/404/500/502/504)
+ */
 #if defined(__linux__)
 #define _GNU_SOURCE /* pipe2(O_CLOEXEC): 파이프를 만드는 순간부터 close-on-exec */
 #else
@@ -54,6 +65,8 @@ static int env_add(cgi_env *e, const char *name, const char *value)
     return 0;
 }
 
+/* 요청 정보로 CGI/1.1 환경 변수 목록을 만든다 (메서드, 스크립트 이름, PATH_INFO, 쿼리, 클라이언트 IP,
+ * POST 면 CONTENT_LENGTH/TYPE, 그리고 Host, User-Agent). 공간이 모자라면 -1 */
 static int build_env(cgi_env *e, const http_request *req, const char *script_name, const char *path_info)
 {
     char num[32], addr[64];
@@ -93,6 +106,7 @@ static int build_env(cgi_env *e, const http_request *req, const char *script_nam
 
 /* ---------- 실행 ---------- */
 
+/* 양쪽 끝이 close-on-exec 인 파이프를 만든다. 다른 CGI 자식에게 이 파이프가 새지 않게 하기 위해서다 */
 static int make_pipe(int p[2])
 {
 #if defined(__linux__)
@@ -244,6 +258,7 @@ static char *find_header_end(char *s, size_t n, char **body)
     return NULL;
 }
 
+/* 두 문자열이 ASCII 대소문자 무시하고 같은가 (CGI 출력 헤더 이름 비교용) */
 static int ieq(const char *a, const char *b)
 {
     for (; *a && *b; a++, b++)
@@ -301,6 +316,8 @@ static int apply_output(cgi_result *cr, http_response *res)
     return 0;
 }
 
+/* CGI 요청 하나 처리: 경로를 스크립트 이름과 PATH_INFO 로 나누고 → realpath 로 cgi_dir 안의
+ * 실행 가능한 파일인지 확인 → 환경 변수를 만들어 실행 → 결과에 따라 출력 반영 또는 502/504 */
 void cgi_handle(const server_config *cfg, const http_request *req, http_response *res)
 {
     if (req->method != HTTP_GET && req->method != HTTP_POST && req->method != HTTP_HEAD) {
