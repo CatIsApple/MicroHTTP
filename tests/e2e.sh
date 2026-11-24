@@ -47,6 +47,11 @@ head_resp=$(curl -s -I "http://127.0.0.1:$PORT/" | tr -d '\r')
 if [[ "$head_resp" == "HTTP/1.1 200"* && "$head_resp" != *Hello* ]]; then echo "  ok   HEAD has no body"; pass=$((pass + 1))
 else echo "  FAIL HEAD: '$head_resp'"; fail=$((fail + 1)); fi
 
+# ---- L3 응답 ----
+resp=$(printf 'HELLO\r\n\r\n' | nc -q 2 127.0.0.1 "$PORT" | tr -d '\r')
+check "error page is HTML" "yes" "$([[ "$resp" == *"Content-Type: text/html"* && "$resp" == *"<h1>400 Bad Request</h1>"* ]] && echo yes)"
+check "Date and Server headers" "yes" "$(curl -s -I "http://127.0.0.1:$PORT/" | grep -c -E '^(Date|Server):' | grep -q 2 && echo yes)"
+
 # 헤더를 끝내지 않고 버티는 클라이언트는 마감(5초)에 응답 없이 끊긴다
 slow=$(python3 -c '
 import socket, sys, time

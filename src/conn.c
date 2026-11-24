@@ -3,13 +3,15 @@
  * 받기 루프는 "받은 바이트를 버퍼 뒤에 붙이고 http_parse() 에 물어보기" 의 반복이다.
  * 요청이 어디서 끝나는지(빈 줄, Content-Length 만큼의 본문)는 파서가 판단한다.
  *
- * [임시] L3(응답 생성)가 아직 없어서 응답은 미리 만든 고정 문자열이다.
- *        연결은 요청 하나를 처리하고 닫는다(keep-alive 는 나중 단계).
+ * 응답은 L3(http_response)로 만든다. 오류는 파서 결과에 맞는 상태 코드의 HTML 오류 페이지.
+ * [임시] 핸들러(L4/L5)가 아직 없어서 정상 요청에는 인사말을 돌려준다.
+ *        연결은 요청 하나를 처리하고 닫는다(keep-alive 는 L6 단계).
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "conn.h"
 #include "http_request.h"
+#include "http_response.h"
 #include "tcp.h"
 
 #include <errno.h>
@@ -23,28 +25,7 @@
 #define RECV_TIMEOUT_MS 5000                          /* 요청 전체를 받는 데 주는 시간 */
 #define SEND_TIMEOUT_MS 5000                          /* 응답 전체를 보내는 데 주는 시간 */
 
-#define BODY_200 "Hello from MicroHTTP\n"
-#define HEAD_200                                  \
-    "HTTP/1.1 200 OK\r\n"                         \
-    "Content-Type: text/plain; charset=utf-8\r\n" \
-    "Content-Length: 21\r\n"                      \
-    "Connection: close\r\n"                       \
-    "\r\n"
-static const char RESP_200[] = HEAD_200 BODY_200;
-_Static_assert(sizeof(BODY_200) - 1 == 21, "Content-Length 를 본문 길이에 맞춰 고칠 것");
-
-#define EMPTY_RESP(status) "HTTP/1.1 " status "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-
-static const char *error_response(int status)
-{
-    switch (status) {
-    case 413: return EMPTY_RESP("413 Content Too Large");
-    case 431: return EMPTY_RESP("431 Request Header Fields Too Large");
-    case 501: return EMPTY_RESP("501 Not Implemented");
-    case 505: return EMPTY_RESP("505 HTTP Version Not Supported");
-    default:  return EMPTY_RESP("400 Bad Request");
-    }
-}
+#define HELLO_BODY "Hello from MicroHTTP\n"
 
 /* 요청 하나를 받아 파싱한다.
  * 반환: 1 응답할 것이 있음(*result 채움), 0 응답 없이 닫을 것(타임아웃, 오류, 빈 연결) */
@@ -95,31 +76,30 @@ void conn_serve(int fd, const char *peer, int quiet)
         goto out;
     }
 
-    const char *resp;
-    size_t resp_len;
+    http_response res;
     if (r == HTTP_PARSE_OK) {
-        resp = RESP_200;
-        /* HEAD 는 헤더만 보낸다 */
-        resp_len = req->method == HTTP_HEAD ? sizeof(HEAD_200) - 1 : sizeof(RESP_200) - 1;
-        if (!quiet) {
-            printf("[%s] %s %s HTTP/1.%d host=%s body=%zu -> 200\n", peer, req->method_str, req->path,
-                   req->version_minor, req->host ? req->host : "-", req->body_len);
-            fflush(stdout);
-        }
+        http_response_init(&res, 200);
+        http_response_body_mem(&res, HELLO_BODY, sizeof HELLO_BODY - 1, "text/plain; charset=utf-8");
     } else {
-        int status = http_parse_status(r);
-        resp = error_response(status);
-        resp_len = strlen(resp);
-        printf("[%s] bad request -> %d\n", peer, status);
-        fflush(stdout);
+        http_response_init(&res, 400);
+        http_response_error(&res, http_parse_status(r));
     }
+    res.keep_alive = 0; /* [임시] 요청 하나 처리 후 닫는다. keep-alive 는 L6 단계 */
 
-    if (tcp_send_all(fd, resp, resp_len, tcp_now_ms() + SEND_TIMEOUT_MS) < 0) {
+    if (r == HTTP_PARSE_OK && !quiet)
+        printf("[%s] %s %s HTTP/1.%d -> %d\n", peer, req->method_str, req->path, req->version_minor, res.status);
+    else if (r != HTTP_PARSE_OK)
+        printf("[%s] bad request -> %d\n", peer, res.status);
+    fflush(stdout);
+
+    int head_only = r == HTTP_PARSE_OK && req->method == HTTP_HEAD;
+    if (http_response_send(fd, &res, head_only, tcp_now_ms() + SEND_TIMEOUT_MS) < 0) {
         fprintf(stderr, "[%s] send: %s\n", peer, strerror(errno));
         close(fd);
     } else {
         tcp_close_graceful(fd);
     }
+    http_response_free(&res);
 out:
     free(buf);
     free(req);
