@@ -1,11 +1,10 @@
-/* conn.c — 연결 하나 처리: 받기(L1) → 파싱(L2) → 응답 → 닫기.
+/* conn.c — 연결 하나의 전체 수명: 받기(L1) → 파싱(L2) → 라우팅(L5) → 응답(L3) → 반복 → 닫기.
  *
- * 받기 루프는 "받은 바이트를 버퍼 뒤에 붙이고 http_parse() 에 물어보기" 의 반복이다.
- * 요청이 어디서 끝나는지(빈 줄, Content-Length 만큼의 본문)는 파서가 판단한다.
- *
- * 응답은 L3(http_response)로 만든다. 오류는 파서 결과에 맞는 상태 코드의 HTML 오류 페이지.
- * 정상 요청은 L5 router_dispatch 가 CGI 또는 정적 파일 핸들러로 보낸다.
- * [임시] 연결은 요청 하나를 처리하고 닫는다(keep-alive 는 L6 단계).
+ * keep-alive: 응답 후 연결을 닫지 않고 다음 요청을 기다린다.
+ *   - 한 번의 recv 에 다음 요청이 섞여 들어올 수 있다(파이프라이닝).
+ *     파서가 알려 주는 consumed 뒤의 바이트를 버퍼 앞으로 당겨 다음 요청으로 쓴다.
+ *   - 다음 요청이 KEEPALIVE_IDLE_MS 안에 시작하지 않으면 닫는다 (워커를 오래 붙잡지 않게).
+ *   - 파싱 오류, Connection: close, HTTP/1.0(keep-alive 요청 없음)이면 응답 후 닫는다.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -21,86 +20,118 @@
 #include <string.h>
 #include <unistd.h>
 
-#define MAX_BODY (1024 * 1024)                        /* POST 본문 최대 1MB, 넘으면 413 */
+#define MAX_BODY (1024 * 1024)                           /* POST 본문 최대 1MB, 넘으면 413 */
 #define CONN_BUF_SIZE (HTTP_MAX_HEADER_BYTES + MAX_BODY) /* 헤더 + 본문이 다 들어가는 크기 */
-#define RECV_TIMEOUT_MS 5000                          /* 요청 전체를 받는 데 주는 시간 */
-#define SEND_TIMEOUT_MS 5000                          /* 응답 전체를 보내는 데 주는 시간 */
+#define REQUEST_TIMEOUT_MS 5000                          /* 첫 요청 하나를 다 받는 데 주는 시간 */
+#define KEEPALIVE_IDLE_MS 5000                           /* 다음 요청을 기다리는 시간 */
+#define SEND_TIMEOUT_MS 5000                             /* 응답 하나를 다 보내는 데 주는 시간 */
+#define MAX_REQUESTS_PER_CONN 1000                       /* 한 연결이 무한히 붙잡지 않도록 */
 
-/* 요청 하나를 받아 파싱한다.
- * 반환: 1 응답할 것이 있음(*result 채움), 0 응답 없이 닫을 것(타임아웃, 오류, 빈 연결) */
-static int receive_request(int fd, const char *peer, char *buf, http_request *req, http_parse_result *result)
+typedef struct {
+    int fd;
+    const char *peer;
+    const server_config *cfg;
+    int quiet;
+    char *buf;
+    size_t len; /* buf 에 들어 있는 바이트 (앞쪽은 아직 처리하지 않은 요청) */
+} conn;
+
+typedef enum { RECV_OK, RECV_CLOSED, RECV_FAILED } recv_status;
+
+/* 요청 하나가 완성되거나 오류가 날 때까지 받는다 */
+static recv_status receive_request(conn *c, http_request *req, http_parse_result *result, size_t *used,
+                                   long long deadline)
 {
-    size_t len = 0, used;
-    long long deadline = tcp_now_ms() + RECV_TIMEOUT_MS; /* 요청 하나 전체에 마감 하나 */
-
     for (;;) {
-        *result = http_parse(buf, len, MAX_BODY, req, &used);
+        *result = http_parse(c->buf, c->len, MAX_BODY, req, used);
         if (*result != HTTP_PARSE_INCOMPLETE)
-            return 1;
-        if (len == CONN_BUF_SIZE) { /* 파서의 크기 제한이 먼저 걸리므로 오지 않아야 하는 곳 */
+            return RECV_OK;
+        if (c->len == CONN_BUF_SIZE) { /* 파서의 크기 제한이 먼저 걸리므로 오지 않아야 하는 곳 */
             *result = HTTP_PARSE_BAD_REQUEST;
-            return 1;
+            return RECV_OK;
         }
-        ssize_t n = tcp_recv_some(fd, buf + len, CONN_BUF_SIZE - len, deadline);
+        ssize_t n = tcp_recv_some(c->fd, c->buf + c->len, CONN_BUF_SIZE - c->len, deadline);
         if (n < 0) {
-            fprintf(stderr, "[%s] recv: %s (%zu bytes so far)\n", peer, strerror(errno), len);
-            return 0;
+            /* 요청 사이의 대기 시간 초과는 정상적인 keep-alive 종료라 로그를 남기지 않는다 */
+            if (c->len > 0 || errno != ETIMEDOUT)
+                fprintf(stderr, "[%s] recv: %s (%zu bytes so far)\n", c->peer, strerror(errno), c->len);
+            return RECV_FAILED;
         }
-        if (n == 0) {         /* 클라이언트가 닫음 */
-            if (len == 0)
-                return 0;     /* 아무것도 안 보냈음 */
-            *result = HTTP_PARSE_BAD_REQUEST; /* 요청이 끝나기 전에 닫힘 */
-            return 1;
+        if (n == 0) {
+            if (c->len == 0)
+                return RECV_CLOSED; /* 요청 사이에 클라이언트가 닫음: 정상 */
+            *result = HTTP_PARSE_BAD_REQUEST; /* 요청 도중에 닫힘 */
+            return RECV_OK;
         }
-        len += (size_t)n;
+        c->len += (size_t)n;
     }
+}
+
+/* 요청 하나 처리. 반환: 1 연결 유지, 0 닫기 */
+static int serve_one(conn *c, long long deadline, int last, int *responded)
+{
+    http_request *req = malloc(sizeof *req); /* path_buf 때문에 8KB 가 넘어 스택 대신 힙에 */
+    if (!req)
+        return 0;
+    http_parse_result r;
+    size_t used = 0;
+    recv_status rs = receive_request(c, req, &r, &used, deadline);
+    if (rs != RECV_OK) {
+        free(req);
+        return 0;
+    }
+
+    http_response res;
+    http_response_init(&res, 200);
+    if (r == HTTP_PARSE_OK) {
+        req->remote_addr = c->peer;
+        router_dispatch(c->cfg, req, &res); /* L5: CGI 또는 L4 정적 파일 */
+        res.keep_alive = res.keep_alive && req->keep_alive && !last;
+        if (!c->quiet)
+            printf("[%s] %s %s HTTP/1.%d -> %d\n", c->peer, req->method_str, req->path, req->version_minor,
+                   res.status);
+    } else {
+        http_response_error(&res, http_parse_status(r));
+        res.keep_alive = 0; /* 어디까지가 요청이었는지 모르므로 더 읽지 않는다 */
+        printf("[%s] bad request -> %d\n", c->peer, res.status);
+    }
+    fflush(stdout);
+
+    int head_only = r == HTTP_PARSE_OK && req->method == HTTP_HEAD;
+    int keep = res.keep_alive;
+    int sent = http_response_send(c->fd, &res, head_only, tcp_now_ms() + SEND_TIMEOUT_MS);
+    http_response_free(&res);
+    free(req);
+    if (sent < 0) {
+        fprintf(stderr, "[%s] send: %s\n", c->peer, strerror(errno));
+        return 0;
+    }
+    *responded = 1;
+
+    /* 처리한 요청을 버퍼에서 빼고, 남은 바이트(다음 요청의 시작)를 앞으로 당긴다 */
+    memmove(c->buf, c->buf + used, c->len - used);
+    c->len -= used;
+    return keep;
 }
 
 void conn_serve(int fd, const char *peer, const server_config *cfg, int quiet)
 {
-    /* 1MB 버퍼는 스택 대신 힙에 (나중에 스레드마다 스택을 작게 잡아도 안전하도록) */
-    char *buf = malloc(CONN_BUF_SIZE);
-    http_request *req = malloc(sizeof *req);
-    if (!buf || !req) {
+    conn c = {.fd = fd, .peer = peer, .cfg = cfg, .quiet = quiet, .buf = malloc(CONN_BUF_SIZE), .len = 0};
+    if (!c.buf) {
         fprintf(stderr, "[%s] out of memory\n", peer);
-        free(buf);
-        free(req);
         close(fd);
         return;
     }
-
-    http_parse_result r;
-    if (!receive_request(fd, peer, buf, req, &r)) {
+    int responded = 0;
+    long long deadline = tcp_now_ms() + REQUEST_TIMEOUT_MS;
+    for (int i = 0; i < MAX_REQUESTS_PER_CONN; i++) {
+        if (!serve_one(&c, deadline, i == MAX_REQUESTS_PER_CONN - 1, &responded))
+            break;
+        deadline = tcp_now_ms() + KEEPALIVE_IDLE_MS;
+    }
+    if (responded)
+        tcp_close_graceful(fd); /* 응답을 보낸 연결은 RST 없이 닫는다 */
+    else
         close(fd);
-        goto out;
-    }
-
-    http_response res;
-    if (r == HTTP_PARSE_OK) {
-        req->remote_addr = peer;
-        http_response_init(&res, 200);
-        router_dispatch(cfg, req, &res); /* L5: CGI 또는 L4 정적 파일 */
-    } else {
-        http_response_init(&res, 400);
-        http_response_error(&res, http_parse_status(r));
-    }
-    res.keep_alive = 0; /* [임시] 요청 하나 처리 후 닫는다. keep-alive 는 L6 단계 */
-
-    if (r == HTTP_PARSE_OK && !quiet)
-        printf("[%s] %s %s HTTP/1.%d -> %d\n", peer, req->method_str, req->path, req->version_minor, res.status);
-    else if (r != HTTP_PARSE_OK)
-        printf("[%s] bad request -> %d\n", peer, res.status);
-    fflush(stdout);
-
-    int head_only = r == HTTP_PARSE_OK && req->method == HTTP_HEAD;
-    if (http_response_send(fd, &res, head_only, tcp_now_ms() + SEND_TIMEOUT_MS) < 0) {
-        fprintf(stderr, "[%s] send: %s\n", peer, strerror(errno));
-        close(fd);
-    } else {
-        tcp_close_graceful(fd);
-    }
-    http_response_free(&res);
-out:
-    free(buf);
-    free(req);
+    free(c.buf);
 }

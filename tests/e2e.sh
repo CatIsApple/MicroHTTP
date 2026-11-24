@@ -94,6 +94,21 @@ check "CGI timeout -> 504"   "504" "$(code /cgi-bin/slow.sh)"
 took=$(( $(date +%s) - start ))
 check "CGI timeout took ~5s" "yes" "$([[ $took -ge 4 && $took -le 7 ]] && echo yes)"
 
+# ---- L6 keep-alive ----
+reuse=$(curl -s -v -o /dev/null -o /dev/null "$url/index.html" "$url/style.css" 2>&1 | grep -c -i 're-using\|reusing')
+check "curl reuses one connection" "yes" "$([[ $reuse -ge 1 ]] && echo yes)"
+two=$(printf 'GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+      | nc -q 3 127.0.0.1 "$PORT" | grep -c '^HTTP/1.1 200')
+check "pipelined two requests -> two 200" "2" "$two"
+check "Connection: close is honored" "Connection: close" \
+    "$(curl -s -I -H 'Connection: close' "$url/" | grep -i '^connection:' | tr -d '\r')"
+check "HTTP/1.1 default keep-alive" "Connection: keep-alive" \
+    "$(curl -s -I "$url/" | grep -i '^connection:' | tr -d '\r')"
+check "HTTP/1.0 closes" "Connection: close" \
+    "$(curl -s -I -0 "$url/" | grep -i '^connection:' | tr -d '\r')"
+check "error closes connection" "1" \
+    "$(printf 'BAD\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n' | nc -q 3 127.0.0.1 "$PORT" | grep -c '^HTTP/1.1')"
+
 # 헤더를 끝내지 않고 버티는 클라이언트는 마감(5초)에 응답 없이 끊긴다
 slow=$(python3 -c '
 import socket, sys, time
