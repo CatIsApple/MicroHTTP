@@ -198,6 +198,6 @@ else echo "  FAIL slow client: '$slow'"; fail=$((fail + 1)); fi
 
 check "server still serving" "HTTP/1.1 200" "$(curl -s -i "http://127.0.0.1:$PORT/" | status_of)"
 
-if grep -qE "AddressSanitizer|runtime error" "$LOG"; then echo "  FAIL sanitizer report:"; cat "$LOG"; fail=$((fail + 1)); fi
+if grep -qE "AddressSanitizer|runtime error|ThreadSanitizer|LeakSanitizer" "$LOG"; then echo "  FAIL sanitizer report:"; cat "$LOG"; fail=$((fail + 1)); fi
 echo "e2e: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

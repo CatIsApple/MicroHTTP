@@ -4,6 +4,8 @@
 #   make e2e        서버를 띄워 curl/nc 로 확인
 #   make asan       AddressSanitizer + UBSan 빌드
 #   make asan-test  sanitizer 를 켜고 단위 테스트
+#   make tsan       ThreadSanitizer 빌드 (데이터 레이스 검사, 이후 make e2e)
+#   make tsan-test  ThreadSanitizer 로 단위 테스트
 #   make clean
 
 CC       ?= cc
@@ -11,13 +13,14 @@ CFLAGS   ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
 CPPFLAGS += -Iinclude -MMD -MP
 LDLIBS   += -pthread
 SAN      := -fsanitize=address,undefined -fno-omit-frame-pointer
+TSAN     := -fsanitize=thread
 
 BIN      := microhttp
 LIB_SRCS := src/tcp.c src/http_request.c src/http_response.c src/mime.c src/static.c src/cgi.c src/router.c src/threadpool.c src/conn.c src/server.c
 LIB_OBJS := $(LIB_SRCS:src/%.c=build/%.o)
 TESTS    := build/test_tcp build/test_http_request build/test_http_response build/test_mime build/test_threadpool
 
-.PHONY: all test e2e asan asan-test clean
+.PHONY: all test e2e asan asan-test tsan tsan-test clean
 all: $(BIN)
 
 $(BIN): build/main.o $(LIB_OBJS)
@@ -46,6 +49,12 @@ asan: clean
 
 asan-test: clean
 	$(MAKE) test CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O1 -g $(SAN)" LDFLAGS="$(SAN)"
+
+tsan: clean
+	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O1 -g $(TSAN)" LDFLAGS="$(TSAN)"
+
+tsan-test: clean
+	$(MAKE) test CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O1 -g $(TSAN)" LDFLAGS="$(TSAN)"
 
 clean:
 	rm -rf build $(BIN)
