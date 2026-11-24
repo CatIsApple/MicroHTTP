@@ -1,6 +1,6 @@
 /* main.c — 명령줄 인자를 읽고 서버를 시작한다.
  * 사용법: microhttp [-q] [-r doc_root] [-c cgi_dir] [-w workers] [port] */
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 /* realpath 는 POSIX 의 XSI 확장이라 _POSIX_C_SOURCE 만으로는 선언되지 않는다 */
 
 #include "server.h"
 

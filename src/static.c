@@ -1,5 +1,5 @@
 /* static.c — L4: 정적 파일 서빙 */
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 /* realpath 는 POSIX 의 XSI 확장이라 _POSIX_C_SOURCE 만으로는 선언되지 않는다 */
 
 #include "static.h"
 #include "mime.h"

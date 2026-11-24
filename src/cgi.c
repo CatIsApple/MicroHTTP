@@ -2,7 +2,7 @@
 #if defined(__linux__)
 #define _GNU_SOURCE /* pipe2(O_CLOEXEC): 파이프를 만드는 순간부터 close-on-exec */
 #else
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 /* realpath (XSI) */
 #endif
 
 #include "cgi.h"
