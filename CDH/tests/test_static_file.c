@@ -257,6 +257,44 @@ int main(void)
     static_lookup(root, "/a%00", NULL, &r);
     CHECK_INT(r.status, 400);
 
+    /* 심볼릭 링크: 경로 어디에 있든 따라가지 않음 → 루트 밖 파일이 나가지 않는다 */
+    {
+        char q[512];
+        snprintf(q, sizeof(q), "%s/sub/deep", dir);
+        mkdir(q, 0755);
+        write_file(dir, "sub/deep/f.txt", "deep");
+        static_lookup(root, "/sub/deep/f.txt", NULL, &r);     /* 링크 없는 깊은 경로는 그대로 200 */
+        CHECK_INT(r.status, 200);
+        CHECK_INT(r.size, 4);
+        if (r.fd >= 0)
+            close(r.fd);
+
+        snprintf(q, sizeof(q), "%s/out.txt", dir);
+        CHECK_INT(symlink("/etc/passwd", q), 0);              /* 루트 밖을 가리키는 파일 링크 */
+        static_lookup(root, "/out.txt", NULL, &r);
+        CHECK_INT(r.status, 403);
+        CHECK_INT(r.fd, -1);
+        snprintf(q, sizeof(q), "%s/etc", dir);
+        CHECK_INT(symlink("/etc", q), 0);                     /* 루트 밖을 가리키는 디렉터리 링크 (중간 경로) */
+        static_lookup(root, "/etc/passwd", NULL, &r);
+        CHECK_INT(r.status, 403);
+        CHECK_INT(r.fd, -1);
+        snprintf(q, sizeof(q), "%s/sub2", dir);
+        CHECK_INT(symlink("sub", q), 0);                      /* 루트 안을 가리키는 링크도 거부 (nginx disable_symlinks on) */
+        static_lookup(root, "/sub2/index.html", NULL, &r);
+        CHECK_INT(r.status, 403);
+        static_lookup(root, "/sub/deep/../../etc/passwd", NULL, &r); /* ".." 정리 뒤 "etc/passwd" → 역시 링크라 403 */
+        CHECK_INT(r.status, 403);
+
+        const char *links[] = {"out.txt", "etc", "sub2", "sub/deep/f.txt"};
+        for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+            snprintf(q, sizeof(q), "%s/%s", dir, links[i]);
+            unlink(q);
+        }
+        snprintf(q, sizeof(q), "%s/sub/deep", dir);
+        rmdir(q);
+    }
+
     /* 정리 */
     close(root);
     chmod(p, 0644);

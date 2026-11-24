@@ -397,7 +397,18 @@ int main(void)
         snprintf(req + n + 2048, sizeof(req) - (size_t)n - 2048, " HTTP/1.1\r\nHost: t\r\n\r\n");
         send_str(req);
         CHECK_INT(status(), 414);
+        CHECK(body() && strcmp(body(), "414 URI Too Long\n") == 0);
+        memmove(req + 1, req, strlen(req) + 1);           /* 같은 요청을 HEAD 로: 한 칸 밀고 */
+        memcpy(req, "HEAD", 4);                           /* "GET" → "HEAD" (오류여도 본문 없어야 함) */
+        send_str(req);
+        CHECK_INT(status(), 414);
+        CHECK(header("Content-Length") != NULL);          /* 머리는 GET 과 같음 */
+        CHECK(body() && *body() == '\0');
     }
+    /* HEAD + 파서 오류 → 오류 응답도 본문 없음 */
+    send_str("HEAD / HTTP/1.1\r\n\r\n");                  /* Host 없음 → 400 */
+    CHECK_INT(status(), 400);
+    CHECK(body() && *body() == '\0');
 
     /* 헤더가 버퍼(8191바이트)보다 큼 → 431 */
     {

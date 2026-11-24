@@ -8,8 +8,11 @@
  *
  * 경로를 문자열로 이어 붙여(root + "/" + path) open 하지 않고, 시작할 때 한 번 연 문서 루트 디렉터리 fd 에
  * openat 한다 → 요청마다 루트 경로를 다시 해석하지 않고, realpath 같은 비싼 호출도 없다.
- * 루트 밖으로 나가는 것은 static_resolve 가 ".." 를 문자열 단계에서 막아서 보장한다.
- * (문서 루트 안의 심볼릭 링크는 따라간다 — 루트를 관리하는 운영자가 둔 것으로 본다. nginx 기본값과 같음) */
+ * 루트 밖으로 나가는 것은 두 겹으로 막는다:
+ *   - static_resolve 가 ".." 를 문자열 단계에서 차단
+ *   - static_lookup 이 경로를 한 단계씩 O_NOFOLLOW 로 열어 심볼릭 링크를 거부 (403).
+ *     "www/x -> /etc/passwd" 같은 링크로 루트 밖 파일이 나가지 않게. (nginx 의 disable_symlinks on 과 같음)
+ *     문서 루트 자체(-r 로 준 경로)가 링크인 것은 괜찮다 — 시작할 때 한 번 따라가서 연다. */
 
 #ifndef STATIC_FILE_H /* 인클루드 가드 */
 #define STATIC_FILE_H

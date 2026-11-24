@@ -79,10 +79,11 @@ static int log_sent(int rc, const char *peer, int status)
     return rc;                                                           /* 0 = 성공, -1 = 실패 */
 }
 
-/* 오류 응답: 상태 줄 + 헤더 + "<코드> <이유>\n" 본문 (오류 뒤에는 연결을 닫는다) */
-static int send_error(int cfd, const char *peer, int status) /* status: 400, 413 등 */
+/* 오류 응답: 상태 줄 + 헤더 + "<코드> <이유>\n" 본문 (오류 뒤에는 연결을 닫는다).
+ * head_only: HEAD 요청이면 본문 없이 머리만 (RFC 7231 4.3.2 — HEAD 응답에는 본문이 없어야 한다) */
+static int send_error(int cfd, const char *peer, int status, int head_only) /* status: 400, 413 등 */
 {
-    return log_sent(http_send_error(cfd, status, NULL, CLIENT_TIMEOUT_MS), peer, status); /* 전송 + 로그 */
+    return log_sent(http_send_error_ex(cfd, status, NULL, head_only, CLIENT_TIMEOUT_MS), peer, status); /* 전송 + 로그 */
 }
 
 static int g_root_fd = -1; /* 문서 루트 디렉터리 fd. 시작할 때 한 번 열고 요청마다 openat 의 기준으로 씀 */
@@ -133,7 +134,7 @@ static int send_echo(int cfd, const char *peer, const http_request *req) /* req:
                         req->host ? req->host : "(none)", req->header_count,       /* Host (HTTP/1.0 이면 없을 수 있음), 헤더 수 */
                         req->keep_alive ? "yes" : "no", req->body_len);            /* keep-alive, 본문 길이 */
     if (slen < 0)                                                /* 형식 오류 (사실상 없음) */
-        return send_error(cfd, peer, 500);                       /* 서버 오류로 응답 */
+        return send_error(cfd, peer, 500, 0);                     /* 서버 오류로 응답 */
     if ((size_t)slen >= sizeof(summary))                         /* 잘렸으면 */
         slen = (int)sizeof(summary) - 1;                         /* 실제로 버퍼에 들어간 길이만 보냄 */
 
@@ -148,7 +149,7 @@ static int send_echo(int cfd, const char *peer, const http_request *req) /* req:
     char head[HTTP_HEAD_MAX];                                    /* 응답 머리 */
     int hlen = http_format_head(head, sizeof(head), &res, time(NULL)); /* 지금 시각으로 머리 만들기 */
     if (hlen < 0)                                                /* 만들 수 없음 (사실상 없음) */
-        return send_error(cfd, peer, 500);                       /* 서버 오류로 응답 */
+        return send_error(cfd, peer, 500, 0);                     /* 서버 오류로 응답 */
     struct iovec iov[3] = {                                      /* 보낼 순서대로 세 조각 */
         {.iov_base = head, .iov_len = (size_t)hlen},             /* 머리 */
         {.iov_base = summary, .iov_len = (size_t)slen},          /* 요약 */
@@ -177,15 +178,19 @@ static int handle_client(int cfd, const char *peer) /* cfd: 클라이언트 연�
         return -1;                                         /* 응답할 대상이 없음 */
     }
 
+    /* HEAD 요청인지: 파싱 전에 오류가 나도(431, 414 ...) 본문 없이 답해야 해서 첫 5바이트로 미리 판단.
+     * 파서는 메서드를 대소문자 구분해서 비교하므로 여기도 정확히 "HEAD " 만 */
+    int head_only = (size_t)n >= 5 && memcmp(buf, "HEAD ", 5) == 0;
+
     /* 헤더 끝(빈 줄)을 못 찾은 경우: 잘린 요청을 정상으로 처리하지 않는다 */
     if (header_len == 0) {                                 /* 헤더 끝을 못 찾고 수신이 끝남 */
         if ((size_t)n >= sizeof(buf) - 1) { /* 버퍼가 꽉 참 = 헤더가 너무 큼 */
             fprintf(stderr, "[%s] header too large (> %zu bytes)\n", peer, sizeof(buf) - 1); /* 로그 */
-            return send_error(cfd, peer, 431);             /* 431 Request Header Fields Too Large */
+            return send_error(cfd, peer, 431, head_only);  /* 431 Request Header Fields Too Large */
         }
         /* 헤더가 끝나기 전에 상대가 송신을 닫음(half-close) */
         fprintf(stderr, "[%s] incomplete request (%zd bytes)\n", peer, n); /* 로그 */
-        return send_error(cfd, peer, 400);                 /* 400 Bad Request */
+        return send_error(cfd, peer, 400, head_only);      /* 400 Bad Request */
     }
 
     /* 첫 줄(요청 라인)만 로그 — 파싱이 '\0' 을 써 넣기 전에 찍는다 */
@@ -199,7 +204,7 @@ static int handle_client(int cfd, const char *peer) /* cfd: 클라이언트 연�
     http_request req;                                     /* 파싱 결과 (buf 안을 가리키는 포인터들) */
     int rc = http_parse_request(buf, header_len, &req);   /* 요청 라인 + 헤더 파싱 */
     if (rc != 0)                                          /* 문법 오류·미지원 등 */
-        return send_error(cfd, peer, rc);                 /* 파서가 정한 상태 코드로 응답 */
+        return send_error(cfd, peer, rc, head_only);      /* 파서가 정한 상태 코드로 응답 */
 
     char *heap = NULL;                                    /* 본문이 버퍼에 안 들어가면 http_read_body 가 malloc 한 포인터 */
     rc = http_read_body(cfd, &req, buf, sizeof(buf), (size_t)n, header_len, CLIENT_TIMEOUT_MS, &heap); /* 본문 마저 받기 */
@@ -208,7 +213,7 @@ static int handle_client(int cfd, const char *peer) /* cfd: 클라이언트 연�
         return -1;                                        /* 응답 없이 닫기 */
     }
     if (rc > 0)                                           /* 411 / 413 / 417 / 500 */
-        return send_error(cfd, peer, rc);                 /* 오류 응답 (heap 은 NULL) */
+        return send_error(cfd, peer, rc, head_only);      /* 오류 응답 (heap 은 NULL) */
 
     if (req.method == HTTP_METHOD_POST)                   /* POST → echo (동적 처리 단계에서 대체) */
         rc = send_echo(cfd, peer, &req);

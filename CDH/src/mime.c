@@ -52,7 +52,9 @@ static const mime_entry TABLE[] = {
     {"zip", "application/zip"},
 };
 
-/* 테스트에서 표 정렬을 검사할 수 있도록 노출 (헤더에는 없음 — 테스트가 extern 으로 선언) */
+#ifdef MICROHTTP_TESTING
+/* 테스트에서 표 정렬을 검사할 수 있도록 노출 (헤더에는 없음 — 테스트가 extern 으로 선언).
+ * 테스트 빌드(Makefile 의 TEST_CFLAGS)에서만 생긴다 → 서버 실행 파일에는 이 심볼이 없음 */
 const void *mime_table_for_test(size_t *count, size_t *entry_size);
 const void *mime_table_for_test(size_t *count, size_t *entry_size)
 {
@@ -60,6 +62,7 @@ const void *mime_table_for_test(size_t *count, size_t *entry_size)
     *entry_size = sizeof(TABLE[0]);
     return TABLE;
 }
+#endif
 
 static int cmp_entry(const void *key, const void *elem) /* bsearch 비교 함수: key 는 소문자 확장자 문자열 */
 {

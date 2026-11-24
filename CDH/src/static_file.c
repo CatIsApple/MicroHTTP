@@ -1,6 +1,7 @@
 /* static_file.c — URI → 파일 경로 해석과 파일 찾기 (정적 파일 서빙).
  *
- * 요청 하나의 비용: openat 1 + fstat 1 (+ 보낸 뒤 close 1). 경로 해석은 4KB 스택 버퍼에서 끝나고 할당이 없다.
+ * 요청 하나의 비용: openat 1 + fstat 1 (+ 보낸 뒤 close 1). 하위 디렉터리 한 단계마다 openat + close 가 하나씩 더
+ * (심볼릭 링크 차단 때문, open_nofollow 참고). 경로 해석은 4KB 스택 버퍼에서 끝나고 할당이 없다.
  * 실제 본문 전송은 main 이 http_send_response(use_file) → tcp_sendfile_all 로 한다. */
 
 #define _POSIX_C_SOURCE 200809L /* openat, O_CLOEXEC, O_DIRECTORY (POSIX 2008) */
@@ -141,14 +142,57 @@ int static_resolve(const char *uri, char *out, size_t cap, int *dir_request)
 
 /* ---- 2. 파일 찾기 ---- */
 
+/* rel("a/b/c.html") 을 문서 루트에서 한 단계씩 O_NOFOLLOW 로 열어 내려간다.
+ * 경로 어디에든 심볼릭 링크가 있으면 ELOOP 로 실패 → "www/x -> /etc/passwd" 같은 링크로 루트 밖을 읽을 수 없다.
+ * (static_resolve 의 ".." 차단은 문자열만 보므로 링크는 못 막는다. nginx 의 disable_symlinks on 과 같은 방식)
+ * openat 한 번에 "a/b/c" 를 주면 커널이 중간 링크를 따라가 버리고, O_NOFOLLOW 는 마지막 이름에만 걸리기 때문에 나눠 연다.
+ * 중간 디렉터리는 읽기 권한(r)이 있어야 열린다 (실행 권한만 있는 디렉터리는 403).
+ * 깊이 0 ("index.html") 이면 openat 한 번으로 끝난다. 실패 시 -1, errno 는 실패한 openat 의 것. */
+static int open_nofollow(int root_fd, const char *rel, int flags)
+{
+    char buf[STATIC_PATH_MAX];                  /* '/' 자리에 '\0' 을 써 가며 이름을 하나씩 끊으려고 복사 */
+    size_t len = strlen(rel);
+    if (len >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(buf, rel, len + 1);
+
+    int dfd = root_fd;                          /* 지금 있는 디렉터리 */
+    char *name = buf;
+    char *slash;
+    while ((slash = strchr(name, '/')) != NULL) { /* 마지막 이름 전까지는 디렉터리 */
+        *slash = '\0';
+        int next = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int err = errno;
+        struct stat lst;                        /* 리눅스는 디렉터리 링크에 O_DIRECTORY|O_NOFOLLOW 면 ELOOP 대신 ENOTDIR */
+        if (next < 0 && err == ENOTDIR && fstatat(dfd, name, &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode))
+            err = ELOOP;                        /* → "진짜 파일이 중간에 있음(404)" 과 구분해 링크(403) 로 (실패 경로에서만 확인) */
+        if (dfd != root_fd)
+            close(dfd);                         /* 한 단계 내려갔으니 위 디렉터리는 닫음 (루트는 유지) */
+        if (next < 0) {
+            errno = err;
+            return -1;
+        }
+        dfd = next;
+        name = slash + 1;
+    }
+    int fd = openat(dfd, name, flags | O_NOFOLLOW);
+    int err = errno;
+    if (dfd != root_fd)
+        close(dfd);
+    errno = err;
+    return fd;
+}
+
 static int status_from_errno(int err) /* openat 실패 → 상태 코드 */
 {
     switch (err) {
     case ENOENT:       /* 없음 */
     case ENOTDIR:      /* 중간 경로가 파일 ("/a.txt/b") */
     case ENAMETOOLONG: /* 이름이 파일시스템 한도 초과 */
-    case ELOOP:        /* 심볼릭 링크 순환 */
         return 404;
+    case ELOOP:        /* 경로에 심볼릭 링크 (O_NOFOLLOW) → 따라가지 않음 */
     case EACCES:       /* 읽기 권한 없음 */
     case EPERM:
         return 403;
@@ -174,8 +218,9 @@ void static_lookup(int root_fd, const char *uri, const char *if_modified_since, 
     }
 
     /* O_NONBLOCK: 루트 안에 FIFO 가 있어도 open 에서 영원히 멈추지 않게 (일반 파일에는 영향 없음)
-     * O_NOCTTY  : 터미널 장치를 열어도 제어 터미널이 되지 않게 */
-    int fd = openat(root_fd, rel, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+     * O_NOCTTY  : 터미널 장치를 열어도 제어 터미널이 되지 않게
+     * open_nofollow: 경로의 심볼릭 링크를 따라가지 않음 (루트 밖 탈출 차단) */
+    int fd = open_nofollow(root_fd, rel, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
     if (fd < 0) {
         out->status = status_from_errno(errno);
         return;

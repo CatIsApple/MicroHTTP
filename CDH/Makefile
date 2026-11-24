@@ -1,5 +1,5 @@
 # Makefile — microhttp 빌드 규칙.
-# 사용법: make (빌드) / make asan (메모리 검사 빌드) / make clean (산출물 삭제)
+# 사용법: make (빌드) / make asan (메모리 검사 빌드) / make test (테스트) / make bench (부하 테스트) / make clean (산출물 삭제)
 # 주의: 변수 줄 끝에 주석을 붙이면 값 뒤에 공백이 남을 수 있어서, 주석은 모두 별도 줄에 둔다.
 
 # 컴파일러. ?= 는 "환경변수로 따로 지정 안 했을 때만" 기본값 gcc 를 쓴다는 뜻
@@ -20,7 +20,7 @@ OBJS := $(SRCS:src/%.c=build/%.o)
 BIN  := microhttp
 
 # 실제 파일 이름이 아닌 "명령" 타깃이라고 표시 (같은 이름의 파일이 있어도 항상 실행)
-.PHONY: all clean asan test ftest-asan
+.PHONY: all clean asan test ftest-asan bench
 
 # 기본 타깃: 그냥 make 하면 실행 파일을 만든다
 all: $(BIN)
@@ -48,7 +48,7 @@ asan: clean
 # 항상 sanitizer 를 켜서 빌드 → 메모리 오류·정의되지 않은 동작도 테스트 실패로 잡는다.
 TEST_SRCS := $(wildcard tests/test_*.c)
 TEST_BINS := $(TEST_SRCS:tests/%.c=build/tests/%)
-TEST_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+TEST_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -DMICROHTTP_TESTING
 
 # make test: 모든 테스트를 빌드한 뒤 차례로 실행. 하나라도 실패하면 make 도 실패(종료 코드 != 0)
 # test_functional 은 서버 실행 파일을 띄워서 검사하므로 $(BIN) 도 먼저 빌드
@@ -68,6 +68,16 @@ build/tests:
 ftest-asan: asan
 	$(MAKE) build/tests/test_functional
 	./build/tests/test_functional
+
+# ---- 부하 테스트 ----
+# tests/bench.c: 자체 부하 생성기 (스레드 c 개가 d 초 동안 GET 반복). sanitizer 없이 -O2 로 → 측정값이 왜곡되지 않게.
+# tests/bench.sh: 서버를 띄우고 경로 × 동시 연결 수 조합으로 측정. ab / wrk / hey 가 있으면 비교용으로 함께 실행.
+# 옵션은 환경변수로: DUR=10 CONCS="1 10 100" PATHS="/index.html" make bench
+build/bench: tests/bench.c | build
+	$(CC) -std=c11 -Wall -Wextra -O2 -pthread -o $@ $<
+
+bench: $(BIN) build/bench
+	sh tests/bench.sh
 
 # 빌드 산출물(build 폴더, 실행 파일) 삭제
 clean:
