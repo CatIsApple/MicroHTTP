@@ -18,13 +18,15 @@
  *
  *   handle_connection()        : recv → 파싱 → 요청 처리 → (keep-alive면 반복)
  *
- *   handle_request()           : 요청 하나를 정적 파일로 응답
- *    └─ serve_static_file()    : static_file_open() → 헤더 send → 파일 read/send 반복
+ *   handle_request()           : 요청 하나를 어디서 처리할지 결정
+ *    ├─ proxy_find_route() 일치 → proxy_forward()   : 백엔드로 전달 (동적 요청, proxy.c)
+ *    └─ 그 외              → serve_static_file()    : static_file_open() → 헤더 send → 파일 read/send
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "http.h"
 #include "net.h"
+#include "proxy.h"
 #include "static_file.h"
 
 #include <arpa/inet.h>
@@ -60,6 +62,9 @@ static struct {
     int threads;
     int verbose;              /* 1이면 [parse]/[recv] 상세 로그 */
 } config = { "127.0.0.1", DEFAULT_PORT, NULL, DEFAULT_THREADS, 0 };
+
+/* Reverse Proxy 라우팅 규칙 (-R 옵션). 규칙 목록은 시작 후 바뀌지 않고, Round-Robin 순번만 lock으로 보호합니다. */
+static ProxyTable proxy_table = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 /*
  * SIGINT(Ctrl+C)/SIGTERM(kill)이 오면 1이 됩니다.
@@ -177,6 +182,17 @@ static int serve_static_file(int client_fd, const HttpRequest *request,
  */
 static int handle_request(int client_fd, const HttpRequest *request, int *keep_alive)
 {
+    /*
+     * 라우팅 규칙과 경로가 일치하면 백엔드로 전달합니다(동적 요청 처리).
+     * 백엔드 응답은 "연결이 닫힐 때까지"로 끝을 판단해 그대로 중계하므로,
+     * 응답 뒤 클라이언트 연결도 닫습니다(keep-alive 하지 않음).
+     */
+    ProxyRoute *route = proxy_find_route(&proxy_table, request->target);
+    if (route) {
+        *keep_alive = 0;
+        return proxy_forward(client_fd, request, &proxy_table, route);
+    }
+
     int is_head = strcmp(request->method, "HEAD") == 0;
     /* 정적 파일은 읽기 전용이므로 GET/HEAD만 허용합니다. */
     if (strcmp(request->method, "GET") != 0 && !is_head) {
@@ -392,10 +408,11 @@ static void stop_workers(pthread_t *threads, int count)
 static void print_usage(const char *program)
 {
     fprintf(stderr,
-        "Usage: %s [-p port] [-r root] [-t threads] [-b bind_address] [-v]\n"
+        "Usage: %s [-p port] [-r root] [-t threads] [-R prefix=host:port[,host:port...]]... [-b bind_address] [-v]\n"
         "  -p port          listen port (default 8080)\n"
         "  -r root          static file root directory (default ./www)\n"
         "  -t threads       worker threads (default 8)\n"
+        "  -R rule          reverse proxy rule, repeatable (e.g. -R /api/=127.0.0.1:9001,127.0.0.1:9002)\n"
         "  -b bind_address  IPv4 address to bind (default 127.0.0.1)\n"
         "  -v               verbose parse/recv logs\n", program);
 }
@@ -415,7 +432,7 @@ static int parse_arguments(int argc, char **argv)
 {
     const char *root = "./www";
     int option;
-    while ((option = getopt(argc, argv, "p:r:t:b:v")) != -1) {
+    while ((option = getopt(argc, argv, "p:r:t:R:b:v")) != -1) {
         if (option == 'p') {
             long port = parse_number(optarg, 65535);
             if (port == -1) { fprintf(stderr, "invalid port: %s\n", optarg); return -1; }
@@ -424,6 +441,11 @@ static int parse_arguments(int argc, char **argv)
             long threads = parse_number(optarg, MAX_THREADS);
             if (threads == -1) { fprintf(stderr, "invalid thread count: %s\n", optarg); return -1; }
             config.threads = (int)threads;
+        } else if (option == 'R') {
+            if (proxy_add_route(&proxy_table, optarg) == -1) {
+                fprintf(stderr, "invalid proxy rule: %s\n", optarg);
+                return -1;
+            }
         } else if (option == 'r') {
             root = optarg;
         } else if (option == 'b') {
@@ -471,6 +493,13 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "MicroHTTP listening on %s:%u root=%s threads=%d\n",
             config.bind_address, config.port, config.root, started);
+    for (size_t i = 0; i < proxy_table.route_count; ++i) {
+        const ProxyRoute *route = &proxy_table.routes[i];
+        fprintf(stderr, "  proxy %s ->", route->prefix);
+        for (size_t j = 0; j < route->backend_count; ++j)
+            fprintf(stderr, " %s:%s", route->backends[j].host, route->backends[j].port);
+        fputc('\n', stderr);
+    }
 
     while (!stop_requested) {
         /*
