@@ -1,35 +1,48 @@
-CC = cc
-PYTHON = python3
-CFLAGS = -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
+# MicroHTTP — 학습용 C 웹 서버
+#
+#   make            서버 빌드 (./server)
+#   make test       단위 테스트 + 기능 테스트
+#   make asan       AddressSanitizer/UBSan으로 빌드 후 전체 테스트
+#   make clean      빌드 결과 삭제
 
-.PHONY: all run test test-unit clean
+CC      ?= cc
+CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Werror
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc
+LDLIBS  += -lpthread
+PYTHON  ?= python3
+
+SOURCES = src/http.c src/net.c src/static_file.c
+HEADERS = $(wildcard src/*.h)
+UNIT_TESTS = build/test_http build/test_mime build/test_static build/test_net
+
+.PHONY: all test unit functional asan clean
+
 all: server
 
-football_page.inc: web/match.html tools/embed_page.py
-	$(PYTHON) tools/embed_page.py
+server: src/server.c $(SOURCES) $(HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/server.c $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
-server: server.c http.c http.h football.c football.h chat.c chat.h football_page.inc
-	$(CC) $(CFLAGS) server.c http.c football.c chat.c $(LDFLAGS) -o $@
+build:
+	mkdir -p build
 
-run: server
-	./server
+# test_net.c는 net.c를 직접 #include 해서 send()를 가짜로 바꾸므로 net.c를 따로 링크하지 않습니다.
+build/test_net: tests/unit/test_net.c src/net.c src/http.c $(HEADERS) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit/test_net.c src/http.c $(LDFLAGS) $(LDLIBS) -o $@
 
-tests/test_send: tests/test_send.c server.c http.c http.h football.c football.h chat.c chat.h football_page.inc
-	$(CC) $(CFLAGS) tests/test_send.c http.c football.c chat.c $(LDFLAGS) -o $@
+build/test_%: tests/unit/test_%.c $(SOURCES) $(HEADERS) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
-tests/test_http: tests/test_http.c http.c http.h football.c football.h chat.c chat.h football_page.inc
-	$(CC) $(CFLAGS) tests/test_http.c http.c football.c chat.c $(LDFLAGS) -o $@
+unit: $(UNIT_TESTS)
+	@for test in $(UNIT_TESTS); do ./$$test || exit 1; done
 
-tests/test_chat: tests/test_chat.c chat.c chat.h
-	$(CC) $(CFLAGS) tests/test_chat.c chat.c $(LDFLAGS) -o $@
+functional: server
+	$(PYTHON) tests/functional/test_server.py
 
-test-unit: tests/test_send tests/test_http tests/test_chat
-	./tests/test_send
-	./tests/test_http
-	./tests/test_chat
+test: unit functional
 
-test: server test-unit
-	$(PYTHON) tests/test_server.py
+asan:
+	$(MAKE) clean
+	$(MAKE) test CFLAGS='-std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
 
 clean:
-	rm -f server tests/test_send tests/test_http tests/test_chat football_page.inc
+	rm -rf server build *.dSYM
