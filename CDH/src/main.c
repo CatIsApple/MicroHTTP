@@ -7,8 +7,8 @@
 
 #include "http_body.h"     /* http_read_body (Content-Length 만큼 본문 받기) */
 #include "http_parser.h"   /* http_parse_request, http_request (요청 헤더 파싱) */
-#include "http_response.h" /* http_format_head, http_reason (응답 머리 만들기) */
-#include "tcp_server.h" /* tcp_listen, tcp_accept, tcp_send_all, tcp_recv_request, tcp_close_graceful */
+#include "http_response.h" /* http_response, http_send_response, http_send_error, http_reason */
+#include "tcp_server.h" /* tcp_listen, tcp_accept, tcp_recv_request, tcp_close_graceful */
 
 #include <errno.h>      /* errno, EINTR, ETIMEDOUT, EMFILE, ENFILE */
 #include <fcntl.h>      /* open, O_RDONLY (예비 fd 용) */
@@ -65,30 +65,28 @@ static int parse_port(const char *s, uint16_t *out) /* 문자열 → 포트 번�
 
 static int g_quiet = 0; /* -q: 요청마다 찍는 로그 끔 (부하 테스트용) */
 
-static int send_resp(int cfd, const char *peer, const char *resp, size_t len) /* 응답 전송 + 실패 로그. 성공 0, 실패 -1 */
+/* 응답 전송 + 결과 로그. 성공 0, 실패 -1 */
+static int send_resp(int cfd, const char *peer, const http_response *res) /* res: 보낼 응답 */
 {
-    if (tcp_send_all(cfd, resp, len, CLIENT_TIMEOUT_MS) < 0) {           /* 마감 시간 안에 응답 전체 전송 시도 */
+    if (http_send_response(cfd, res, CLIENT_TIMEOUT_MS) < 0) {           /* 마감 시간 안에 머리 + 본문 전송 시도 */
         fprintf(stderr, "[%s] send error: %s\n", peer, strerror(errno)); /* 실패 이유 출력 (EPIPE, ETIMEDOUT 등) */
         return -1;                                                       /* 실패 */
     }
-    return 0; /* 성공 */
+    if (!g_quiet)                                                        /* 조용 모드가 아니면 */
+        printf("[%s] -> %d %s\n", peer, res->status, http_reason(res->status)); /* 결과 로그 */
+    return 0;                                                            /* 성공 */
 }
 
-/* 오류 응답: 상태 줄 + 헤더 + "<코드> <이유>\n" 본문을 한 번에 보낸다 */
+/* 오류 응답: 상태 줄 + 헤더 + "<코드> <이유>\n" 본문 (오류 뒤에는 연결을 닫는다) */
 static int send_error(int cfd, const char *peer, int status) /* status: 400, 413 등 */
 {
-    char body[64];                                                          /* 본문: 예) "404 Not Found\n" */
-    int blen = snprintf(body, sizeof(body), "%d %s\n", status, http_reason(status)); /* 본문 문자열 만들기 */
-    if (blen < 0 || (size_t)blen >= sizeof(body))                           /* 만들기 실패나 잘림 (이유 문구는 짧아서 사실상 없음) */
-        blen = 0;                                                           /* 본문 없이 보냄 */
-    char resp[256];                                                         /* 응답 머리 + 본문 전체 */
-    int hlen = http_format_head(resp, sizeof(resp), status, "text/plain; charset=utf-8", (size_t)blen, 0); /* 오류 후엔 항상 연결 종료 */
-    if (hlen < 0 || (size_t)hlen + (size_t)blen >= sizeof(resp))            /* 머리 생성 실패 또는 자리 부족 */
-        return -1;                                                          /* 보낼 수 없음 */
-    memcpy(resp + hlen, body, (size_t)blen);                                /* 머리 뒤에 본문을 이어 붙임 */
-    if (!g_quiet)                                                           /* 조용 모드가 아니면 */
-        printf("[%s] -> %d %s\n", peer, status, http_reason(status));      /* 결과 로그 */
-    return send_resp(cfd, peer, resp, (size_t)hlen + (size_t)blen);         /* 전송 */
+    if (http_send_error(cfd, status, NULL, CLIENT_TIMEOUT_MS) < 0) {     /* 오류 응답 전송 */
+        fprintf(stderr, "[%s] send error: %s\n", peer, strerror(errno)); /* 실패 이유 출력 */
+        return -1;                                                       /* 실패 */
+    }
+    if (!g_quiet)                                                        /* 조용 모드가 아니면 */
+        printf("[%s] -> %d %s\n", peer, status, http_reason(status));   /* 결과 로그 */
+    return 0;                                                            /* 성공 */
 }
 
 /* 정상 요청에 대한 echo 응답: 파싱 결과 요약 + 받은 본문 그대로.
@@ -109,23 +107,29 @@ static int send_echo(int cfd, const char *peer, const http_request *req) /* req:
                         req->host ? req->host : "(none)", req->header_count,       /* Host (HTTP/1.0 이면 없을 수 있음), 헤더 수 */
                         req->keep_alive ? "yes" : "no", req->body_len);            /* keep-alive, 본문 길이 */
     if (slen < 0)                                                /* 형식 오류 (사실상 없음) */
-        return -1;                                               /* 실패 */
+        return send_error(cfd, peer, 500);                       /* 서버 오류로 응답 */
     if ((size_t)slen >= sizeof(summary))                         /* 잘렸으면 */
         slen = (int)sizeof(summary) - 1;                         /* 실제로 버퍼에 들어간 길이만 보냄 */
 
-    char head[256];                                              /* 응답 머리 */
-    int hlen = http_format_head(head, sizeof(head), 200, "text/plain; charset=utf-8", /* 200 OK, 일반 텍스트 */
-                                (size_t)slen + req->body_len, 0); /* 길이 = 요약 + 본문. keep-alive 는 아직 미구현이라 close */
-    if (hlen < 0)                                                /* 머리 생성 실패 */
-        return -1;                                               /* 실패 */
-    if (send_resp(cfd, peer, head, (size_t)hlen) < 0 ||          /* 머리 전송 */
-        send_resp(cfd, peer, summary, (size_t)slen) < 0)         /* 요약 전송 */
-        return -1;                                               /* 실패 */
-    if (req->body_len > 0 && send_resp(cfd, peer, req->body, req->body_len) < 0) /* 본문이 있으면 그대로 돌려줌 */
-        return -1;                                               /* 실패 */
-    if (!g_quiet)                                                /* 조용 모드가 아니면 */
-        printf("[%s] -> 200 OK\n", peer);                        /* 결과 로그 */
-    return 0;                                                    /* 성공 */
+    size_t total = (size_t)slen + req->body_len;                 /* 응답 본문 = 요약 + 받은 본문 */
+    char *out = malloc(total);                                   /* 두 조각을 이어 붙일 버퍼 (total >= 요약 길이 > 0) */
+    if (out == NULL)                                             /* 메모리 부족 */
+        return send_error(cfd, peer, 500);                       /* 500 Internal Server Error */
+    memcpy(out, summary, (size_t)slen);                          /* 앞부분: 요약 */
+    if (req->body_len > 0)                                       /* 본문이 있으면 */
+        memcpy(out + slen, req->body, req->body_len);            /* 뒷부분: 받은 본문 그대로 */
+
+    http_response res = {                                        /* 응답 내용 */
+        .status = 200,                                           /* 200 OK */
+        .content_type = "text/plain; charset=utf-8",             /* 일반 텍스트 */
+        .body = out,                                             /* 본문 */
+        .body_len = total,                                       /* 본문 길이 */
+        .keep_alive = 0,                                         /* keep-alive 는 동시성 단계에서 같이 다룸 → 지금은 close */
+        .extra_headers = NULL,                                   /* 추가 헤더 없음 */
+    };
+    int rc = send_resp(cfd, peer, &res);                         /* 전송 + 로그 */
+    free(out);                                                   /* 임시 버퍼 반납 */
+    return rc;                                                   /* 0 = 성공, -1 = 전송 실패 */
 }
 
 /* 연결 하나 처리: 헤더 수신 → 파싱 → 본문 수신 → 응답

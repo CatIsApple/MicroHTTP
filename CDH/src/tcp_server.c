@@ -12,7 +12,8 @@
 #include <poll.h>       /* poll(), struct pollfd, POLLIN/POLLOUT (fd 가 준비될 때까지 기다리기) */
 #include <stdio.h>      /* perror, snprintf */
 #include <string.h>     /* memset, strstr */
-#include <sys/socket.h> /* socket, bind, listen, accept, send, recv, shutdown, setsockopt, MSG_* 플래그 */
+#include <sys/socket.h> /* socket, bind, listen, accept, send, sendmsg, recv, shutdown, setsockopt, MSG_* 플래그 */
+#include <sys/uio.h>    /* struct iovec (sendmsg 에 넘길 "여러 덩어리" 목록) */
 #include <time.h>       /* clock_gettime, struct timespec, CLOCK_MONOTONIC */
 #include <unistd.h>     /* close */
 
@@ -126,6 +127,45 @@ int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms) /* buf 의
         len -= (size_t)n; /* 남은 길이 감소 */
     }
     return 0; /* 전부 보냄 (= 커널 송신 버퍼에 다 넣음. 상대가 받았다는 뜻은 아님) */
+}
+
+int tcp_send_all2(int fd, const void *a, size_t alen, const void *b, size_t blen, int timeout_ms) /* a 다음 b 를 한 번에 이어서 전송 */
+{
+    struct iovec iov[2] = {{.iov_base = (void *)a, .iov_len = alen},  /* 첫 덩어리 (예: 응답 머리). iovec 은 const 가 아니라서 캐스팅 */
+                           {.iov_base = (void *)b, .iov_len = blen}}; /* 둘째 덩어리 (예: 본문) */
+    size_t idx = 0;                             /* 아직 다 안 보낸 첫 덩어리의 번호 */
+    long long deadline = now_ms() + timeout_ms; /* 두 덩어리 전체의 마감 시각 */
+    while (idx < 2) {                           /* 덩어리가 남은 동안 */
+        if (iov[idx].iov_len == 0) {            /* 길이 0 (처음부터 비었거나 다 보냄) */
+            idx++;                              /* 다음 덩어리로 */
+            continue;
+        }
+        if (wait_until(fd, POLLOUT, deadline) <= 0) /* 송신 버퍼에 자리가 날 때까지 마감 안에서 기다림 */
+            return -1;                          /* 시간 초과(errno=ETIMEDOUT) 또는 오류 */
+        struct msghdr msg;                      /* sendmsg 에 넘길 "여러 덩어리 + 옵션" 묶음 */
+        memset(&msg, 0, sizeof(msg));           /* 안 쓰는 필드(주소 등)는 0 */
+        msg.msg_iov = &iov[idx];                /* 남은 덩어리들의 시작 */
+        msg.msg_iovlen = 2 - idx;               /* 남은 덩어리 수 */
+        ssize_t n = sendmsg(fd, &msg, MSG_DONTWAIT); /* 일부만 들어가도 블로킹하지 않고 돌아옴 (tcp_send_all 과 같은 이유) */
+        if (n < 0) {                            /* 실패한 경우 */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) /* 일시적 상황 */
+                continue;                       /* 다시 기다렸다가 재시도 */
+            return -1;                          /* EPIPE 등: 상대가 끊음 */
+        }
+        size_t left = (size_t)n;                /* 보낸 바이트 수를 덩어리 앞에서부터 차례로 차감 */
+        while (idx < 2 && left > 0) {           /* 보낸 양이 남아 있는 동안 */
+            if (left >= iov[idx].iov_len) {     /* 이 덩어리를 통째로 보냈으면 */
+                left -= iov[idx].iov_len;       /* 그만큼 차감 */
+                iov[idx].iov_len = 0;           /* 이 덩어리는 끝 */
+                idx++;                          /* 다음 덩어리 */
+            } else {                            /* 이 덩어리의 일부만 보냈으면 */
+                iov[idx].iov_base = (char *)iov[idx].iov_base + left; /* 시작 위치를 보낸 만큼 앞으로 */
+                iov[idx].iov_len -= left;       /* 남은 길이 감소 */
+                left = 0;                       /* 차감할 양 소진 */
+            }
+        }
+    }
+    return 0; /* 둘 다 커널 송신 버퍼에 넣음 */
 }
 
 ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len) /* HTTP 헤더 끝까지 받기 */

@@ -20,6 +20,13 @@ int tcp_accept(int listen_fd, char *client_addr_buf, size_t buf_len); /* 반환:
  * timeout_ms 는 호출 "전체" 의 마감 시간. 성공 0, 실패·초과 -1 (초과 시 errno = ETIMEDOUT) */
 int tcp_send_all(int fd, const void *buf, size_t len, int timeout_ms); /* buf 의 len 바이트를 fd 로 전부 전송 */
 
+/* 두 덩어리(a 다음 b)를 sendmsg() 한 번에 이어서 보낸다 — 응답 머리 + 본문용.
+ * 두 번 send 하면 작은 패킷 둘로 갈라져 Nagle + delayed ACK 로 40ms 지연이 생길 수 있고,
+ * 하나로 합치려고 복사하면 큰 본문에서 메모리가 낭비된다. 복사 없이 한 번에 보낸다.
+ * timeout_ms 는 두 덩어리 "전체" 의 마감 시간. 성공 0, 실패·초과 -1 (초과 시 errno = ETIMEDOUT).
+ * 길이가 0 인 덩어리는 건너뛴다 (a, b 가 NULL 이어도 길이가 0 이면 OK). */
+int tcp_send_all2(int fd, const void *a, size_t alen, const void *b, size_t blen, int timeout_ms);
+
 /* 요청 헤더 끝("\r\n\r\n") 또는 EOF 또는 버퍼가 찰 때까지 수신.
  * timeout_ms 는 호출 "전체" 의 마감 시간(천천히 보내는 클라이언트 대비).
  * 반환: 읽은 바이트 수(>=0), 오류·초과 시 -1 (초과 시 errno = ETIMEDOUT).
