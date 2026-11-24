@@ -12,7 +12,8 @@ pass=0 fail=0
 
 "$BIN" -q -r "$ROOT" -c cgi-bin "$PORT" >"$LOG" 2>&1 &
 pid=$!
-trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$LOG" "$ROOT"' EXIT
+pid2=
+trap 'kill $pid $pid2 2>/dev/null; wait 2>/dev/null; rm -rf "$LOG" "$ROOT"' EXIT
 for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.1; done
 
 check() { # check <설명> <기대값 앞부분> <실제값>
@@ -108,6 +109,80 @@ check "HTTP/1.0 closes" "Connection: close" \
     "$(curl -s -I -0 "$url/" | grep -i '^connection:' | tr -d '\r')"
 check "error closes connection" "1" \
     "$(printf 'BAD\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n' | nc -q 3 127.0.0.1 "$PORT" | grep -c '^HTTP/1.1')"
+
+# ---- L6 동시성 ----
+# 느린 CGI(5초)가 워커 하나를 잡고 있어도 다른 요청은 바로 처리된다
+curl -s -o /dev/null "$url/cgi-bin/slow.sh" &
+slow_pid=$!
+sleep 0.3
+t0=$(date +%s%N)
+check "served while slow CGI runs" "200" "$(code /hello.txt)"
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+check "...within 1s" "yes" "$([[ $ms -lt 1000 ]] && echo yes)"
+wait $slow_pid
+
+# 동시에 50개 연결로 요청 400개
+ok=$(python3 - "$PORT" <<'PY'
+import sys, socket, threading
+port = int(sys.argv[1]); ok = 0; lock = threading.Lock()
+def worker():
+    global ok
+    for _ in range(8):
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        if data.startswith(b"HTTP/1.1 200") and data.endswith(b"hello from a static file\n"):
+            with lock:
+                ok += 1
+ts = [threading.Thread(target=worker) for _ in range(50)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(ok)
+PY
+)
+check "50 concurrent clients, 400 requests" "400" "$ok"
+
+# 워커 1개 + 대기열 16칸 서버에 아무것도 안 보내는 연결 24개 → 넘친 연결은 503
+"$BIN" -q -w 1 -r "$ROOT" "$((PORT + 1))" >>"$LOG" 2>&1 &
+pid2=$!
+sleep 0.3
+busy=$(python3 - "$((PORT + 1))" <<'PY'
+import sys, socket, time
+port = int(sys.argv[1]); socks = []
+for _ in range(24):
+    socks.append(socket.create_connection(("127.0.0.1", port)))
+    time.sleep(0.02)
+n = 0
+for s in socks:
+    s.settimeout(0.5)
+    try:
+        if s.recv(64).startswith(b"HTTP/1.1 503"):
+            n += 1
+    except socket.timeout:
+        pass
+print(n)
+PY
+)
+check "queue full -> 503" "yes" "$([[ $busy -ge 1 ]] && echo yes)"
+
+# 우아한 종료: SIGTERM 을 받아도 처리 중인 요청은 응답을 받고 나서 끝난다
+sleep 0.5 # 위 연결들이 닫혀 워커가 비도록
+inflight=$(mktemp)
+( { printf 'GET /hello.txt HTTP/1.1\r\nHost: x\r\n'; sleep 1; printf 'Connection: close\r\n\r\n'; } \
+    | nc -q 2 127.0.0.1 "$((PORT + 1))" | head -1 | tr -d '\r' >"$inflight" ) &
+nc_pid=$!
+sleep 0.4
+kill -TERM $pid2
+wait $nc_pid 2>/dev/null
+check "in-flight request finished after SIGTERM" "HTTP/1.1 200" "$(cat "$inflight")"
+for _ in $(seq 60); do kill -0 $pid2 2>/dev/null || break; sleep 0.1; done
+check "server exited" "yes" "$(kill -0 $pid2 2>/dev/null || echo yes)"
+rm -f "$inflight"
 
 # 헤더를 끝내지 않고 버티는 클라이언트는 마감(5초)에 응답 없이 끊긴다
 slow=$(python3 -c '

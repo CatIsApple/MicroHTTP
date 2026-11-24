@@ -1,5 +1,5 @@
 /* main.c — 명령줄 인자를 읽고 서버를 시작한다.
- * 사용법: microhttp [-q] [-r doc_root] [-c cgi_dir] [port] */
+ * 사용법: microhttp [-q] [-r doc_root] [-c cgi_dir] [-w workers] [port] */
 #define _POSIX_C_SOURCE 200809L
 
 #include "server.h"
@@ -27,10 +27,11 @@ static int parse_port(const char *s, uint16_t *out)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s [-q] [-r doc_root] [-c cgi_dir] [port]\n"
+    fprintf(stderr, "usage: %s [-q] [-r doc_root] [-c cgi_dir] [-w workers] [port]\n"
                     "  -q            정상 요청 로그 끄기\n"
                     "  -r doc_root   정적 파일 루트 (기본 ./www)\n"
                     "  -c cgi_dir    /cgi-bin/ 으로 실행할 스크립트 폴더 (기본 ./cgi-bin, 없으면 CGI 끔)\n"
+                    "  -w workers    워커 스레드 수 (기본 8)\n"
                     "  port          기본 8080\n", prog);
 }
 
@@ -40,6 +41,7 @@ int main(int argc, char **argv)
     int quiet = 0;
     const char *root_arg = "www";
     const char *cgi_arg = NULL;
+    long workers = 8;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) {
             quiet = 1;
@@ -47,6 +49,13 @@ int main(int argc, char **argv)
             root_arg = argv[++i];
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             cgi_arg = argv[++i];
+        } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+            char *end;
+            workers = strtol(argv[++i], &end, 10);
+            if (*end != '\0' || workers < 1 || workers > 1024) {
+                usage(argv[0]);
+                return 2;
+            }
         } else if (parse_port(argv[i], &port) < 0) {
             usage(argv[0]);
             return 2;
@@ -70,5 +79,5 @@ int main(int argc, char **argv)
         fprintf(stderr, "cgi dir %s: %s\n", cgi_arg, strerror(errno));
         return 1;
     }
-    return server_run(&cfg, port, quiet) == 0 ? 0 : 1;
+    return server_run(&cfg, port, (size_t)workers, quiet) == 0 ? 0 : 1;
 }

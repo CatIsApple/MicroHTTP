@@ -1,11 +1,13 @@
-/* server.c — 서버 수명 관리 */
+/* server.c — L6: 서버 수명 관리 (시그널, accept 루프, 스레드 풀에 연결 분배, 우아한 종료) */
 #define _POSIX_C_SOURCE 200809L
 
 #include "server.h"
 #include "conn.h"
 #include "tcp.h"
+#include "threadpool.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@
 #include <unistd.h>
 
 #define LISTEN_BACKLOG 128
+#define QUEUE_PER_WORKER 16 /* 대기열 크기 = 워커 수 x 16 */
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -62,7 +65,36 @@ static void on_accept_error(int lfd)
     nanosleep(&pause, NULL);
 }
 
-int server_run(const server_config *cfg, uint16_t port, int quiet)
+/* 워커가 부르는 작업: 연결 하나를 끝까지 처리 */
+typedef struct {
+    const server_config *cfg;
+    int quiet;
+} job_ctx;
+
+static void serve_job(int fd, const char *peer, void *arg)
+{
+    const job_ctx *ctx = arg;
+    conn_serve(fd, peer, ctx->cfg, ctx->quiet);
+}
+
+/* 대기열이 가득 찼을 때 accept 스레드가 직접 보내는 응답. 미리 만들어 둬서 거의 비용이 없다 */
+static const char RESP_503[] = "HTTP/1.1 503 Service Unavailable\r\n"
+                               "Content-Type: text/plain; charset=utf-8\r\n"
+                               "Content-Length: 20\r\n"
+                               "Retry-After: 1\r\n"
+                               "Connection: close\r\n"
+                               "\r\n"
+                               "server is too busy\r\n";
+
+static void reject_busy(int fd, const char *peer)
+{
+    /* accept 스레드가 오래 붙잡히지 않도록 아주 짧은 마감. 요청은 읽지 않고 바로 닫는다 */
+    tcp_send_all(fd, RESP_503, sizeof RESP_503 - 1, tcp_now_ms() + 100);
+    close(fd);
+    fprintf(stderr, "[%s] queue full -> 503\n", peer);
+}
+
+int server_run(const server_config *cfg, uint16_t port, size_t n_workers, int quiet)
 {
     if (setup_signals() < 0) {
         perror("sigaction");
@@ -75,8 +107,24 @@ int server_run(const server_config *cfg, uint16_t port, int quiet)
     }
     g_reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
-    printf("MicroHTTP listening on 0.0.0.0:%u (root %s, cgi %s)\n", (unsigned)port, cfg->doc_root,
-           cfg->cgi_dir ? cfg->cgi_dir : "off");
+    /* SIGINT/SIGTERM 은 accept 하는 메인 스레드만 받아야 accept() 가 EINTR 로 깨어난다.
+     * 새 스레드는 만든 스레드의 시그널 마스크를 물려받으므로, 막은 상태에서 워커를 만들고 다시 푼다. */
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &block, &old);
+    job_ctx ctx = {.cfg = cfg, .quiet = quiet};
+    threadpool *tp = tp_create(n_workers, n_workers * QUEUE_PER_WORKER, serve_job, &ctx);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (!tp) {
+        fprintf(stderr, "thread pool: cannot start %zu workers\n", n_workers);
+        close(lfd);
+        return -1;
+    }
+
+    printf("MicroHTTP listening on 0.0.0.0:%u (root %s, cgi %s, %zu workers)\n", (unsigned)port, cfg->doc_root,
+           cfg->cgi_dir ? cfg->cgi_dir : "off", n_workers);
     fflush(stdout);
 
     while (!g_stop) {
@@ -87,11 +135,15 @@ int server_run(const server_config *cfg, uint16_t port, int quiet)
                 on_accept_error(lfd);
             continue;
         }
-        /* 한 번에 하나씩 처리하므로, 한 연결이 오래 붙잡지 못하게 conn_serve 가 마감 시각을 건다 */
-        conn_serve(fd, peer, cfg, quiet);
+        if (tp_submit(tp, fd, peer) < 0) /* 워커가 다 바쁘고 대기열도 가득 참 */
+            reject_busy(fd, peer);
     }
 
+    /* 우아한 종료: 새 연결은 그만 받고, 대기열과 처리 중인 연결을 마친 뒤 끝낸다 */
     close(lfd);
+    printf("shutting down: finishing queued connections\n");
+    fflush(stdout);
+    tp_shutdown(tp);
     if (g_reserve_fd >= 0)
         close(g_reserve_fd);
     printf("shutdown\n");
