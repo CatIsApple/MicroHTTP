@@ -7,10 +7,10 @@
 
 #include <stdint.h>
 
-/* Ctrl+C / SIGTERM 을 받을 때까지 실행. 정상 종료 0, 시작 실패 -1 */
 #include <stddef.h>
 
-/* n_workers 개의 워커 스레드로 연결을 동시에 처리한다 */
+/* port 에서 연결을 받아 n_workers 개의 워커 스레드로 동시에 처리한다. quiet 면 정상 요청 로그를 끈다.
+ * Ctrl+C / SIGTERM 을 받을 때까지 실행. 정상 종료 0, 시작 실패 -1 */
 int server_run(const server_config *cfg, uint16_t port, size_t n_workers, int quiet);
 
 #endif

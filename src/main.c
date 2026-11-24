@@ -1,5 +1,8 @@
 /* main.c — 명령줄 인자를 읽고 서버를 시작한다.
- * 사용법: microhttp [-q] [-r doc_root] [-c cgi_dir] [-w workers] [port] */
+ * 사용법: microhttp [-q] [-r doc_root] [-c cgi_dir] [-w workers] [port]
+ *
+ * 레이어 구조에서의 위치: 프로그램 진입점. 설정(server_config)만 만들고 실제 일은 server_run(L6) 에 맡긴다.
+ * 구성: parse_port(포트 검사), usage(도움말), main(옵션 해석 → 경로 정규화 → server_run) */
 #define _XOPEN_SOURCE 700 /* realpath 는 POSIX 의 XSI 확장이라 _POSIX_C_SOURCE 만으로는 선언되지 않는다 */
 
 #include "server.h"
@@ -14,6 +17,7 @@
 #define PATH_MAX 4096
 #endif
 
+/* 문자열을 1~65535 포트 번호로 바꾼다. 숫자가 아니거나 범위를 벗어나면 -1 */
 static int parse_port(const char *s, uint16_t *out)
 {
     char *end;
@@ -25,6 +29,7 @@ static int parse_port(const char *s, uint16_t *out)
     return 0;
 }
 
+/* 사용법과 옵션 설명을 stderr 에 찍는다 */
 static void usage(const char *prog)
 {
     fprintf(stderr, "usage: %s [-q] [-r doc_root] [-c cgi_dir] [-w workers] [port]\n"
@@ -35,6 +40,8 @@ static void usage(const char *prog)
                     "  port          기본 8080\n", prog);
 }
 
+/* 옵션 읽기 → doc_root, cgi_dir 을 realpath 로 정규화 → server_config 를 만들어 server_run.
+ * 잘못된 인자는 2, 경로 오류·서버 시작 실패는 1 로 끝난다 */
 int main(int argc, char **argv)
 {
     uint16_t port = 8080;

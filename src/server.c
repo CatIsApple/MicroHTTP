@@ -1,4 +1,16 @@
-/* server.c — L6: 서버 수명 관리 (시그널, accept 루프, 스레드 풀에 연결 분배, 우아한 종료) */
+/* server.c — L6: 서버 수명 관리 (시그널, accept 루프, 스레드 풀에 연결 분배, 우아한 종료)
+ *
+ * 레이어 구조에서의 위치 (맨 위)
+ *   main.c → server_run → [메인 스레드] tcp_accept(L1) → tp_submit(L6)
+ *                         [워커 스레드] conn_serve → L1 받기 → L2 파싱 → L5 라우팅 → L4/L5 핸들러 → L3 응답
+ *
+ * 구성
+ *   - 시그널: g_stop, on_stop, setup_signals
+ *   - accept 오류 대처: g_reserve_fd, on_accept_error
+ *   - 스레드 풀 연결: job_ctx, serve_job
+ *   - 과부하 거절: RESP_503, reject_busy
+ *   - 진입점: server_run
+ */
 #define _POSIX_C_SOURCE 200809L
 
 #include "server.h"
@@ -21,12 +33,14 @@
 
 static volatile sig_atomic_t g_stop = 0;
 
+/* SIGINT/SIGTERM 핸들러: 종료 플래그만 세운다 */
 static void on_stop(int sig)
 {
     (void)sig;
     g_stop = 1; /* 핸들러에서는 플래그만 세운다 (printf 등은 시그널 핸들러에서 안전하지 않음) */
 }
 
+/* SIGINT/SIGTERM 에 on_stop 을 걸고, SIGPIPE 는 무시하도록 설정한다 */
 static int setup_signals(void)
 {
     struct sigaction sa;
@@ -47,6 +61,7 @@ static int setup_signals(void)
  * 그때 예비 fd 를 잠깐 내놓고 연결 하나를 받아 바로 닫아서 큐를 비운다. */
 static int g_reserve_fd = -1;
 
+/* accept 실패 처리: fd 가 바닥났으면 예비 fd 로 연결 하나를 받아 버리고, 그 밖에는 잠깐 쉰다 */
 static void on_accept_error(int lfd)
 {
     int err = errno;
@@ -71,6 +86,7 @@ typedef struct {
     int quiet;
 } job_ctx;
 
+/* 스레드 풀의 작업 함수: job_ctx 에서 설정을 꺼내 conn_serve 로 연결 하나를 처리한다 */
 static void serve_job(int fd, const char *peer, void *arg)
 {
     const job_ctx *ctx = arg;
@@ -86,6 +102,7 @@ static const char RESP_503[] = "HTTP/1.1 503 Service Unavailable\r\n"
                                "\r\n"
                                "server is too busy\r\n";
 
+/* 대기열이 가득 찼을 때 미리 만든 503 응답을 보내고 연결을 닫는다 */
 static void reject_busy(int fd, const char *peer)
 {
     /* accept 스레드가 오래 붙잡히지 않도록 아주 짧은 마감. 요청은 읽지 않고 바로 닫는다 */
@@ -94,6 +111,7 @@ static void reject_busy(int fd, const char *peer)
     fprintf(stderr, "[%s] queue full -> 503\n", peer);
 }
 
+/* 시그널 설정 → 리스닝 소켓 → 워커 시작 → accept 루프(연결을 풀에 넘김) → 우아한 종료 */
 int server_run(const server_config *cfg, uint16_t port, size_t n_workers, int quiet)
 {
     if (setup_signals() < 0) {

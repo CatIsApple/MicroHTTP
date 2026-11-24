@@ -1,5 +1,14 @@
 /* conn.c — 연결 하나의 전체 수명: 받기(L1) → 파싱(L2) → 라우팅(L5) → 응답(L3) → 반복 → 닫기.
  *
+ * 레이어 구조에서의 위치
+ *   L6 스레드 풀의 워커가 conn_serve 를 부른다. 이 파일이 L1~L5 를 이어 붙이는 접착층이다.
+ *
+ * 구성
+ *   - conn: 연결 상태 (fd, peer, 설정, 수신 버퍼와 그 안의 바이트 수)
+ *   - receive_request: 요청 하나가 완성될 때까지 tcp_recv_some + http_parse 반복
+ *   - serve_one: 요청 하나 받기 → 라우팅 → 로그 → 응답 보내기 → 버퍼 정리
+ *   - conn_serve: keep-alive 루프와 연결 닫기
+ *
  * keep-alive: 응답 후 연결을 닫지 않고 다음 요청을 기다린다.
  *   - 한 번의 recv 에 다음 요청이 섞여 들어올 수 있다(파이프라이닝).
  *     파서가 알려 주는 consumed 뒤의 바이트를 버퍼 앞으로 당겨 다음 요청으로 쓴다.
@@ -114,6 +123,8 @@ static int serve_one(conn *c, long long deadline, int last, int *responded)
     return keep;
 }
 
+/* 연결 하나를 끝까지 처리한다: 버퍼를 만들고 serve_one 을 keep-alive 가 끝날 때까지(최대 1000번) 반복,
+ * 마감 시각은 첫 요청은 REQUEST_TIMEOUT_MS, 그 뒤로는 KEEPALIVE_IDLE_MS. 응답을 보냈으면 우아하게 닫는다 */
 void conn_serve(int fd, const char *peer, const server_config *cfg, int quiet)
 {
     conn c = {.fd = fd, .peer = peer, .cfg = cfg, .quiet = quiet, .buf = malloc(CONN_BUF_SIZE), .len = 0};
