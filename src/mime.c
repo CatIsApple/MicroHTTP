@@ -1,4 +1,11 @@
-/* mime.c — L4: 확장자 표로 Content-Type 을 고른다 */
+/* mime.c — L4: 확장자 표로 Content-Type 을 고른다
+ *
+ * 레이어 구조에서의 위치
+ *   L4 정적 파일 핸들러(static.c) 가 파일을 본문으로 넣을 때 Content-Type 값을 여기서 받는다.
+ *
+ * 구성: { 확장자(소문자), Content-Type } 표 TABLE + 대소문자 무시 비교 ieq + mime_from_path.
+ * 새 파일 형식은 TABLE 에 한 줄 추가하면 된다. 표에 없으면 application/octet-stream.
+ */
 #include "mime.h"
 
 #include <stddef.h>
@@ -37,6 +44,7 @@ static int ieq(const char *a, const char *b)
     return *a == *b;
 }
 
+/* 경로의 마지막 '/' 뒤 파일 이름에서 마지막 '.' 뒤를 확장자로 보고 TABLE 에서 찾는다 */
 const char *mime_from_path(const char *path)
 {
     const char *slash = strrchr(path, '/');

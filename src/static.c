@@ -1,4 +1,14 @@
-/* static.c — L4: 정적 파일 서빙 */
+/* static.c — L4: 정적 파일 서빙
+ *
+ * 레이어 구조에서의 위치
+ *   L5 라우터가 CGI 경로가 아닌 요청을 여기로 보낸다 → 파일을 찾아 L3 응답(BODY_FILE)을 채운다.
+ *   소켓은 모르고, 파일을 실제로 보내는 일은 L3 http_response_send 가 한다.
+ *
+ * 구성
+ *   - path_is_under: realpath 결과가 루트 안에 있는지 (경로 탈출 2차 방어선. 1차는 L2 의 ".." 거부)
+ *   - status_from_errno: 파일 시스템 오류 → 404/403/500
+ *   - static_handle: 요청 하나 처리 (아래 1~4 단계)
+ */
 #define _XOPEN_SOURCE 700 /* realpath 는 POSIX 의 XSI 확장이라 _POSIX_C_SOURCE 만으로는 선언되지 않는다 */
 
 #include "static.h"
@@ -17,6 +27,8 @@
 #define PATH_MAX 4096
 #endif
 
+/* resolved 가 root 로 시작하고, 그 바로 뒤가 끝이거나 '/' 인지 본다.
+ * "/www" 와 "/www-secret" 처럼 앞부분만 같은 경로를 구별하기 위해서다 (CGI 도 같이 씀) */
 int path_is_under(const char *root, const char *resolved)
 {
     size_t n = strlen(root);
@@ -35,6 +47,8 @@ static int status_from_errno(int err)
     return 500;
 }
 
+/* 메서드 검사 → 1. 루트와 경로 합치기 → 2. realpath + 루트 안인지 확인
+ * → 3. 디렉터리면 301 또는 index.html → 4. 파일을 열어 BODY_FILE 로 넣는다 */
 void static_handle(const server_config *cfg, const http_request *req, http_response *res)
 {
     if (req->method != HTTP_GET && req->method != HTTP_HEAD) {

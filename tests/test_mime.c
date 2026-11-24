@@ -1,4 +1,5 @@
-/* test_mime.c — L4 MIME 표 단위 테스트 */
+/* test_mime.c — L4 MIME 표 단위 테스트
+ * EXPECT_TYPE(경로, 기대 Content-Type) 한 줄이 경우 하나다. 실패하면 위치와 실제 값을 찍는다. */
 #include "mime.h"
 
 #include <stdio.h>
@@ -14,6 +15,7 @@ static int failures = 0;
         }                                                                                    \
     } while (0)
 
+/* 확장자별 결과, 대소문자 무시, 확장자 없음·숨김 파일·디렉터리 이름의 점 같은 경계 경우를 확인한다 */
 int main(void)
 {
     EXPECT_TYPE("/index.html", "text/html; charset=utf-8");
