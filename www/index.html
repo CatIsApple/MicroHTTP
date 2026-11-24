@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>MicroHTTP</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>MicroHTTP</h1>
+  <p>C11 로 만든 HTTP/1.1 서버가 보내는 정적 페이지입니다.</p>
+  <img src="img/logo.png" alt="logo" width="64" height="64">
+  <p id="js-check">JavaScript 가 로드되지 않았습니다.</p>
+  <ul>
+    <li><a href="docs/">docs/ (디렉터리 → index.html)</a></li>
+    <li><a href="hello.txt">hello.txt</a></li>
+    <li><a href="/cgi-bin/hello.sh?name=MicroHTTP">CGI GET</a></li>
+  </ul>
+  <form method="post" action="/cgi-bin/echo.py">
+    <input name="msg" value="안녕하세요">
+    <button>CGI POST</button>
+  </form>
+  <script src="app.js"></script>
+</body>
+</html>
