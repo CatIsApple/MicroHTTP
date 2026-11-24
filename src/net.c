@@ -5,9 +5,13 @@
 #include "http.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <string.h>
 #include <unistd.h>
 
 void close_socket(int fd)
@@ -64,4 +68,55 @@ int send_error_response(int fd, int status, int keep_alive, int omit_body, const
     if (body_length < 0 || header_length < 0) return -1;
     if (send_all(fd, header, (size_t)header_length) == -1) return -1;
     return omit_body ? 0 : send_all(fd, body, (size_t)body_length);
+}
+
+int connect_with_timeout(const char *host, const char *port, int timeout_ms)
+{
+    /* "localhost" 같은 이름도 쓸 수 있도록 getaddrinfo로 주소를 찾습니다. */
+    struct addrinfo hints, *addresses;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int error = getaddrinfo(host, port, &hints, &addresses);
+    if (error) {
+        fprintf(stderr, "getaddrinfo %s:%s: %s\n", host, port, gai_strerror(error));
+        errno = EHOSTUNREACH;
+        return -1;
+    }
+    int fd = -1;
+    int saved_errno = ECONNREFUSED;
+    for (struct addrinfo *address = addresses; address; address = address->ai_next) {
+        fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (fd == -1) { saved_errno = errno; continue; }
+        /*
+         * 블로킹 connect는 응답 없는 주소에서 OS 기본값(수십 초~수 분)만큼 멈춥니다.
+         * 논블로킹으로 바꾸면 connect가 즉시 EINPROGRESS로 돌아오고,
+         * poll로 "쓰기 가능(=연결 완료)"이 될 때까지 timeout_ms만 기다릴 수 있습니다.
+         */
+        int flags = fcntl(fd, F_GETFL, 0);
+        int result = flags == -1 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (result == 0) result = connect(fd, address->ai_addr, address->ai_addrlen);
+        if (result == -1 && errno == EINPROGRESS) {
+            struct pollfd waiting = { .fd = fd, .events = POLLOUT };
+            int ready = poll(&waiting, 1, timeout_ms);
+            if (ready == 1) {
+                /* 연결 결과(성공 0 / ECONNREFUSED 등)는 SO_ERROR로 확인합니다. */
+                int socket_error = 0;
+                socklen_t length = sizeof(socket_error);
+                result = getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length);
+                if (result == 0 && socket_error) { errno = socket_error; result = -1; }
+            } else {
+                if (ready == 0) errno = ETIMEDOUT;
+                result = -1;
+            }
+        }
+        /* 이후 recv/send는 SO_RCVTIMEO를 쓰는 블로킹 방식으로 하므로 원래 모드로 되돌립니다. */
+        if (result == 0 && fcntl(fd, F_SETFL, flags) == 0) break;
+        saved_errno = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(addresses);
+    if (fd == -1) errno = saved_errno;
+    return fd;
 }

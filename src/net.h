@@ -26,4 +26,10 @@ int set_socket_timeout(int fd, int seconds);
  */
 int send_error_response(int fd, int status, int keep_alive, int omit_body, const char *allow);
 
+/*
+ * host:port에 TCP 연결합니다. timeout_ms 안에 연결되지 않으면 실패합니다.
+ * 성공하면 블로킹 모드의 소켓 fd, 실패하면 -1 (errno에 원인).
+ */
+int connect_with_timeout(const char *host, const char *port, int timeout_ms);
+
 #endif

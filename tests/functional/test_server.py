@@ -21,6 +21,13 @@ SERVER = os.path.join(ROOT, "server")
 WWW = os.path.join(ROOT, "www")
 PORT = 18080
 IDLE_TIMEOUT = 5
+BACKEND_TIMEOUT = 5
+BACKEND_A, BACKEND_B, BACKEND_DEAD = 19001, 19002, 19009
+PROXY_ARGS = [
+    "-R", f"/api/=127.0.0.1:{BACKEND_A},127.0.0.1:{BACKEND_B}",          # Round-Robin
+    "-R", f"/down/=127.0.0.1:{BACKEND_DEAD}",                            # 아무도 듣지 않는 포트
+    "-R", f"/failover/=127.0.0.1:{BACKEND_DEAD},127.0.0.1:{BACKEND_A}",  # 죽은 백엔드 건너뛰기
+]
 
 
 # ── 서버 실행 도우미 ──────────────────────────────────────────────────────
@@ -59,6 +66,13 @@ class Server:
             self.process.kill()
             self.process.wait()
         self.log.close()
+
+
+def start_backend(port, name):
+    process = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "backend.py"), str(port), name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for_port(port)
+    return process
 
 
 # ── 원시 HTTP 도우미 ──────────────────────────────────────────────────────
@@ -288,13 +302,163 @@ def test_sudden_client_disconnect(server):
     assert get("/")[0] == 200
 
 
+# ── 동시 처리 (스레드 풀) ─────────────────────────────────────────────────
+
+def test_concurrent_slow_client_does_not_block_others(server):
+    # 느린 클라이언트가 작업 스레드 하나를 붙잡고 있어도 다른 요청은 바로 처리되어야 함
+    slow = connect()
+    slow.sendall(b"GET / HTTP/1.1\r\nHost:")         # 헤더를 보내다 멈춤
+    time.sleep(0.2)
+    start = time.time()
+    assert get("/index.html")[0] == 200
+    assert time.time() - start < 1.0, "blocked behind slow client"
+    slow.close()
+
+
+def test_concurrent_many_clients(server):
+    import concurrent.futures
+    expected = file_bytes("css/style.css")
+
+    def client(_):
+        results = []
+        with connect() as sock:                       # 연결 하나로 keep-alive 10회
+            for _ in range(10):
+                sock.sendall(b"GET /css/style.css HTTP/1.1\r\nHost: a\r\n\r\n")
+                status, _, body = read_response(sock)
+                results.append(status == 200 and body == expected)
+        return all(results)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+        assert all(pool.map(client, range(200)))     # 200 연결 × 10 요청 = 2000 요청
+
+
+def test_pool_exhausted_requests_wait_not_fail(server):
+    # 작업 스레드가 1개뿐이고 그 스레드를 느린 클라이언트가 붙잡으면, 다음 요청은 실패하지 않고
+    # 큐에서 기다렸다가 스레드가 풀려난 뒤(유휴 타임아웃 5초) 처리됩니다. → 스레드 풀 크기의 한계
+    single = Server("-t", "1", port=PORT + 1)
+    try:
+        slow = connect(PORT + 1)
+        slow.sendall(b"GET / HTTP/1.1\r\nHost:")              # 유일한 작업 스레드를 점유
+        time.sleep(0.2)
+        start = time.time()
+        status, _, _ = request(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", port=PORT + 1)
+        waited = time.time() - start
+        assert status == 200
+        assert IDLE_TIMEOUT - 1 <= waited <= IDLE_TIMEOUT + 2, waited
+        assert read_response(slow)[0] == 408                    # 느린 쪽은 타임아웃
+        slow.close()
+    finally:
+        single.stop()
+
+
+# ── 시그널 / 셧다운 ──────────────────────────────────────────────────────
+
+def test_graceful_shutdown_finishes_inflight_request(server):
+    import signal
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        target = Server(port=PORT + 2)
+        try:
+            sock = connect(PORT + 2)
+            sock.sendall(b"GET /index.html HTTP/1.1\r\nHost: a\r\n")   # 요청을 보내는 도중
+            time.sleep(0.2)
+            target.process.send_signal(signal_number)                    # 셧다운 시작
+            time.sleep(0.3)
+            sock.sendall(b"\r\n")                                       # 요청 마저 보내기
+            status, headers, body = read_response(sock)
+            assert status == 200 and body == file_bytes("index.html")
+            assert headers["connection"] == "close"                     # 마지막 응답
+            assert target.process.wait(timeout=IDLE_TIMEOUT + 3) == 0   # 정상 종료 코드
+            assert "shutdown complete" in target.logs()
+            try:
+                connect(PORT + 2, timeout=1).close()
+                raise AssertionError("listener still open")
+            except ConnectionRefusedError:
+                pass
+            sock.close()
+        finally:
+            target.stop()
+
+
+# ── Reverse Proxy ───────────────────────────────────────────────────────
+
+def proxy_get(path, extra=b""):
+    import json
+    status, headers, body = request(b"GET " + path.encode() + b" HTTP/1.1\r\nHost: front.test\r\n" + extra + b"\r\n")
+    return status, headers, (json.loads(body) if status == 200 else body)
+
+
+def test_proxy_routes_api_to_backend_and_static_locally(server):
+    status, headers, data = proxy_get("/api/hello?x=1")
+    assert status == 200 and headers["content-type"].startswith("application/json")
+    assert data["path"] == "/api/hello?x=1" and data["method"] == "GET"
+    assert get("/index.html")[0] == 200                      # 규칙에 없는 경로는 정적 파일
+
+
+def test_proxy_round_robin(server):
+    names = [proxy_get("/api/rr")[2]["backend"] for _ in range(6)]
+    assert set(names) == {"A", "B"}, names
+    assert all(names[i] != names[i + 1] for i in range(5)), names   # 번갈아 가며
+
+
+def test_proxy_forwards_post_body_and_headers(server):
+    import json
+    body = "안녕 proxy".encode() + bytes(range(1, 32))
+    raw = (b"POST /api/echo HTTP/1.1\r\nHost: front.test\r\nContent-Type: text/plain\r\n"
+           b"X-Custom: yes\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n"
+           b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    with connect() as sock:
+        sock.sendall(raw)
+        status, headers, payload = read_response(sock)
+        data = json.loads(payload)
+        assert status == 200 and data["method"] == "POST"
+        assert data["body_bytes"] == len(body)
+        seen = data["headers"]
+        assert seen["host"] == "front.test" and seen["x-custom"] == "yes"   # 원래 헤더 유지
+        assert seen["connection"] == "close" and "keep-alive" not in seen   # hop-by-hop 교체
+        assert is_closed(sock)                                              # 프록시 응답 후 연결 닫힘
+
+
+def test_proxy_http10_without_host(server):
+    import json
+    status, _, body = request(b"GET /api/old HTTP/1.0\r\n\r\n")
+    assert status == 200 and json.loads(body)["headers"]["host"].startswith("127.0.0.1:")
+
+
+def test_proxy_backend_down_502(server):
+    status, headers, _ = proxy_get("/down/x")
+    assert status == 502 and headers["connection"] == "close"
+
+
+def test_proxy_failover_skips_dead_backend(server):
+    for _ in range(4):
+        status, _, data = proxy_get("/failover/x")
+        assert status == 200 and data["backend"] == "A"
+
+
+def test_proxy_backend_timeout_504(server):
+    start = time.time()
+    status, _, _ = proxy_get("/api/slow")
+    elapsed = time.time() - start
+    assert status == 504, status
+    assert BACKEND_TIMEOUT - 1 <= elapsed <= BACKEND_TIMEOUT + 2, elapsed
+
+
+def test_proxy_client_disconnects_midway(server):
+    sock = connect()
+    sock.sendall(b"GET /api/slow HTTP/1.1\r\nHost: a\r\n\r\n")
+    sock.close()                                       # 백엔드 응답 전에 클라이언트가 떠남
+    assert proxy_get("/api/after")[0] == 200
+    assert server.alive()
+
+
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
 
 
 def main():
     selected = [t for t in TESTS if len(sys.argv) < 2 or sys.argv[1] in t.__name__]
     subprocess.run(["make", "-s", "server"], cwd=ROOT, check=True)
-    server = Server()
+    backends = [start_backend(BACKEND_A, "A"), start_backend(BACKEND_B, "B")]
+    server = Server(*PROXY_ARGS)
     failures = 0
     try:
         for test in selected:
@@ -310,9 +474,18 @@ def main():
                 print("server died; restarting")
                 print(server.logs()[-3000:])
                 server.stop()
-                server = Server()
+                server = Server(*PROXY_ARGS)
+        # 새니타이저 빌드(make asan)에서 서버 로그에 메모리 오류나 UB 보고가 있으면 실패로 처리
+        for marker in ("AddressSanitizer", "LeakSanitizer", "runtime error:"):
+            if marker in server.logs():
+                failures += 1
+                print(f"FAIL sanitizer report in server log: {marker}")
+                print(server.logs()[-5000:])
     finally:
         server.stop()
+        for backend in backends:
+            backend.kill()
+            backend.wait()
     print(f"{len(selected) - failures}/{len(selected)} functional tests passed")
     return 1 if failures else 0
 
