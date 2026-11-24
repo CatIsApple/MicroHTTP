@@ -14,7 +14,7 @@ SAN      := -fsanitize=address,undefined -fno-omit-frame-pointer
 BIN      := microhttp
 LIB_SRCS := src/tcp.c src/http_request.c src/http_response.c src/mime.c src/conn.c src/server.c
 LIB_OBJS := $(LIB_SRCS:src/%.c=build/%.o)
-TESTS    := build/test_tcp build/test_http_request build/test_http_response
+TESTS    := build/test_tcp build/test_http_request build/test_http_response build/test_mime
 
 .PHONY: all test e2e asan asan-test clean
 all: $(BIN)
