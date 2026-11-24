@@ -12,6 +12,11 @@
  * 마감 시각을 넘겨서 붙잡히는 일이 없다.
  */
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+/* macOS 는 _POSIX_C_SOURCE 를 정의하면 POSIX 에 없는 이름을 숨긴다. MSG_DONTWAIT 도 그중 하나라서
+ * 다윈 확장을 다시 켠다. 리눅스에서는 이 줄이 없어도 MSG_DONTWAIT 가 보인다. */
+#define _DARWIN_C_SOURCE
+#endif
 
 #include "tcp.h"
 
