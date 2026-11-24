@@ -1,5 +1,8 @@
 /* test_tcp.c — L1 단위 테스트.
- * socketpair() 로 서로 연결된 소켓 한 쌍을 만들어 네트워크 없이 L1 함수를 확인한다. */
+ * socketpair() 로 서로 연결된 소켓 한 쌍을 만들어 네트워크 없이 L1 함수를 확인한다.
+ *
+ * 구성: 테스트 함수 하나가 한 가지 성질을 확인한다 (읽기, cap, EOF, 마감 시각, 보내기 실패, errno).
+ * EXPECT 가 실패하면 위치를 찍고 failures 를 늘리며, main 은 실패가 하나라도 있으면 1 을 돌려준다. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "tcp.h"
@@ -21,7 +24,9 @@ static int failures = 0;
         }                                                                \
     } while (0)
 
+/* 서로 연결된 소켓 한 쌍을 만든다 (sv[0] ↔ sv[1]) */
 static void pair(int sv[2]) { EXPECT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0); }
+/* pair 로 만든 소켓 두 개를 닫는다 */
 static void unpair(int sv[2]) { close(sv[0]); close(sv[1]); }
 
 /* 보낸 바이트가 그대로 읽힌다 */
@@ -128,6 +133,7 @@ static void send_to_closed_peer(void)
     close(sv[0]);
 }
 
+/* cap 이 0 이면 EOF 와 헷갈리지 않도록 -1, errno = EINVAL */
 static void zero_cap_is_einval(void)
 {
     int sv[2]; pair(sv);
@@ -151,6 +157,7 @@ static void listen_keeps_errno(void)
     close(a);
 }
 
+/* 모든 테스트를 차례로 실행하고, 실패가 있으면 개수를 찍고 1 을 돌려준다 */
 int main(void)
 {
     send_then_recv();

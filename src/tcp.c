@@ -1,4 +1,16 @@
-/* tcp.c — L1: TCP 소켓 레이어 구현. 인터페이스 설명은 include/tcp.h */
+/* tcp.c — L1: TCP 소켓 레이어 구현. 인터페이스 설명은 include/tcp.h
+ *
+ * 레이어 구조에서의 위치
+ *   L1 (이 파일)  소켓 열기/받기/읽기/쓰기/닫기. HTTP 는 모른다.
+ *   L2 이상       이 파일의 함수로 받은 바이트를 파싱하고(L2), 만든 응답을 보낸다(L3).
+ *
+ * 구성
+ *   - 시간: tcp_now_ms (단조 시계)
+ *   - 내부 도우미: fail_close, set_cloexec, wait_ready(poll 로 마감 시각까지 대기)
+ *   - 공개 함수: tcp_listen → tcp_accept → tcp_recv_some / tcp_send_all → tcp_close_graceful
+ * 모든 입출력은 "poll 로 기다린 뒤 MSG_DONTWAIT 로 한 번 시도" 하는 방식이라
+ * 마감 시각을 넘겨서 붙잡히는 일이 없다.
+ */
 #define _POSIX_C_SOURCE 200809L
 
 #include "tcp.h"
@@ -24,6 +36,7 @@
 #define CLOSE_DRAIN_MS 500             /* 닫기 전에 남은 입력을 비우는 최대 시간 */
 #define CLOSE_DRAIN_BYTES (64 * 1024)  /* 비우면서 버릴 최대 바이트 수 */
 
+/* 단조 시계(CLOCK_MONOTONIC)로 현재 시각을 ms 단위로 돌려준다. 마감 시각 계산의 기준 */
 long long tcp_now_ms(void)
 {
     struct timespec ts;
@@ -70,6 +83,8 @@ static int wait_ready(int fd, short events, long long deadline_ms)
     }
 }
 
+/* 소켓 생성 → close-on-exec → SO_REUSEADDR → 0.0.0.0:port 에 bind → listen.
+ * 중간에 실패하면 소켓을 닫고 -1 (errno 는 실패한 단계의 원인) */
 int tcp_listen(uint16_t port, int backlog)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -95,6 +110,8 @@ int tcp_listen(uint16_t port, int backlog)
     return fd;
 }
 
+/* 대기 중인 연결 하나를 accept 하고 close-on-exec 를 건다.
+ * peer 버퍼가 있으면 상대 주소를 "ip:port" 로 적어 준다 (로그, CGI REMOTE_ADDR 용) */
 int tcp_accept(int lfd, char *peer, size_t peer_len)
 {
     struct sockaddr_in addr;
@@ -114,6 +131,8 @@ int tcp_accept(int lfd, char *peer, size_t peer_len)
     return fd;
 }
 
+/* 읽을 데이터가 올 때까지 마감 시각까지 기다린 뒤, 와 있는 만큼(최대 cap) 한 번 읽는다.
+ * 시그널(EINTR)이나 헛깨어남(EAGAIN)은 다시 기다리고, 그 밖의 오류는 -1 */
 ssize_t tcp_recv_some(int fd, void *buf, size_t cap, long long deadline_ms)
 {
     if (cap == 0) { /* 0 바이트 읽기는 결과 0 이 EOF 와 구분되지 않으므로 막는다 */
@@ -132,6 +151,8 @@ ssize_t tcp_recv_some(int fd, void *buf, size_t cap, long long deadline_ms)
     }
 }
 
+/* 송신 버퍼에 자리가 날 때마다 보낼 수 있는 만큼 보내기를 반복해서 len 바이트를 다 보낸다.
+ * 마감 시각이 지나거나 상대가 끊으면 -1 */
 int tcp_send_all(int fd, const void *buf, size_t len, long long deadline_ms)
 {
     const char *p = buf;
@@ -151,6 +172,7 @@ int tcp_send_all(int fd, const void *buf, size_t len, long long deadline_ms)
     return 0;
 }
 
+/* 응답을 보낸 연결을 RST 없이 닫는다: FIN 을 보내고 → 남은 입력을 상한 안에서 버린 뒤 → close */
 void tcp_close_graceful(int fd)
 {
     /* 1. "더 보낼 것 없음" (FIN). 클라이언트는 응답을 끝까지 읽고 자기도 닫는다. */
