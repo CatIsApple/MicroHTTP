@@ -1,0 +1,7 @@
+PASS test_http: request line, headers, body, split delivery, keep-alive, errors, limits, response header, extra headers, find header
+PASS test_mime: html, css, js, json, txt, png, jpg, gif, svg, ico, pdf, unknown
+PASS test_static: index, query, percent-decode, 404, 403 (.., symlink, permission, dir), 400, 414 (NAME_MAX), 500 (ELOOP)
+PASS test_net: partial send, EINTR, EPIPE, timeout, zero progress, empty input
+PASS test_proxy: rule parsing, longest-prefix routing, round-robin, request rewrite (hop-by-hop, Host)
+PASS test_session: create/lookup/destroy, forged ids, idle/absolute timeout, no renewal after expiry, active expiration, concurrent access
+34/34 functional tests passed

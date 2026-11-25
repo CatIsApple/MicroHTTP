@@ -116,7 +116,12 @@ static void *client_thread(void *arg)
 static void *sweeper_thread(void *unused)
 {
     (void)unused;
-    while (!__atomic_load_n(&stop_sweeper, __ATOMIC_SEQ_CST)) session_expire(5000); /* 아무것도 만료되지 않는 시각 */
+    /* 실제 서버는 1초마다 훑습니다. 쉬지 않고 돌면 Valgrind(스레드를 하나씩 실행)에서 다른 스레드가 굶습니다. */
+    struct timespec pause = { 0, 50000 };   /* 50us */
+    while (!__atomic_load_n(&stop_sweeper, __ATOMIC_SEQ_CST)) {
+        session_expire(5000);               /* 아무것도 만료되지 않는 시각 */
+        nanosleep(&pause, NULL);
+    }
     return NULL;
 }
 

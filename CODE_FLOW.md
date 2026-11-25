@@ -129,6 +129,40 @@ handle_request()                                   server.c:194
 handle_connection: keep_alive=0 → break → free(buffer) → 작업 스레드가 close
 ```
 
+### 2.4 인증 요청: 로그인 → 새 연결로 `/me` → 로그아웃
+
+```text
+[연결 1] POST /login  (username=alice&password=…)
+handle_request                                         server.c:213
+ └─ auth_handle_request(fd, &request, keep_alive)      auth.c:193   경로가 /login·/logout·/me가 아니면 0 → 정적 파일
+      ├─ cookie_session_id → http_find_header("Cookie") auth.c:115, http.c:296
+      ├─ form_value("username"), form_value("password") auth.c:82   %XX·'+' 디코딩
+      ├─ check_password → crypto_pwhash_str_verify      auth.c:152   (libsodium argon2id)
+      ├─ (이전 sid가 있으면) session_destroy(old)                    Session 고정 방지
+      ├─ session_create("alice", session_now(), new_id) auth.c:257 → session.c:91
+      │    randombytes_buf(32바이트) → 16진수 64자, malloc 노드
+      │    LOCK → 리스트 앞에 연결 → id 복사 → UNLOCK
+      └─ send_auth_response(303, "Location: /me\r\nSet-Cookie: sid=…; Path=/; HttpOnly; SameSite=Lax")
+           + Cache-Control: no-store                   auth.c:136
+handle_connection: 연결 종료 → fd 닫힘 (fd 번호는 커널이 다음 연결에 재사용)
+
+[연결 2] GET /me  Cookie: sid=<64자>
+auth_handle_request
+ ├─ cookie_session_id → id
+ ├─ session_lookup(id, now, &info)                     auth.c:225 → session.c:117
+ │    형식 검사(64자 16진수) → LOCK → sodium_memcmp로 찾기
+ │    만료면 리스트에서 빼고 free, 0 반환 (Passive Expiration, 갱신하지 않음)
+ │    유효하면 last_seen = now, user를 info에 **복사** → UNLOCK
+ └─ (락 밖) "user: alice" 응답 생성·send           ← info는 복사본이라 그사이 로그아웃돼도 안전
+
+[연결 3] POST /logout  Cookie: sid=<64자>
+ └─ session_destroy(id)                                auth.c:237 → session.c:144   LOCK → 빼고 free → UNLOCK
+    + Set-Cookie: sid=; Max-Age=0 …                    이후 같은 sid는 어디서 와도 401
+
+[main 스레드, 1초마다]  session_expire(now)           server.c:570 → session.c:163  요청이 없어도 만료 정리
+[종료]                 stop_workers → session_clear() server.c:606                  남은 Session 모두 free
+```
+
 ### 2.3 오류 경로 요약
 
 | 어디서 | 상황 | 결과 |
@@ -143,6 +177,8 @@ handle_connection: keep_alive=0 → break → free(buffer) → 작업 스레드�
 | `serve_static_file` | 헤더 송신 후 read 실패 | 상태를 바꿀 수 없으므로 연결 종료 |
 | `send_all` | 클라이언트가 끊음(EPIPE, SIGPIPE 무시 덕분) | -1 → 연결 종료 |
 | `proxy_forward` | 백엔드 연결 불가 / 응답 없음 | 502 / 504 |
+| `auth_handle_request` | 로그인 실패 / Cookie 없음·위조·만료·로그아웃된 sid | 401 (연결 유지) |
+| `auth_handle_request` | `/login`·`/logout`에 GET, `/me`에 POST | 405 + Allow |
 | `wait_backend_or_client_gone` | 백엔드를 기다리는 중 클라이언트가 떠남 | 백엔드 요청을 버리고 즉시 종료 (스레드 반환) |
 
 ---

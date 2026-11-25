@@ -17,11 +17,11 @@
 | Proxy | Reverse Proxy, 경로 라우팅(최장 prefix), Round-Robin | ✅ | `proxy.c`, `test_proxy.c` |
 | Proxy | 502(연결 불가)/504(타임아웃), 장애 백엔드 건너뛰기, 떠난 클라이언트 감지 | ✅ | 기능 테스트 10개 |
 | Proxy | Forward Proxy | ➖ | 요구사항은 "최소 한 가지" — Reverse Proxy 선택 |
-| 메모리·안정성 | ASan + UBSan | ✅ | `make asan` 28/28 |
-| 메모리·안정성 | ThreadSanitizer | ✅ | `make tsan` 28/28 (macOS clang, Linux gcc), TSan 빌드 서버 엣지 탐침 30/30 · 보고 0. 베이스라인은 27/28 |
+| 메모리·안정성 | ASan + UBSan | ✅ | `make asan` 단위 6 + 기능 34/34 (인증 추가 후) |
+| 메모리·안정성 | ThreadSanitizer | ✅ | `make tsan` 기능 34/34 (인증 추가 후, macOS). 베이스라인은 27/28 → 레이스 수정 후 28/28 |
 | 메모리·안정성 | Valgrind(누수·잘못된 접근), 일반 사용자 테스트, malloc 실패 → 500 (Linux) | ✅ | `tests/linux/verify.sh` → `ALL LINUX CHECKS PASSED` |
 | 메모리·안정성 | fd 누수 | ✅ | 부하 측정 전후 fd 7 → 7, Valgrind `--track-fds` 종료 시 stdio + 로그만 열림 |
-| 메모리·안정성 | 엣지 케이스(불완전 헤더, Slowloris, 큰 본문, 긴 URI, 백엔드 타임아웃, 갑작스러운 종료) | ✅ | `edge_probe.py` 30/30, 기능 테스트 28/28 |
+| 메모리·안정성 | 엣지 케이스(불완전 헤더, Slowloris, 큰 본문, 긴 URI, 백엔드 타임아웃, 갑작스러운 종료) | ✅ | `edge_probe.py` 30/30, 기능 테스트 34/34 |
 
 **베이스라인 성능** (hey, 3회 중앙값, M1 Pro 루프백, 작업 스레드 8)
 
@@ -36,6 +36,136 @@
 
 외부 HTTP 라이브러리 없이 POSIX 소켓 API만으로 만든 HTTP/1.1 웹 서버입니다.
 구현 범위는 [REQUIREMENTS.md](REQUIREMENTS.md), 작업 원칙은 [CLAUDE.md](CLAUDE.md)를 따릅니다.
+
+---
+
+# 인증 상태 관리 — HTTP는 Stateless인데, 서버는 어떻게 나를 기억할까?
+
+> 로그인이라는 일상적인 경험에서 출발해, Cookie와 서버 측 Session을 직접 구현하며 **Security · Usability · Reliability** 사이의 선택을 실험으로 확인했습니다.
+> 상세 기록: [EXPERIMENT_REPORT.md](EXPERIMENT_REPORT.md) · 구현과 선택 근거: [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) 10절 · 호출 흐름: [CODE_FLOW.md](CODE_FLOW.md) 2.4 · 개념 정리: [STUDY_GUIDE.md](STUDY_GUIDE.md) 13~16
+
+## 전체 아키텍처 (개념도)
+
+```mermaid
+flowchart LR
+    C[브라우저 / curl<br/>Cookie: sid=64자] -->|TCP 연결 N개| L[main 스레드<br/>accept 루프]
+    L -->|fd| Q[(작업 큐 64)]
+    Q --> W[작업 스레드 8개<br/>handle_connection]
+    W -->|/login /logout /me| A[auth.c]
+    W -->|그 외| S[정적 파일]
+    W -->|-R 규칙| P[proxy.c] --> B[백엔드]
+    A -->|복사본만 반환| ST[(Session 저장소<br/>연결 리스트 + mutex)]
+    L -.1초마다 session_expire.-> ST
+```
+
+## TCP 연결과 Session의 생명주기 (개념도)
+
+```mermaid
+sequenceDiagram
+    participant A as 브라우저 A
+    participant S as 서버
+    participant B as 다른 클라이언트 B
+    A->>S: 연결 1 (fd 5) POST /login
+    S-->>A: 303 Set-Cookie: sid=X (Session X 생성)
+    Note over A,S: 연결 1 종료 — fd 5 반납, Session X는 남음
+    B->>S: 연결 2 (fd 5 재사용) GET /me, Cookie 없음
+    S-->>B: 401 (fd가 아니라 sid로 판단)
+    A->>S: 연결 3 (fd 5) GET /me, Cookie: sid=X
+    S-->>A: 200 user: alice
+    A->>S: POST /logout, Cookie: sid=X
+    S-->>A: Session X 삭제, Set-Cookie Max-Age=0
+```
+
+## STEP별 기록 — 문제 → 가설 → 선택 → 구현 → 실험 → 결과 → 새 문제
+
+| STEP | 문제 | 가설 / 선택 | 구현 | 실험 결과 (실측) | 새 문제 |
+|---|---|---|---|---|---|
+| 0 베이스라인 | 인증을 넣은 뒤 "느려졌나, 깨졌나"를 판단할 기준이 없음 | 같은 스크립트로 전후 측정 | `tests/bench/baseline.sh` | 5개 시나리오 비정상 0. **TSan 첫 실행에서 `stop_requested` 데이터 레이스 발견 → atomic_int로 수정** | 측정 변동 최대 약 10% |
+| 1 TCP ≠ Session | 로그인 상태를 무엇에 묶을까 | 연결(fd)이 아니라 Cookie의 Session ID | `session.c`, `auth.c` | fd 식별 데모: **자격 증명 없는 B가 `user: alice`**. Session 방식: B는 401, A는 새 연결 3개에서 200 | 만료, 동시 접근 |
+| 2 만료·동시성 | 버려진 Session, 로그아웃과 조회의 경쟁 | Passive+Active 만료, **락 안에서 복사** | `session_lookup` 복사본, 1초 주기 `session_expire` | 요청 없이 6→0개 정리. **포인터 반환 시 ASan UAF·Valgrind Invalid read 4, 복사본 0**. 넓은 락은 c=8에서 -14%, 락 점유 34배 | TSan은 UAF를 못 잡음 |
+| 3 Proxy 경유 | 프록시가 Cookie를 망가뜨리지 않나 | 기존 프록시 그대로(캐시 없음) | 변경 없음, 백엔드가 no-store | 직접과 경유가 로그인·/me·로그아웃·속성·no-store 모두 동일 | 프록시는 연결을 닫음(keep-alive 아님) |
+| 4 입력 불신 | 클라이언트가 보낸 상태를 믿으면? | 서버 측 저장, CSPRNG ID, 재발급, argon2id | libsodium | 위조·변조·형식만 맞춘 ID, `logged_in=true` Cookie 모두 401 | 없는 사용자는 응답이 빨라 존재 여부가 드러날 수 있음 |
+| 5 노출·전송 | ID가 새는 경로 | HttpOnly, SameSite=Lax, 로그 미기록 | `COOKIE_ATTRIBUTES` | 로그의 ID 평문 0건 | **TLS·CSRF 검증 미완료**, Secure 미적용 |
+| 7 다중 서버 | 서버가 2대면? | 메모리 저장소의 한계 확인 | 실험만 | A에서 받은 sid: A 200 / B 401. Round-Robin 뒤에서 200·401 번갈아 | Sticky / 복제 / 공유 저장소 비교(아래) |
+
+## 실험 결과 요약 (실측, 재현 명령어)
+
+| 실험 | 명령어 | 핵심 결과 |
+|---|---|---|
+| FD 재사용 | `make server build/server_fd_demo && python3 tests/experiments/step1_fd_reuse.py` | fd 방식에서 B가 alice로 인증, Session 방식은 401 |
+| 만료 | `./server -U tests/functional/users.txt -I 3` 후 로그인 6번 | 요청 없이 `expired 2 → 3 → 1, remaining 0` |
+| UAF | `make build/step2_uaf CFLAGS='-O1 -g -fsanitize=address' LDFLAGS=-fsanitize=address && build/step2_uaf unsafe` | unsafe: heap-use-after-free / safe: 0 |
+| 락 범위 | `sh tests/bench/step2_lock_scope.sh 3` | 아래 표 |
+| 프록시 경유 | `sh tests/experiments/step3_proxy_auth.sh` | 직접 = 경유 |
+| 서버 2대 | `sh tests/experiments/step7_two_servers.sh` | 200 / 401 |
+| Linux 전체 | `docker build -t microhttp-verify tests/linux && docker run --rm -v "$PWD":/src:ro microhttp-verify sh /src/tests/linux/verify.sh` | `ALL LINUX CHECKS PASSED` |
+
+**락 범위 비교 (실측, `GET /me` 20,000회, 3회 중앙값)**
+
+| 변형 | 동시 8 요청/초 | 동시 50 요청/초 | 평균 락 점유 | 평균 락 대기 |
+|---|---:|---:|---:|---:|
+| 좁은 락 (복사 후 해제) | 49,975 | 46,339 | 0.21 us | 0.55 us |
+| 넓은 락 (send까지) | 43,002 | 45,652 | 7.26 us | 16.10 us |
+
+동시 8은 3회 범위가 겹치지 않아 차이가 있고, 동시 50은 겹쳐서 차이가 없다고 판단했습니다(병목이 스레드 풀 대기로 옮겨 감).
+
+**회귀 (STEP 0 대비, 실측)**
+
+| 시나리오 | STEP 0 (레이스 수정 후) | 인증 추가 후 | 중앙값 변화 | 3회 범위 | 비정상 |
+|---|---:|---:|---:|---|---:|
+| 정적 keep-alive c8 | 42,445 | 29,326 | -30.9% | 안 겹침 | 0 → 0 |
+| 정적 keep-alive c50 | 40,298 | 34,352 | -14.8% | 안 겹침 | 0 → 0 |
+| 정적 새 연결 c10 | 19,894 | 18,634 | -6.3% | 겹침 | 0 → 0 |
+| 정적 새 연결 c50 | 19,011 | 18,987 | -0.1% | 겹침 | 0 → 0 |
+| 프록시 c10 | 5,774 | 5,198 | -10.0% | 겹침 | 0 → 0 |
+
+keep-alive의 큰 하락이 실제 회귀인지 확인하려고, **두 바이너리(STEP 0 `73dc4dd`, 현재)를 같은 시간대에 번갈아 6회씩** 측정했습니다(`docs/results/step2_ab_static.csv`):
+STEP 0 중앙값 **35,599** · 현재 **37,884** 요청/초 — 짝지은 6쌍 중 5쌍에서 현재가 같거나 빠름. 같은 세션 안에서 두 바이너리 모두 31k→40k로 함께 움직였으므로(측정 시 load average 약 3),
+위 -31%는 두 측정 시점 사이의 환경 변화이고 **회귀는 없다**고 판단합니다. 정적 경로에 추가된 것은 경로 문자열 비교 3번뿐입니다.
+기능·메모리 회귀: `make test`/`asan`/`tsan` 모두 단위 6 + 기능 34/34, Linux `verify.sh` ALL PASSED(Valgrind 단위 6개·실서버·인증 흐름 포함). fd는 7 → 9로 시작값이 늘었지만 측정 전후 9 → 9로 일정(libsodium 초기화가 여는 fd로 추정, 누수 아님).
+
+## TTL 트레이드오프 (개념 설명, 실측 아님)
+
+TTL이 짧을수록 탈취된 ID의 유효 시간이 줄지만(Security) 자주 다시 로그인해야 합니다(Usability). 아래는 방향만 정리한 표이며, 특정 값이 최적이라고 주장하지 않습니다.
+
+| 서비스 성격 | Idle TTL 방향 | Absolute TTL 방향 | 이유 |
+|---|---|---|---|
+| 금융·공공(예: 고용24) | 짧게 (분 단위, 연장 버튼) | 짧게 | 피해가 크고 공용 PC 사용이 많음. 고용24는 화면에 남은 시간과 연장 버튼을 보여 주는 UI 사례로만 참고(내부 구현·최적성은 미확인) |
+| 사내 업무 도구 | 중간 (수십 분) | 근무 시간 수준 | 보안과 업무 흐름의 균형 |
+| 커뮤니티·쇼핑 | 길게 | 길게 (+ 중요 작업 시 재인증) | 재로그인 피로가 이탈로 이어짐 |
+| 이 서버 기본값 | 30분 (`-I 1800`) | 8시간 (`-A 28800`) | 실험용 기본값, 근거 측정 없음 |
+
+## 다중 서버에서의 Session (비교만, 구현하지 않음)
+
+| 방식 | 장점 | 단점 |
+|---|---|---|
+| Sticky Session | 서버 코드 변경 없음 | 그 서버가 죽으면 로그인 유실, 부하 쏠림 |
+| Session Replication | 어느 서버로 가도 됨 | 복제 지연·충돌, 통신량 증가 |
+| 공유 저장소(Redis 등) | 서버가 상태를 갖지 않아 확장 쉬움 | 저장소가 단일 장애점, 요청마다 네트워크 왕복 |
+
+## 한계와 미완료 항목
+
+| 항목 | 상태 |
+|---|---|
+| **TLS**(HTTPS 종료), HTTP vs HTTPS 비교, 탈취 ID 재사용 실험 | 미완료 — 방식 결정·검증 시간 부족. 프록시~백엔드 구간은 평문 |
+| **CSRF** 보호 범위 검증 | 미완료 — SameSite=Lax만 적용, 토큰·교차 사이트 실험 없음 |
+| Cookie `Secure` | 미적용 — HTTP만 지원하므로 붙이면 브라우저가 Cookie를 보내지 않음 |
+| STEP 6 TTL 개념도(그림) | 미완료 — 위 표로 대신 |
+| 느린 클라이언트에서의 락 범위 비교 | 미실행 |
+| Session이 많을 때 연결 리스트 조회 비용 | 미측정 (성능 측정은 Session 1개 상태) |
+| 로그인 실패 타이밍 | 없는 사용자는 해시 검증을 건너뛰어 응답이 빠름 |
+| HTTPS와 Cookie 속성의 한계 | 이미 탈취된 Session ID의 재사용은 막지 못함 |
+| 4분 발표 | 이 저장소 밖 — 구성: 문제 제기 → STEP 2 실험(UAF, 락 범위) → 남은 문제 |
+
+### 실행 예
+
+```bash
+make server build/hashpw
+./server -p 8080 -U tests/functional/users.txt          # 테스트 계정: alice / alice-test-pw
+curl -i -c jar -d 'username=alice&password=alice-test-pw' http://127.0.0.1:8080/login
+curl -b jar http://127.0.0.1:8080/me
+```
+
 
 | 문서 | 내용 |
 |---|---|
@@ -93,5 +223,7 @@ docker build -t microhttp-verify tests/linux && docker run --rm -v "$PWD":/src:r
 | `src/http.c` | HTTP 요청 파서, 응답 헤더 생성 (소켓 I/O 없음) |
 | `src/static_file.c` | 루트 안에서 파일 찾기(403/404), MIME 타입 매핑 |
 | `src/proxy.c` | Reverse Proxy: 경로 라우팅, Round-Robin, 요청 재작성, 응답 중계, 502/504 |
+| `src/session.c` | 서버 측 Session 저장소: 생성·조회(복사본)·삭제·만료, mutex 하나 |
+| `src/auth.c` | `/login`·`/logout`·`/me`, Cookie·폼 파싱, 비밀번호 확인(libsodium) |
 | `src/net.c` | `send_all`, 소켓 타임아웃, 타임아웃 있는 connect, 오류 응답 송신 |
 | `tools/backend.py` | 프록시 실습용 백엔드 (테스트 도구) |
