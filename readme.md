@@ -2,7 +2,7 @@
 
 ## 기본 과제 달성 현황 (STEP 0 베이스라인, 2026-11-25)
 
-인증 기능을 넣기 **전** 상태입니다. 이후 모든 비교와 회귀 검증의 기준점입니다. 측정 방법과 원시 결과는 [EXPERIMENT_REPORT.md](EXPERIMENT_REPORT.md) STEP 0에 있습니다.
+인증 기능을 넣기 **전** 상태입니다. 베이스라인에서 발견한 TSan 레이스 1건은 STEP 1 전에 고쳤고, 표는 수정 후 상태입니다(성능은 수정 전후 차이 없음). 이후 모든 비교와 회귀 검증의 기준점입니다. 측정 방법과 원시 결과는 [EXPERIMENT_REPORT.md](EXPERIMENT_REPORT.md) STEP 0에 있습니다.
 
 | 영역 | LMS 체크리스트 항목 | 상태 | 근거 (코드 / 테스트) |
 |---|---|---|---|
@@ -13,12 +13,12 @@
 | HTTP | 정적 파일, MIME, 404/403/500, 경로 탈출 방지 | ✅ | `static_file.c`, `test_static.c`, `test_mime.c` |
 | HTTP | 오류 응답 400/408/411/413/414/417/431/501/505 | ✅ | `test_http.c`, `edge_probe.py` 30케이스 |
 | 동시성 | 스레드 풀(기본 8) + 작업 큐(64) + 배압 | ✅ | `server.c` `queue_push`/`queue_pop`/`worker_main` |
-| 동시성 | SIGINT/SIGTERM 안전한 셧다운, SIGPIPE 무시 | ⚠️ | 동작은 ✅(`test_graceful_shutdown_…`), **TSan이 `stop_requested` 데이터 레이스 보고** — STEP 1 전에 수정 예정 |
+| 동시성 | SIGINT/SIGTERM 안전한 셧다운, SIGPIPE 무시 | ✅ | `test_graceful_shutdown_…`. 베이스라인에서 TSan이 `stop_requested` 데이터 레이스를 보고 → C11 `atomic_int`로 수정 (EXPERIMENT_REPORT STEP 0-1) |
 | Proxy | Reverse Proxy, 경로 라우팅(최장 prefix), Round-Robin | ✅ | `proxy.c`, `test_proxy.c` |
 | Proxy | 502(연결 불가)/504(타임아웃), 장애 백엔드 건너뛰기, 떠난 클라이언트 감지 | ✅ | 기능 테스트 10개 |
 | Proxy | Forward Proxy | ➖ | 요구사항은 "최소 한 가지" — Reverse Proxy 선택 |
 | 메모리·안정성 | ASan + UBSan | ✅ | `make asan` 28/28 |
-| 메모리·안정성 | ThreadSanitizer | ❌ | `make tsan` 27/28 — 위 레이스 |
+| 메모리·안정성 | ThreadSanitizer | ✅ | `make tsan` 28/28 (macOS clang, Linux gcc), TSan 빌드 서버 엣지 탐침 30/30 · 보고 0. 베이스라인은 27/28 |
 | 메모리·안정성 | Valgrind(누수·잘못된 접근), 일반 사용자 테스트, malloc 실패 → 500 (Linux) | ✅ | `tests/linux/verify.sh` → `ALL LINUX CHECKS PASSED` |
 | 메모리·안정성 | fd 누수 | ✅ | 부하 측정 전후 fd 7 → 7, Valgrind `--track-fds` 종료 시 stdio + 로그만 열림 |
 | 메모리·안정성 | 엣지 케이스(불완전 헤더, Slowloris, 큰 본문, 긴 URI, 백엔드 타임아웃, 갑작스러운 종료) | ✅ | `edge_probe.py` 30/30, 기능 테스트 28/28 |

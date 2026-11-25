@@ -93,3 +93,57 @@ WARNING: ThreadSanitizer: data race
 | 시험용 백엔드가 c=10에서 연결을 끊어 프록시 502 (1000건 중 4~5건) | 시범 측정의 비정상 응답 수 | `tools/backend.py` listen 대기열 5 → 128 (서버 코드 변경 없음) |
 | p95/p99가 0으로 나옴, 평균 해상도 부족 | 시범 측정 | hey 요약 화면 대신 `-o csv` 원시 시간으로 직접 계산 |
 | TSan 보고가 있어도 기능 테스트가 통과할 수 있음 | `make tsan` 추가 중 하니스 검토 | 검사 표식에 `ThreadSanitizer` 추가 |
+
+---
+
+## STEP 0-1. 베이스라인의 TSan 레이스 수정과 회귀 확인
+
+### 목적
+STEP 2의 동시성 실험(TSan)을 읽을 때 기존 레이스와 섞이지 않도록, 인증 작업 전에 고칩니다.
+
+### 가설
+- `stop_requested`를 lock-free `atomic_int`로 바꾸면 TSan 보고가 사라진다.
+- 요청마다 원자적 읽기 1번이 늘 뿐이라 성능 차이는 측정 오차 안에 들 것이다.
+
+### 변경
+`src/server.c`: `static volatile sig_atomic_t stop_requested` → `static atomic_int stop_requested`,
+읽기는 `atomic_load`, 핸들러의 쓰기는 `atomic_store`, `_Static_assert(ATOMIC_INT_LOCK_FREE == 2)`로 시그널 안전성 조건을 컴파일 시점에 확인.
+
+### 재현 명령어
+```sh
+make tsan                                    # macOS
+docker run --rm -v "$PWD":/src:ro microhttp-verify sh -c \
+  'cp -r /src/. /home/tester/w && chown -R tester /home/tester/w && cd /home/tester/w && runuser -u tester -- make tsan'
+sh tests/bench/baseline.sh 3 > docs/results/step0_fix_baseline.csv
+```
+
+### 실제 결과
+
+| 검사 | 수정 전 (STEP 0) | 수정 후 |
+|---|---|---|
+| `make tsan` macOS (clang 15) | 27/28, `test_graceful_shutdown_…` FAIL | **28/28** (`docs/results/step0_fix_tsan.txt`) |
+| `make tsan` Linux (gcc 13, 사용자 tester) | 미실행 | **28/28** (`docs/results/step0_fix_linux_tsan.txt`) |
+| 요청 도중 SIGTERM 수동 재현 (TSan 빌드) | TSan 경고 1, 종료 코드 ≠ 0 | 3회 모두 경고 0, 종료 코드 0 |
+| TSan 빌드 서버에 엣지 탐침 30케이스(200병렬 포함) | 미실행 | 30/30, 경고 0, 종료 코드 0 |
+| `make test` / `make asan` | 28/28 / 28/28 | 28/28 / 28/28 |
+| Linux `verify.sh` (Valgrind 등) | ALL PASSED | ALL PASSED (`docs/results/step0_fix_linux_verify.txt`) |
+
+성능 (같은 스크립트, 3회 중앙값, `docs/results/step0_fix_baseline.csv`):
+
+| 시나리오 | 요청/초 전 → 후 | 3회 범위 전 / 후 | p95 ms 전 → 후 |
+|---|---|---|---|
+| `static_keepalive_c8` | 37,700 → 42,445 | 37,258~40,883 / 40,298~43,122 | 0.3 → 0.3 |
+| `static_keepalive_c50` | 39,471 → 40,298 | 37,850~40,420 / 39,300~42,265 | 0.3 → 0.4 |
+| `static_newconn_c10` | 18,248 → 19,894 | 18,094~18,657 / 18,394~19,907 | 0.9 → 0.8 |
+| `static_newconn_c50` | 19,096 → 19,011 | 18,293~19,443 / 18,518~19,973 | 4.4 → 4.5 |
+| `proxy_c10` | 5,365 → 5,774 | 5,311~6,523 / 5,173~5,814 | 2.2 → 2.2 |
+
+비정상 응답 0 (전후 모두), fd 7 → 7.
+
+### 해석
+- **레이스는 사라졌습니다.** 수정 전 TSan이 지목한 읽기(작업 스레드)와 쓰기(시그널 핸들러)가 원자 연산이 되어 보고 대상이 아닙니다.
+- **성능 차이는 없다고 판단합니다.** 중앙값은 -0.4% ~ +12.6%로 움직였지만, 모든 시나리오에서 수정 전후의 3회 범위가 겹칩니다. 원자적 읽기 1번이 처리량을 높일 이유가 없으므로, 증가분은 실행 간 변동(같은 기계에서 부하 도구와 서버가 CPU를 나눠 씀)으로 봅니다. 따라서 STEP 1 이후의 비교 기준은 **수정 후 값(`step0_fix_baseline.csv`)**으로 삼습니다.
+- `proxy_c10`의 p99가 2.9 → 7.3ms로 커진 것도 3회 중 1회의 꼬리 값이 끌어올린 것으로, p95는 같습니다.
+
+### 한계
+- 3회 반복의 변동폭(최대 약 10%)보다 작은 성능 변화는 이 측정으로 구별할 수 없습니다. 이후 STEP에서 "차이 없음"을 주장할 때 이 한계를 함께 적습니다.

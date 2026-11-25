@@ -249,7 +249,7 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | HTTP 범위 | chunked 요청 501, Expect 417, 절대 URL 400, HTTP/2 505. 디렉터리 목록·301 리다이렉트 없음 |
 | 바인딩 | IPv4만 (`-b`), 기본 127.0.0.1 |
 | 셧다운 지연 | keep-alive 대기 중인 작업 스레드는 최대 5초(유휴 타임아웃) 뒤 종료 |
-| 시그널 플래그 | `volatile sig_atomic_t`를 작업 스레드도 읽음. 시그널 안전성은 보장되지만 스레드 간 메모리 순서 보장은 아님(학습용 단순화) |
+| 시그널 플래그 | ~~`volatile sig_atomic_t`를 작업 스레드도 읽음~~ → STEP 0에서 TSan이 데이터 레이스로 보고, C11 lock-free `atomic_int`로 수정(9절) |
 | Forward Proxy | 미구현 (Reverse Proxy 선택) |
 
 ## 7. 미검증 항목
@@ -291,4 +291,10 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | `tests/functional/test_server.py` | 새니타이저 보고 검사에 `ThreadSanitizer` 추가 | 없으면 TSan 보고가 있어도 테스트가 통과함 |
 | `tests/bench/` | `baseline.sh`, `hey_stats.py`, `summarize.py` | 이후 STEP과 같은 조건으로 비교하기 위한 측정 도구 |
 
-**베이스라인 시점에 남긴 결함 (수정하지 않음)**: TSan이 `stop_requested` 데이터 레이스를 보고합니다(시그널 핸들러가 쓰고 작업 스레드가 읽음). 원인과 수정 계획은 EXPERIMENT_REPORT.md STEP 0에 있습니다.
+**베이스라인 측정 후 수정한 결함**: TSan이 보고한 `stop_requested` 데이터 레이스(시그널 핸들러가 쓰고 작업 스레드가 읽음).
+
+| 파일 / 함수 | 변경 | 이유 |
+|---|---|---|
+| `src/server.c` `stop_requested`, `on_stop_signal`, `handle_connection`, `main` | `volatile sig_atomic_t` → `atomic_int` + `atomic_load`/`atomic_store`, `_Static_assert(ATOMIC_INT_LOCK_FREE == 2)` | 스레드 사이에서 안전하고, lock-free라면 시그널 핸들러에서도 안전(C11 7.14.1.1). 대안인 "작업 스레드는 mutex로 보호되는 `queue.closing`을 읽기"는 요청마다 큐 락을 잡아야 해서 택하지 않음 |
+
+결과와 성능 비교는 EXPERIMENT_REPORT.md STEP 0-1.

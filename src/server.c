@@ -36,6 +36,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,8 +74,15 @@ static ProxyTable proxy_table = { .lock = PTHREAD_MUTEX_INITIALIZER };
  * SIGINT(Ctrl+C)/SIGTERM(kill)이 오면 1이 됩니다.
  * 시그널 핸들러 안에서는 안전하게 할 수 있는 일이 매우 적기 때문에(printf, malloc 금지),
  * 핸들러는 이 플래그만 세우고 실제 정리는 main 루프가 플래그를 보고 합니다.
+ *
+ * 왜 volatile sig_atomic_t가 아니라 atomic_int인가:
+ *   sig_atomic_t는 "시그널 핸들러 ↔ 같은 스레드" 사이에서만 안전합니다. 이 플래그는 작업 스레드도
+ *   읽기 때문에(handle_connection의 keep-alive 판단) C11 메모리 모델상 데이터 레이스였고,
+ *   ThreadSanitizer가 보고했습니다(EXPERIMENT_REPORT STEP 0). atomic_int는 스레드 사이에서 안전하고,
+ *   lock-free라면 시그널 핸들러 안에서 써도 안전합니다(C11 7.14.1.1) — 아래 검사로 보장합니다.
  */
-static volatile sig_atomic_t stop_requested = 0;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "stop_requested must be lock-free to be used in a signal handler");
+static atomic_int stop_requested = 0;
 
 /*
  * 작업 큐: main 스레드가 accept한 연결(fd)을 넣고, 작업 스레드가 꺼내 갑니다.
@@ -260,7 +268,7 @@ static void handle_connection(int client_fd)
             ++handled;
             /* 셧다운 중이면 이 응답을 마지막으로 연결을 닫습니다 (처리 중인 요청은 끝까지 응답). */
             int keep_alive = request.keep_alive && handled < MAX_REQUESTS_PER_CONNECTION &&
-                             !stop_requested;
+                             !atomic_load(&stop_requested);
             int sent_status = handle_request(client_fd, &request, &keep_alive);
             fprintf(stderr, "[request] fd=%d \"%s %s %s\" status=%d keep_alive=%d\n",
                     client_fd, request.method, request.target, request.version,
@@ -368,7 +376,7 @@ static void *worker_main(void *unused)
 static void on_stop_signal(int signal_number)
 {
     (void)signal_number;
-    stop_requested = 1;
+    atomic_store(&stop_requested, 1);
 }
 
 /* SIGINT/SIGTERM → 안전한 셧다운, SIGPIPE → 무시. 성공 0, 실패 -1. */
@@ -526,7 +534,7 @@ int main(int argc, char **argv)
         fputc('\n', stderr);
     }
 
-    while (!stop_requested) {
+    while (!atomic_load(&stop_requested)) {
         /*
          * accept()에 바로 들어가면, 플래그 검사 직후~accept 진입 직전에 시그널이 오는 경우
          * 다음 연결이 올 때까지 셧다운이 미뤄집니다. poll에 1초 제한을 두어
