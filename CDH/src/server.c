@@ -35,6 +35,14 @@
 
 #define RECV_BUF_SIZE 8192     /* 요청 헤더를 받을 버퍼 크기 (헤더 최대 8191바이트 + '\0'). 워커 스택에 둔다 */
 #define CLIENT_TIMEOUT_MS 5000 /* 요청 수신, 응답 송신 각각의 전체 마감 시간 */
+#define REJECT_DRAIN_MAX (64u * 1024u) /* 503 거절 전에 비울 수신 데이터 상한 (이미 와 있는 것만, 기다리지 않음) */
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0 /* macOS 등 없는 곳: SIGPIPE 는 main 에서 이미 무시하므로 0 이어도 안전 */
+#endif
+
+/* 바쁠 때(큐 가득 / poller 가득 / 종료 중) 보내는 고정 응답 */
+static const char RESP_503[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /* errno → 설명 문자열 (스레드 안전). strerror 는 정적 버퍼를 쓸 수 있어 여러 워커가 동시에 부르면 안전하지 않다.
  * _GNU_SOURCE 없이 _POSIX_C_SOURCE 200809L 이면 int 를 돌려주는 XSI 판 strerror_r 이 선택된다 */
@@ -306,7 +314,79 @@ void server_on_idle_ready(const conn_job *job, void *ctx)   /* idle_ready_fn: po
     int err = errno;                      /* EAGAIN (큐 가득) / ECANCELED (종료 중) */
     if (!c->quiet) {                      /* 조용 모드가 아니면 */
         char eb[128];                     /* strerror_r 용 버퍼 */
-        fprintf(stderr, "[%s] keep-alive connection dropped: %s\n", job->peer, err_str(err, eb, sizeof(eb))); /* 버린 이유 로그 */
+        fprintf(stderr, "[%s] busy -> 503: %s\n", job->peer, err_str(err, eb, sizeof(eb))); /* 거절 이유 로그 */
     }
-    close(job->fd);                       /* 실패하면 fd 는 아직 우리 것 → 닫는다 (poller 스레드는 막히면 안 됨) */
+    server_reject_busy(job->fd);          /* 요청이 이미 와 있음 → 그냥 close 하면 RST. 비우고 503 후 닫음 (기다리지 않음) */
+}
+
+/* 바빠서 처리할 수 없는 연결을 닫는다. 어느 스레드에서 불러도 절대 기다리지 않는다.
+ *
+ * 왜 그냥 close 하면 안 되나: 수신 버퍼에 아직 안 읽은 데이터(= 클라이언트가 보낸 요청)가 남은 채 close 하면
+ * 커널은 FIN 대신 RST 를 보낸다. RST 를 받은 클라이언트는 먼저 도착한 503 까지 버리고 ECONNRESET 을 본다.
+ * → 이미 와 있는 바이트를 먼저 읽어 버려서(논블로킹) 수신 버퍼를 비운 뒤 503 을 보내고 닫는다.
+ *   상대가 아무것도 안 보내고 이미 닫았으면(FIN 만 옴) 503 없이 그냥 닫는다.
+ * 한계: 닫은 "뒤에" 도착하는 바이트는 여전히 RST 를 부른다 (기다리면 호출 스레드가 막히므로 감수) */
+void server_reject_busy(int fd)
+{
+    char junk[4096];                      /* 읽어서 버릴 임시 버퍼 */
+    size_t total = 0;                     /* 버린 바이트 수 */
+    int eof = 0;                          /* 상대가 송신을 닫았는지 */
+    while (total < REJECT_DRAIN_MAX) {    /* 상한까지 (악의적으로 많이 보내도 오래 안 붙잡힘) */
+        ssize_t n = recv(fd, junk, sizeof(junk), MSG_DONTWAIT); /* 이미 와 있는 것만 */
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)      /* 시그널 → 재시도 */
+            continue;
+        if (n == 0)                       /* FIN */
+            eof = 1;
+        break;                            /* EAGAIN(다 비움) / FIN / 오류 */
+    }
+    if (!(eof && total == 0)) {           /* 상대가 아무것도 안 보내고 닫은 게 아니면 503 */
+        ssize_t r = send(fd, RESP_503, sizeof(RESP_503) - 1, MSG_DONTWAIT | MSG_NOSIGNAL); /* 송신 버퍼가 차 있어도 기다리지 않음 */
+        (void)r;                          /* 실패해도(EPIPE 등) 닫는 건 같음 */
+    }
+    close(fd);                            /* 수신 버퍼가 비었으니 FIN → 503 이 클라이언트에 그대로 도착 */
+}
+
+/* accept 스레드에서 호출: 새 연결을 어디로 보낼지 정한다 (fd 소유권을 넘겨받음, 절대 기다리지 않음).
+ *   - 요청 바이트가 벌써 와 있음 → 바로 워커 (poller 를 거치는 왕복을 아낌)
+ *   - 아직 아무것도 없음        → idle poller 에 맡김: 읽을 게 생기면 그때 워커로.
+ *     예전처럼 곧장 워커에 넣으면, 연결만 맺고 안 보내는 클라이언트가 워커 하나를 CLIENT_TIMEOUT_MS 동안
+ *     recv 에서 붙잡아, 워커 수만큼의 빈 연결로 서버 전체가 멈췄다.
+ *   - 상대가 벌써 닫음 → 닫기 / 맡길 곳이 가득 → 503 */
+void server_dispatch_new(const conn_job *job, void *ctx)
+{
+    const server_ctx *c = ctx;            /* 공유 설정 (읽기만) */
+    char ch;                              /* 엿보기용 1바이트 (큐에서 빼지 않음) */
+    ssize_t p;
+    do
+        p = recv(job->fd, &ch, 1, MSG_PEEK | MSG_DONTWAIT); /* 와 있는지 보기만 */
+    while (p < 0 && errno == EINTR);
+
+    if (p == 0) {                         /* 연결만 하고 바로 닫음 */
+        if (!c->quiet)
+            printf("[%s] closed without data\n", job->peer);
+        close(job->fd);
+        return;
+    }
+    if (p < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { /* ECONNRESET 등: 이미 망가진 연결 */
+        close(job->fd);
+        return;
+    }
+
+    const char *why;                      /* 거절 이유 (로그용) */
+    if (p < 0 && c->idle != NULL) {       /* 아직 데이터 없음 → poller 가 대신 기다림 */
+        if (idle_park(c->idle, job) == 0)
+            return;                       /* fd 는 이제 poller 소유 */
+        why = errno == ECANCELED ? "shutting down" : "idle poller full";
+    } else {                              /* 데이터 있음 (또는 poller 없이 부르는 경우) → 워커 */
+        if (tp_submit(c->pool, job) == 0)
+            return;                       /* fd 는 이제 풀 소유 */
+        why = errno == ECANCELED ? "shutting down" : "queue full";
+    }
+    if (!c->quiet)
+        fprintf(stderr, "[%s] %s -> 503\n", job->peer, why);
+    server_reject_busy(job->fd);          /* 503 후 RST 없이 닫기 */
 }

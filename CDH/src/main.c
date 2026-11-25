@@ -6,8 +6,11 @@
  *                                        ↕ 쉬는 keep-alive 연결
  *                                     idle poller (스레드 1개)
  *
- * 워커·poller 는 SIGINT/SIGTERM 을 막은 채 만들어지므로 종료 시그널은 메인 스레드로만 온다
- * → 블로킹 accept 가 EINTR 로 깨어나 루프를 빠져나간다. */
+ * 워커·poller 는 SIGINT/SIGTERM 을 막은 채 만들어지므로 종료 시그널은 메인 스레드로만 온다.
+ * 메인 스레드는 블로킹 accept 대신 poll([리스닝 소켓, 시그널 pipe]) 에서 잔다 (self-pipe):
+ *   핸들러가 pipe 에 1바이트를 쓰므로 시그널이 poll "직전" 에 와도 poll 이 바로 깨어난다.
+ *   (예전처럼 g_running 검사 → 블로킹 accept 순서면, 그 사이에 온 시그널은 EINTR 을 만들지 못해
+ *    다음 연결이 올 때까지 종료되지 않았다) */
 
 #define _POSIX_C_SOURCE 200809L /* POSIX 2008 함수(sigaction, nanosleep 등)를 헤더에서 보이게 함. include 보다 먼저 */
 #if defined(__APPLE__)
@@ -22,49 +25,66 @@
 #include "thread_pool.h" /* tp_create, tp_submit, tp_shutdown, tp_destroy */
 
 #include <errno.h>      /* errno, EINTR, EMFILE, ENFILE */
-#include <fcntl.h>      /* open, O_RDONLY (예비 fd 용) */
+#include <fcntl.h>      /* open, O_RDONLY (예비 fd 용), fcntl, O_NONBLOCK, FD_CLOEXEC */
+#include <poll.h>       /* poll, struct pollfd, POLLIN (리스닝 소켓 + 시그널 pipe 대기) */
 #include <signal.h>     /* sigaction, SIGINT/SIGTERM/SIGPIPE, sig_atomic_t, SIG_IGN */
 #include <stdint.h>     /* uint16_t */
 #include <stdio.h>      /* printf, fprintf, perror, fflush */
 #include <stdlib.h>     /* strtol, EXIT_SUCCESS, EXIT_FAILURE */
 #include <string.h>     /* memset, strcmp, strerror (메인 스레드에서만) */
-#include <sys/socket.h> /* accept, send, MSG_DONTWAIT, MSG_NOSIGNAL */
+#include <sys/socket.h> /* accept */
 #include <time.h>       /* nanosleep, struct timespec */
-#include <unistd.h>     /* close */
+#include <unistd.h>     /* close, pipe, write */
 
 #define DEFAULT_PORT 8080      /* 포트 인자를 안 주면 쓰는 기본 포트 */
 #define DEFAULT_ROOT "./www"   /* -r 을 안 주면 쓰는 문서 루트 (정적 파일 디렉터리) */
 #define BACKLOG 128            /* listen() 대기 큐 크기: handshake 끝나고 accept 를 기다리는 연결 최대 수 */
 #define DEFAULT_THREADS 16     /* -t 를 안 주면 쓰는 워커 수 */
 #define MAX_THREADS 1024       /* -t 상한 */
-#define DEFAULT_IDLE_MS 5000   /* -i 를 안 주면 쓰는 keep-alive 쉬는 시간 (이만큼 아무것도 안 오면 닫음) */
+#define DEFAULT_IDLE_MS 5000   /* -i 를 안 주면 쓰는 쉬는 시간: 새 연결의 첫 바이트 대기 / keep-alive 다음 요청 대기 */
 #define QUEUE_CAP 1024         /* 워커 풀 작업 큐 크기 (넘치면 503) */
-#define IDLE_MAX_CONNS 10000   /* idle poller 가 동시에 맡을 최대 연결 수 (넘치면 그 연결은 닫음) */
-
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0 /* macOS 등 없는 곳: SIGPIPE 는 이미 무시하므로 0 이어도 안전 */
-#endif
-
-/* 큐가 가득 찼을 때 보내는 고정 응답 (만들 필요 없이 그대로 한 번 send) */
-static const char RESP_503[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+#define IDLE_MAX_CONNS 10000   /* idle poller 가 동시에 맡을 최대 연결 수 (넘치면 503 후 닫음) */
+#define ACCEPT_BATCH 64        /* poll 한 번 깨어날 때 연달아 accept 할 최대 수 (backlog 를 빨리 비우되 시그널 확인은 놓치지 않게) */
 
 static volatile sig_atomic_t g_running = 1; /* 서버 실행 중 플래그. 시그널 핸들러가 0 으로 바꾸면 메인 루프 종료.
                                                volatile: 컴파일러가 값을 캐시하지 않고 매번 메모리에서 읽게 함
                                                sig_atomic_t: 시그널 핸들러에서 안전하게 쓸 수 있는 정수 타입 */
+static int g_sig_pipe[2] = {-1, -1}; /* self-pipe: [0] 메인 루프가 poll, [1] 핸들러가 1바이트 씀 */
 
 static void on_shutdown_signal(int sig) /* SIGINT(Ctrl+C), SIGTERM(kill) 을 받으면 커널이 호출하는 함수 */
 {
-    (void)sig;     /* 어떤 시그널인지는 안 씀. "안 쓰는 인자" 경고 제거용 */
-    g_running = 0; /* 종료 요청 표시만 하고 끝 (핸들러 안에서는 printf 같은 복잡한 일을 하면 안전하지 않음) */
+    (void)sig;                 /* 어떤 시그널인지는 안 씀. "안 쓰는 인자" 경고 제거용 */
+    int saved = errno;         /* 핸들러가 끼어든 코드의 errno 를 깨뜨리지 않게 보관 */
+    g_running = 0;             /* 종료 요청 표시 */
+    char b = 1;                /* write 는 async-signal-safe → 핸들러 안에서 써도 안전 */
+    ssize_t r = write(g_sig_pipe[1], &b, 1); /* poll 을 깨움 (논블로킹: 가득이면 이미 깨울 바이트가 있으니 무시) */
+    (void)r;                   /* 결과는 안 씀 */
+    errno = saved;             /* errno 복원 */
 }
 
-static int install_signal_handlers(void) /* 시그널별 동작 등록. 성공 0, 실패 -1 */
+static int set_nb_cloexec(int fd) /* fd 를 논블로킹 + exec 시 자동 close 로. 성공 0, 실패 -1 */
 {
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
+        return -1;
+    int fdfl = fcntl(fd, F_GETFD);
+    if (fdfl < 0 || fcntl(fd, F_SETFD, fdfl | FD_CLOEXEC) < 0)
+        return -1;
+    return 0;
+}
+
+static int install_signal_handlers(void) /* self-pipe 생성 + 시그널별 동작 등록. 성공 0, 실패 -1 */
+{
+    if (pipe(g_sig_pipe) < 0)              /* 핸들러 등록 전에 만들어 둬야 핸들러가 항상 유효한 fd 에 씀 */
+        return -1;
+    if (set_nb_cloexec(g_sig_pipe[0]) < 0 || set_nb_cloexec(g_sig_pipe[1]) < 0) /* 핸들러가 막히지 않게 논블로킹 */
+        return -1;
+
     struct sigaction sa;                   /* 시그널 처리 방법을 담는 구조체 */
     memset(&sa, 0, sizeof(sa));            /* 모든 필드 0 으로 초기화 */
     sa.sa_handler = on_shutdown_signal;    /* 시그널이 오면 이 함수를 호출 */
     sigemptyset(&sa.sa_mask);              /* 핸들러 실행 중에 추가로 막을 시그널: 없음 */
-    sa.sa_flags = 0; /* SA_RESTART 미사용 → 블로킹 accept() 가 EINTR 로 깨어남 */
+    sa.sa_flags = 0; /* SA_RESTART 미사용 → poll 이 EINTR 로 깨어남 (놓쳐도 self-pipe 가 깨움) */
     if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) /* Ctrl+C 와 kill 에 위 설정 적용 */
         return -1;                         /* 등록 실패 */
 
@@ -123,15 +143,6 @@ static int parse_range(const char *s, long lo, long hi, long *out)
     return 0;
 }
 
-/* 큐가 가득 차서 워커에게 못 넘긴 연결: 고정 503 을 한 번만 시도하고 닫는다.
- * MSG_DONTWAIT: 소켓 송신 버퍼가 차 있어도 기다리지 않음 (accept 스레드는 절대 막히면 안 됨) */
-static void reject_busy(int cfd)
-{
-    ssize_t r = send(cfd, RESP_503, sizeof(RESP_503) - 1, MSG_DONTWAIT | MSG_NOSIGNAL); /* 실패해도 상관없음 */
-    (void)r;                                                                             /* 결과는 안 씀 */
-    close(cfd);
-}
-
 int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 배열 (argv[0] = 프로그램 이름) */
 {
     uint16_t port = DEFAULT_PORT;              /* 기본 포트로 시작 */
@@ -176,6 +187,16 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
         return EXIT_FAILURE;
     }
 
+    /* 리스닝 소켓을 논블로킹으로: poll 이 "연결 있음" 이라 해도 accept 전에 상대가 RST 로 사라지면
+     * 블로킹 accept 는 다음 연결까지 잠들어 시그널 확인을 놓친다 → 논블로킹이면 EAGAIN 으로 바로 돌아옴 */
+    int lfl = fcntl(lfd, F_GETFL);
+    if (lfl < 0 || fcntl(lfd, F_SETFL, lfl | O_NONBLOCK) < 0) {
+        perror("fcntl(listen O_NONBLOCK)");
+        close(lfd);
+        close(root_fd);
+        return EXIT_FAILURE;
+    }
+
     g_spare_fd = open("/dev/null", O_RDONLY); /* fd 고갈 대비용 예비 fd 를 미리 하나 잡아 둠 */
 
     /* 워커·poller 가 함께 읽는 설정. pool/idle 은 아래에서 채운다 (스레드는 작업이 와야 ctx 를 읽음) */
@@ -209,19 +230,36 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
            (unsigned)port, root, threads, idle_ms, quiet ? " [quiet]" : "");
     fflush(stdout);
 
+    struct pollfd pfd[2] = {                         /* 메인 스레드가 기다리는 두 가지 */
+        {.fd = lfd, .events = POLLIN},               /* [0] 새 연결 */
+        {.fd = g_sig_pipe[0], .events = POLLIN},     /* [1] 종료 시그널 (핸들러가 1바이트 씀) */
+    };
     while (g_running) {                              /* 종료 시그널이 올 때까지 반복 */
-        conn_job job = {.fd = -1, .nreq = 0};        /* 새 연결 하나 (요청 수 0 부터) */
-        job.fd = tcp_accept(lfd, job.peer, sizeof(job.peer)); /* 연결 하나 받기. 대기 연결이 없으면 여기서 잠듦 */
-        if (job.fd < 0) {                            /* accept 실패 */
-            if (errno == EINTR)                      /* 시그널 때문에 깨어남 (예: Ctrl+C) */
-                continue;                            /* 루프 조건에서 g_running 확인 */
-            handle_accept_error(lfd);                /* fd 고갈 등 나머지 오류 처리 */
+        int pr = poll(pfd, 2, -1);                   /* 둘 중 하나가 준비될 때까지 잠듦. 시그널이 poll 직전에 와도 pipe 가 이미 readable */
+        if (pr < 0) {
+            if (errno == EINTR)                      /* 시그널로 깨어남 → 루프 조건에서 g_running 확인 */
+                continue;
+            perror("poll");                          /* 사실상 없음 (EINVAL/ENOMEM) */
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+            nanosleep(&ts, NULL);                    /* 헛돌지 않게 0.1초 */
             continue;
         }
-        if (tp_submit(ctx.pool, &job) != 0) {        /* 큐가 가득 참 (fd 는 아직 우리 것) */
-            if (!quiet)
-                fprintf(stderr, "[%s] queue full -> 503\n", job.peer);
-            reject_busy(job.fd);                     /* 503 한 번 시도 후 닫음 (기다리지 않음) */
+        if (pfd[1].revents != 0)                     /* 종료 시그널 */
+            break;
+        if (pfd[0].revents == 0)                     /* 새 연결 없음 */
+            continue;
+        for (int k = 0; k < ACCEPT_BATCH && g_running; k++) { /* 쌓인 연결을 한 번에 여러 개 */
+            conn_job job = {.fd = -1, .nreq = 0};    /* 새 연결 하나 (요청 수 0 부터) */
+            job.fd = tcp_accept(lfd, job.peer, sizeof(job.peer)); /* 논블로킹: 대기 연결이 없으면 EAGAIN */
+            if (job.fd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) /* 다 받았음 → 다시 poll */
+                    break;
+                if (errno == EINTR || errno == ECONNABORTED) /* 시그널 / accept 전에 상대가 끊음 → 다음 것 */
+                    continue;
+                handle_accept_error(lfd);            /* fd 고갈 등 나머지 오류 처리 */
+                break;
+            }
+            server_dispatch_new(&job, &ctx);         /* 데이터 있으면 워커로, 아직 없으면 idle poller 로 (fd 소유권 넘김) */
         }
     }
 
@@ -234,6 +272,8 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
     if (g_spare_fd >= 0)          /* 예비 fd 가 열려 있으면 */
         close(g_spare_fd);        /* 반납 */
     close(root_fd);               /* 문서 루트 */
+    close(g_sig_pipe[0]);         /* self-pipe (이후 시그널이 와도 write 는 EBADF 로 무해하게 실패) */
+    close(g_sig_pipe[1]);
     printf("\nshutdown complete\n"); /* 종료 메시지 (exit 시 stdout 버퍼도 자동으로 비워짐) */
     return EXIT_SUCCESS;          /* 종료 코드 0 */
 }

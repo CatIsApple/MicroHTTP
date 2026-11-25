@@ -726,6 +726,31 @@ int main(void)
         close_all(fds, 50);
     }
 
+    /* ---- 빈 연결이 워커를 안 잡음: 워커 2개 서버에 "연결만 하고 아무것도 안 보내는" 연결 20개가 있어도
+     *      새 요청이 바로 처리됨 (예전엔 새 연결이 곧장 워커로 가서 recv 에서 5초씩 붙잡혔다) ---- */
+    if (start_server(bin, "2", NULL) != 0) {
+        CHECK(!"cannot start server -t 2 (empty conns)");
+    } else {
+        int fds[20];
+        for (int i = 0; i < 20; i++)
+            fds[i] = connect_server();                        /* handshake 만 하고 침묵 */
+        sleep_ms(100);                                        /* 서버가 모두 accept 할 시간 */
+        long long t0 = now_ms();
+        send_str("GET /style.css HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        long long dt = now_ms() - t0;
+        CHECK_INT(status(), 200);
+        CHECK(dt < 1000);
+        if (dt >= 1000)
+            fprintf(stderr, "request behind empty conns took %lld ms\n", dt);
+        if (fds[0] >= 0) {                                    /* 침묵하던 연결도 나중에 보내면 정상 처리 (poller → 워커) */
+            send_on(fds[0], "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+            CHECK_INT(status(), 200);
+            CHECK_STR(body(), INDEX);
+        }
+        CHECK(stop_server(2000));                             /* 빈 연결을 둔 채 SIGINT → 바로 종료 */
+        close_all(fds, 20);
+    }
+
     /* 문서 루트 정리 */
     free(big);
     const char *names[] = {"index.html", "style.css", "hello world.txt", "sub/index.html", ".secret", "big.bin"};
