@@ -61,10 +61,20 @@ const char *http_reason(int status);
  * 응답 헤더(상태 줄 + 헤더 + 빈 줄)를 output에 만듭니다.
  *   keep_alive : 1이면 "Connection: keep-alive", 0이면 "Connection: close"
  *   allow      : 405 응답의 Allow 헤더 값. 필요 없으면 NULL
+ *   extra      : 그대로 덧붙일 헤더 줄들 (각 줄 "Name: value\r\n"). 필요 없으면 NULL
+ *                예: "Set-Cookie: sid=...; HttpOnly\r\nCache-Control: no-store\r\n"
  * 반환값: 헤더 바이트 수. 모르는 상태 코드·잘못된 값·공간 부족이면 -1
  */
 int http_response_header(char *output, size_t capacity, int status,
                          const char *content_type, size_t body_length,
-                         int keep_alive, const char *allow);
+                         int keep_alive, const char *allow, const char *extra);
+
+/*
+ * 요청 헤더에서 name(대소문자 무시)을 찾아 값의 시작과 길이를 돌려줍니다(앞뒤 공백 제외).
+ * 같은 이름이 여러 번 있으면 첫 번째. 찾으면 1, 없으면 0.
+ * 값은 요청 버퍼 안을 가리키므로 NUL로 끝나지 않습니다.
+ */
+int http_find_header(const HttpRequest *request, const char *name,
+                     const unsigned char **value, size_t *length);
 
 #endif

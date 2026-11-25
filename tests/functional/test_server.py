@@ -20,6 +20,7 @@ import traceback
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(ROOT, "server")
 WWW = os.path.join(ROOT, "www")
+USERS = os.path.join(ROOT, "tests", "functional", "users.txt")   # alice / alice-test-pw, bob / bob-test-pw
 PORT = 18080
 IDLE_TIMEOUT = 5
 REQUEST_TIMEOUT = 10
@@ -540,6 +541,104 @@ def test_proxy_frees_worker_when_client_leaves(server):
     assert "client left while waiting" in server.logs()
 
 
+# ── 인증: Cookie + 서버 측 Session (STEP 1) ───────────────────────────────
+
+import re
+
+SID = re.compile(r"sid=([0-9a-f]{64})")
+
+
+def login(user, password, cookie=None, sock=None):
+    """POST /login. (status, headers, 새 sid 또는 None)"""
+    body = f"username={user}&password={password}".encode()
+    raw = (b"POST /login HTTP/1.1\r\nHost: a\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+           + (f"Cookie: sid={cookie}\r\n".encode() if cookie else b"")
+           + (b"" if sock else b"Connection: close\r\n")
+           + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    if sock:
+        sock.sendall(raw)
+        status, headers, _ = read_response(sock)
+    else:
+        status, headers, _ = request(raw)
+    match = SID.search(headers.get("set-cookie", ""))
+    return status, headers, match.group(1) if match else None
+
+
+def me(cookie_header=None, sock=None):
+    raw = (b"GET /me HTTP/1.1\r\nHost: a\r\n" + (f"Cookie: {cookie_header}\r\n".encode() if cookie_header else b"")
+           + (b"" if sock else b"Connection: close\r\n") + b"\r\n")
+    if sock:
+        sock.sendall(raw)
+        return read_response(sock)
+    return request(raw)
+
+
+def test_auth_login_cookie_attributes_and_new_connections(server):
+    status, headers, sid = login("alice", "alice-test-pw")
+    assert status == 303 and headers["location"] == "/me" and sid
+    cookie = headers["set-cookie"]
+    for attribute in ("HttpOnly", "SameSite=Lax", "Path=/"):
+        assert attribute in cookie, cookie
+    assert headers["cache-control"] == "no-store"
+    # 로그인한 연결은 이미 닫혔다. 새 TCP 연결 3개에서 같은 Cookie로 인증이 유지되어야 한다.
+    for _ in range(3):
+        status, headers, body = me(f"theme=dark; sid={sid}")
+        assert status == 200 and body == b"user: alice\n" and headers["cache-control"] == "no-store"
+    assert sid not in server.logs()                     # Session ID를 로그에 남기지 않음
+
+
+def test_auth_rejects_missing_wrong_and_forged_credentials(server):
+    assert me()[0] == 401                                                # Cookie 없음
+    assert login("alice", "wrong")[0] == 401                             # 틀린 비밀번호
+    assert login("mallory", "alice-test-pw")[0] == 401                   # 없는 사용자
+    assert login("alice", "")[0] == 401
+    _, _, sid = login("alice", "alice-test-pw")
+    tampered = sid[:-1] + ("0" if sid[-1] != "0" else "1")
+    assert me(f"sid={tampered}")[0] == 401                               # 한 글자 바꾼 ID
+    assert me("sid=" + "a" * 64)[0] == 401                               # 형식만 맞춘 위조 ID
+    assert me("user=alice; logged_in=true; role=admin")[0] == 401        # 상태를 담은 위조 Cookie
+    assert me("sid=alice")[0] == 401                                     # 사용자 이름을 ID로
+    assert me(f"sid={sid}")[0] == 200                                    # 원래 ID는 여전히 유효
+
+
+def test_auth_logout_invalidates_on_server(server):
+    _, _, sid = login("bob", "bob-test-pw")
+    assert me(f"sid={sid}")[0] == 200
+    raw = f"POST /logout HTTP/1.1\r\nHost: a\r\nCookie: sid={sid}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    status, headers, _ = request(raw.encode())
+    assert status == 200 and "Max-Age=0" in headers["set-cookie"]
+    # 클라이언트가 지우라는 말을 무시하고 옛 Cookie를 다시 보내도 서버가 거절해야 한다.
+    assert me(f"sid={sid}")[0] == 401
+
+
+def test_auth_login_reissues_session_id(server):
+    _, _, first = login("alice", "alice-test-pw")
+    status, _, second = login("alice", "alice-test-pw", cookie=first)
+    assert status == 303 and second and second != first                 # 로그인마다 새 ID
+    assert me(f"sid={first}")[0] == 401                                 # 이전 ID는 폐기 (Session 고정 방지)
+    assert me(f"sid={second}")[0] == 200
+
+
+def test_auth_is_per_request_not_per_connection(server):
+    """하나의 keep-alive 연결에서도 인증은 요청마다 Cookie로 판단한다."""
+    with connect() as sock:
+        assert me(sock=sock)[0] == 401
+        _, _, sid = login("alice", "alice-test-pw", sock=sock)
+        assert me(f"sid={sid}", sock=sock)[0] == 200
+        assert me(sock=sock)[0] == 401                                   # 같은 연결이라도 Cookie가 없으면 401
+        _, _, bob = login("bob", "bob-test-pw", sock=sock)
+        assert me(f"sid={bob}", sock=sock)[2] == b"user: bob\n"          # 같은 연결에서 다른 사용자
+        assert me(f"sid={sid}", sock=sock)[2] == b"user: alice\n"
+
+
+def test_auth_methods(server):
+    status, headers, _ = get("/login")
+    assert status == 405 and headers["allow"] == "POST"
+    raw = b"POST /me HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    status, headers, _ = request(raw)
+    assert status == 405 and headers["allow"] == "GET, HEAD"
+
+
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
 
 
@@ -547,7 +646,7 @@ def main():
     selected = [t for t in TESTS if len(sys.argv) < 2 or sys.argv[1] in t.__name__]
     subprocess.run(["make", "-s", "server"], cwd=ROOT, check=True)
     backends = [start_backend(BACKEND_A, "A"), start_backend(BACKEND_B, "B")]
-    server = Server(*PROXY_ARGS)
+    server = Server(*PROXY_ARGS, "-U", USERS)
     failures = 0
     try:
         for test in selected:
@@ -563,7 +662,7 @@ def main():
                 print("server died; restarting")
                 print(server.logs()[-3000:])
                 server.stop()
-                server = Server(*PROXY_ARGS)
+                server = Server(*PROXY_ARGS, "-U", USERS)
         # 새니타이저 빌드(make asan / make tsan)에서 서버 로그에 메모리 오류, 데이터 레이스, UB 보고가 있으면 실패로 처리
         for marker in ("AddressSanitizer", "LeakSanitizer", "ThreadSanitizer", "runtime error:"):
             if marker in server.logs():

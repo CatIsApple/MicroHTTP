@@ -127,16 +127,34 @@ static void test_size_limits(void)
 static void test_response_header(void)
 {
     char out[256];
-    int length = http_response_header(out, sizeof(out), 200, "text/html; charset=utf-8", 12, 1, NULL);
+    int length = http_response_header(out, sizeof(out), 200, "text/html; charset=utf-8", 12, 1, NULL, NULL);
     const char *expected =
         "HTTP/1.1 200 OK\r\nServer: MicroHTTP\r\nContent-Type: text/html; charset=utf-8\r\n"
         "Content-Length: 12\r\nConnection: keep-alive\r\n\r\n";
     assert(length == (int)strlen(expected) && !strcmp(out, expected));
-    length = http_response_header(out, sizeof(out), 405, "text/plain", 0, 0, "GET, HEAD");
+    length = http_response_header(out, sizeof(out), 405, "text/plain", 0, 0, "GET, HEAD", NULL);
     assert(length > 0 && strstr(out, "Connection: close\r\n") && strstr(out, "Allow: GET, HEAD\r\n"));
-    assert(http_response_header(out, sizeof(out), 299, "text/plain", 0, 0, NULL) == -1);       /* 모르는 코드 */
-    assert(http_response_header(out, sizeof(out), 200, "a\r\nX: y", 0, 0, NULL) == -1);       /* 헤더 주입 */
-    assert(http_response_header(out, 10, 200, "text/plain", 0, 0, NULL) == -1);               /* 공간 부족 */
+    assert(http_response_header(out, sizeof(out), 299, "text/plain", 0, 0, NULL, NULL) == -1);       /* 모르는 코드 */
+    assert(http_response_header(out, sizeof(out), 200, "a\r\nX: y", 0, 0, NULL, NULL) == -1);       /* 헤더 주입 */
+    assert(http_response_header(out, 10, 200, "text/plain", 0, 0, NULL, NULL) == -1);               /* 공간 부족 */
+}
+
+static void test_extra_headers_and_find_header(void)
+{
+    char out[512];
+    int length = http_response_header(out, sizeof(out), 303, "text/plain", 0, 1, NULL,
+                                      "Location: /me\r\nSet-Cookie: sid=abc; HttpOnly\r\n");
+    assert(length > 0 && strstr(out, "HTTP/1.1 303 See Other\r\n"));
+    assert(strstr(out, "Set-Cookie: sid=abc; HttpOnly\r\n\r\n"));      /* 추가 헤더 뒤에 빈 줄 */
+    assert(http_response_header(out, sizeof(out), 401, "text/plain", 0, 0, NULL, NULL) > 0);
+
+    const unsigned char *value;
+    size_t value_length;
+    assert(parse("GET / HTTP/1.1\r\nHost: a\r\ncookie:  theme=dark; sid=xyz \r\nCookie: second=1\r\n\r\n") == HTTP_COMPLETE);
+    assert(http_find_header(&request, "Cookie", &value, &value_length) == 1);   /* 대소문자 무시, 첫 번째 */
+    assert(value_length == strlen("theme=dark; sid=xyz") && !memcmp(value, "theme=dark; sid=xyz", value_length));
+    assert(http_find_header(&request, "Cook", &value, &value_length) == 0);      /* 접두어만 같으면 아님 */
+    assert(http_find_header(&request, "Authorization", &value, &value_length) == 0);
 }
 
 int main(void)
@@ -148,6 +166,7 @@ int main(void)
     test_invalid_requests();
     test_size_limits();
     test_response_header();
-    puts("PASS test_http: request line, headers, body, split delivery, keep-alive, errors, limits, response header");
+    test_extra_headers_and_find_header();
+    puts("PASS test_http: request line, headers, body, split delivery, keep-alive, errors, limits, response header, extra headers, find header");
     return 0;
 }

@@ -1,0 +1,3 @@
+# 테스트 전용 계정 (alice / alice-test-pw, bob / bob-test-pw). 형식: 이름:argon2id 해시 — build/hashpw로 생성
+alice:$argon2id$v=19$m=65536,t=2,p=1$0LsZS2VhKEJsClMMARlCyw$a3kLhZn3LHqlc8Bp8OyoCLjAP4dHkTFQw9NQbFlOgxc
+bob:$argon2id$v=19$m=65536,t=2,p=1$ReVcp9z8IDmlUrtYU0POFA$ZRl/pb5OomT+G9tUIH4L2sHN53xVFsAs/bKtO51k+Q8

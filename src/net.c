@@ -64,7 +64,7 @@ int send_error_response(int fd, int status, int keep_alive, int omit_body, const
     int body_length = snprintf(body, sizeof(body), "%d %s\n", status, reason);
     char header[256];
     int header_length = http_response_header(header, sizeof(header), status,
-        "text/plain; charset=utf-8", (size_t)body_length, keep_alive, allow);
+        "text/plain; charset=utf-8", (size_t)body_length, keep_alive, allow, NULL);
     if (body_length < 0 || header_length < 0) return -1;
     if (send_all(fd, header, (size_t)header_length) == -1) return -1;
     return omit_body ? 0 : send_all(fd, body, (size_t)body_length);
