@@ -212,9 +212,19 @@ int auth_handle_request(int client_fd, const HttpRequest *request, int keep_aliv
         if (strcmp(request->method, "GET") && !is_head)
             return send_auth_response(client_fd, 405, keep_alive, 0, "GET, HEAD", NULL, "405 Method Not Allowed\n");
         SessionInfo info;
+#ifdef AUTH_WIDE_LOCK
+        /* STEP 2 비교 실험: 응답 생성과 send()까지 저장소 락을 쥔 채로 수행 (넓은 락) */
+        if (!has_cookie || !session_lookup_hold(id, session_now(), &info))
+            return send_auth_response(client_fd, 401, keep_alive, is_head, NULL, NULL, "not logged in\n");
+        char wide_body[128];
+        snprintf(wide_body, sizeof(wide_body), "user: %s\n", info.user);
+        int wide_status = send_auth_response(client_fd, 200, keep_alive, is_head, NULL, NULL, wide_body);
+        session_release();          /* 오류 경로(송신 실패)에서도 반드시 해제 */
+        return wide_status;
+#endif
         if (!has_cookie || !session_lookup(id, session_now(), &info))
             return send_auth_response(client_fd, 401, keep_alive, is_head, NULL, NULL, "not logged in\n");
-        /* 여기부터는 락 밖. info는 복사본이라 다른 스레드가 이 Session을 지워도 안전합니다. */
+        /* 여기부터는 락 밖(좁은 락). info는 복사본이라 다른 스레드가 이 Session을 지워도 안전합니다. */
         char body[128];
         snprintf(body, sizeof(body), "user: %s\n", info.user);
         return send_auth_response(client_fd, 200, keep_alive, is_head, NULL, NULL, body);

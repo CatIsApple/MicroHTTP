@@ -1,0 +1,9 @@
+# STEP 2 만료 실험 (macOS, ./server -I 3 -A 60) — 2026-11-25 실행 출력
+# alice 5번 로그인 + bob 1번 로그인 (Session 6개), 이후 bob만 t=2s에 /me로 사용
+t=0s login 6 sessions; /me=200
+t=2s /me (갱신)=200
+t=5.5s server log:
+[session] expired 2, remaining 4
+[session] expired 3, remaining 1
+[session] expired 1, remaining 0
+t=7.5s /me (idle 만료 후)=401

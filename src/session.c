@@ -8,6 +8,7 @@
 
 #include <pthread.h>
 #include <sodium.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +25,40 @@ static Session *sessions;           /* lock으로 보호 */
 static size_t stored;               /* lock으로 보호 */
 static int idle_timeout = 1800;     /* 30분 — 시작 전에만 바꿈(session_set_timeouts) */
 static int absolute_timeout = 28800; /* 8시간 */
+
+#ifdef SESSION_EXPERIMENTS
+/* 락 통계: 대기 시간(lock 호출 ~ 획득), 점유 시간(획득 ~ 해제). 실험 빌드에서만 측정합니다. */
+static long long lock_wait_ns, lock_hold_ns, lock_acquisitions; /* 합계는 락을 쥔 동안 갱신 */
+static struct timespec lock_acquired_at;                         /* 락을 쥔 스레드만 씀 */
+
+static long long elapsed_ns(struct timespec from, struct timespec to)
+{
+    return (long long)(to.tv_sec - from.tv_sec) * 1000000000LL + (to.tv_nsec - from.tv_nsec);
+}
+
+static void lock_measured(void)
+{
+    struct timespec before;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    pthread_mutex_lock(&lock);
+    clock_gettime(CLOCK_MONOTONIC, &lock_acquired_at);
+    lock_wait_ns += elapsed_ns(before, lock_acquired_at);
+    ++lock_acquisitions;
+}
+
+static void unlock_measured(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    lock_hold_ns += elapsed_ns(lock_acquired_at, now);
+    pthread_mutex_unlock(&lock);
+}
+#define LOCK() lock_measured()
+#define UNLOCK() unlock_measured()
+#else
+#define LOCK() pthread_mutex_lock(&lock)
+#define UNLOCK() pthread_mutex_unlock(&lock)
+#endif
 
 time_t session_now(void)
 {
@@ -70,12 +105,12 @@ int session_create(const char *user, time_t now, char id_out[SESSION_ID_LENGTH +
     strcpy(session->user, user);
     session->created = session->last_seen = now;
 
-    pthread_mutex_lock(&lock);
+    LOCK();
     session->next = sessions;
     sessions = session;
     ++stored;
     memcpy(id_out, session->id, sizeof(session->id)); /* 락 안에서 복사 — 이 뒤로 노드는 다른 스레드 것 */
-    pthread_mutex_unlock(&lock);
+    UNLOCK();
     return 0;
 }
 
@@ -83,7 +118,7 @@ int session_lookup(const char *id, time_t now, SessionInfo *out)
 {
     if (!valid_id(id)) return 0;
     int found = 0;
-    pthread_mutex_lock(&lock);
+    LOCK();
     for (Session **link = &sessions; *link; link = &(*link)->next) {
         Session *session = *link;
         /* 비교 시간이 "몇 글자까지 맞았는지"에 따라 달라지지 않도록 상수 시간 비교 */
@@ -102,7 +137,7 @@ int session_lookup(const char *id, time_t now, SessionInfo *out)
         }
         break;
     }
-    pthread_mutex_unlock(&lock);
+    UNLOCK();
     return found;
 }
 
@@ -110,7 +145,7 @@ int session_destroy(const char *id)
 {
     if (!valid_id(id)) return 0;
     int removed = 0;
-    pthread_mutex_lock(&lock);
+    LOCK();
     for (Session **link = &sessions; *link; link = &(*link)->next) {
         Session *session = *link;
         if (sodium_memcmp(session->id, id, SESSION_ID_LENGTH) == 0) {
@@ -121,14 +156,14 @@ int session_destroy(const char *id)
             break;
         }
     }
-    pthread_mutex_unlock(&lock);
+    UNLOCK();
     return removed;
 }
 
 size_t session_expire(time_t now)
 {
     size_t removed = 0;
-    pthread_mutex_lock(&lock);
+    LOCK();
     Session **link = &sessions;
     while (*link) {
         Session *session = *link;
@@ -141,26 +176,72 @@ size_t session_expire(time_t now)
         }
     }
     stored -= removed;
-    pthread_mutex_unlock(&lock);
+    UNLOCK();
     return removed;
 }
 
 size_t session_count(void)
 {
-    pthread_mutex_lock(&lock);
+    LOCK();
     size_t count = stored;
-    pthread_mutex_unlock(&lock);
+    UNLOCK();
     return count;
 }
 
 void session_clear(void)
 {
-    pthread_mutex_lock(&lock);
+    LOCK();
     while (sessions) {
         Session *next = sessions->next;
         free(sessions);
         sessions = next;
     }
     stored = 0;
-    pthread_mutex_unlock(&lock);
+    UNLOCK();
 }
+
+#ifdef SESSION_EXPERIMENTS
+const char *session_lookup_unsafe(const char *id, time_t now)
+{
+    const char *user = NULL;
+    LOCK();
+    for (Session *session = sessions; session; session = session->next)
+        if (sodium_memcmp(session->id, id, SESSION_ID_LENGTH) == 0 && !expired(session, now)) {
+            session->last_seen = now;
+            user = session->user;   /* ✗ 노드 내부를 가리키는 포인터 — 락을 풀면 보호받지 못함 */
+            break;
+        }
+    UNLOCK();
+    return user;
+}
+
+int session_lookup_hold(const char *id, time_t now, SessionInfo *out)
+{
+    if (!valid_id(id)) return 0;
+    LOCK();
+    for (Session *session = sessions; session; session = session->next)
+        if (sodium_memcmp(session->id, id, SESSION_ID_LENGTH) == 0 && !expired(session, now)) {
+            session->last_seen = now;
+            memcpy(out->user, session->user, sizeof(out->user));
+            out->created = session->created;
+            out->last_seen = session->last_seen;
+            return 1;               /* 락을 쥔 채로 반환 — 호출자가 session_release() */
+        }
+    UNLOCK();
+    return 0;
+}
+
+void session_release(void)
+{
+    UNLOCK();
+}
+
+void session_lock_report(void)
+{
+    LOCK();
+    long long count = lock_acquisitions, wait = lock_wait_ns, hold = lock_hold_ns;
+    UNLOCK();
+    fprintf(stderr, "[session-lock] acquisitions=%lld wait_avg_us=%.3f hold_avg_us=%.3f wait_total_ms=%.1f hold_total_ms=%.1f\n",
+            count, count ? wait / 1000.0 / count : 0.0, count ? hold / 1000.0 / count : 0.0, wait / 1e6, hold / 1e6);
+}
+#endif

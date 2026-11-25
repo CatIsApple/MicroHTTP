@@ -1,0 +1,21 @@
+# STEP 2 UAF 실험 — ASan (macOS clang 15)
+## unsafe
+==10332==ERROR: AddressSanitizer: heap-use-after-free on address 0x… at pc 0x… bp 0x… sp 0x…
+READ of size 6 at 0x… thread T1
+    #0 0x… in printf_common(void*, char const*, char*)+0x84c (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x22ac4)
+    #1 0x… in wrap_vsnprintf+0xac (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x22e94)
+    #2 0x… in wrap_snprintf+0x50 (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x23a1c)
+freed by thread T2 here:
+    #0 0x… in wrap_free+0x98 (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x53260)
+    #1 0x… in session_destroy session.c:154
+    #2 0x… in writer step2_uaf.c:68
+previously allocated by thread T0 here:
+    #0 0x… in wrap_malloc+0x94 (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x53124)
+    #1 0x… in session_create session.c:94
+    #2 0x… in main step2_uaf.c:86
+    #0 0x… in wrap_pthread_create+0x54 (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x4bd6c)
+exit=134
+## safe
+safe: responses=2614 misses(logged out at lookup)=386 sessions_left=1
+exit=0
+    #3 0x… in reader step2_uaf.c:47

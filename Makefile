@@ -47,6 +47,16 @@ build/hashpw: tools/hashpw.c | build
 build/server_fd_demo: src/server.c $(SOURCES) $(HEADERS) | build
 	$(CC) $(CPPFLAGS) -DAUTH_FD_DEMO $(CFLAGS) src/server.c $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
+# STEP 2 실험용: 락 범위 비교 (둘 다 락 통계를 켜서 같은 조건으로 측정)
+build/server_narrow_lock: src/server.c $(SOURCES) $(HEADERS) | build
+	$(CC) $(CPPFLAGS) -DSESSION_EXPERIMENTS $(CFLAGS) src/server.c $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+build/server_wide_lock: src/server.c $(SOURCES) $(HEADERS) | build
+	$(CC) $(CPPFLAGS) -DSESSION_EXPERIMENTS -DAUTH_WIDE_LOCK $(CFLAGS) src/server.c $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
+# STEP 2 실험용: Use-After-Free 재현 (unsafe = 포인터 반환, safe = 복사본)
+build/step2_uaf: tests/experiments/step2_uaf.c src/session.c src/session.h | build
+	$(CC) $(CPPFLAGS) -DSESSION_EXPERIMENTS $(CFLAGS) tests/experiments/step2_uaf.c src/session.c $(LDFLAGS) $(LDLIBS) -o $@
+
 build/test_%: tests/unit/test_%.c $(SOURCES) $(HEADERS) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 

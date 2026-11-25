@@ -1,0 +1,2 @@
+narrow: [session-lock] acquisitions=120034 wait_avg_us=0.552 hold_avg_us=0.213 wait_total_ms=66.2 hold_total_ms=25.6
+wide: [session-lock] acquisitions=120034 wait_avg_us=16.100 hold_avg_us=7.261 wait_total_ms=1932.6 hold_total_ms=871.6

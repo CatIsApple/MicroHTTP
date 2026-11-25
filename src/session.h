@@ -61,4 +61,18 @@ size_t session_count(void);
 /* 모두 해제 (서버 종료 시) */
 void session_clear(void);
 
+#ifdef SESSION_EXPERIMENTS
+/*
+ * ── STEP 2 실험 전용 (일반 빌드에는 없음) ──
+ * session_lookup_unsafe : 노드 안의 사용자 이름 "포인터"를 돌려줍니다. 락을 푼 뒤에 쓰게 되므로,
+ *                         그 사이 다른 스레드가 로그아웃/만료로 노드를 free하면 Use-After-Free.
+ * session_lookup_hold   : 찾으면 락을 쥔 채로 돌아옵니다(넓은 락). 응답을 보낸 뒤 session_release().
+ * session_lock_report   : 락 획득 횟수, 평균 대기·점유 시간을 stderr로 출력.
+ */
+const char *session_lookup_unsafe(const char *id, time_t now);
+int session_lookup_hold(const char *id, time_t now, SessionInfo *out);
+void session_release(void);
+void session_lock_report(void);
+#endif
+
 #endif

@@ -600,6 +600,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "shutting down: closing listener and waiting for %d workers\n", started);
     close_socket(listener);           /* 새 연결 받기 중단 */
     stop_workers(threads, started);   /* 처리 중·대기 중인 연결을 마무리 */
+#ifdef SESSION_EXPERIMENTS
+    session_lock_report();
+#endif
     session_clear();                  /* 작업 스레드가 모두 끝난 뒤라 경쟁 없음 */
     free(config.root);
     fprintf(stderr, "shutdown complete\n");
