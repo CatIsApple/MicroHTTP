@@ -276,7 +276,8 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
   - 처리 중인 응답을 끝내고, 자원을 정리하고, 정상 종료 코드(0)로 끝내기 위해서입니다.
   - 클라이언트 하나가 끊었다고 서버 전체가 죽으면 안 됩니다.
 - **How**:
-  - 핸들러에서는 `printf`나 `malloc`을 쓰면 안 되므로(async-signal-safe가 아님) `stop_requested = 1`만 세웁니다.
+  - 핸들러에서는 `printf`나 `malloc`을 쓰면 안 되므로(async-signal-safe가 아님) `atomic_store(&stop_requested, 1)`만 합니다.
+  - 플래그 타입은 `volatile sig_atomic_t`가 아니라 C11 `atomic_int`입니다. `sig_atomic_t`는 핸들러와 **같은 스레드** 사이에서만 안전한데, 이 플래그는 작업 스레드도 읽기 때문에 ThreadSanitizer가 데이터 레이스로 보고했습니다. lock-free 원자형은 시그널 핸들러에서도 안전하므로 `_Static_assert(ATOMIC_INT_LOCK_FREE == 2)`로 보장합니다.
   - `SA_RESTART`를 주지 않아서, 블로킹 중인 `poll`이 `EINTR`로 깨어납니다.
   - 작업 스레드에서는 SIGINT/SIGTERM을 `pthread_sigmask`로 막아서, 시그널이 항상 main 스레드로 갑니다.
   - main은 루프를 빠져나와 리스너를 닫고(새 연결 중단), 큐에 `closing`을 표시해 잠든 스레드를 모두 깨운 뒤, `pthread_join`으로 처리 중인 연결이 끝나기를 기다립니다.
@@ -287,7 +288,7 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
   - SIGPIPE를 무시하지 않으면, 응답 도중 브라우저 탭을 닫는 것만으로 서버가 종료됩니다.
 - **Code**:
   - `src/server.c` `on_stop_signal()`, `install_signal_handlers()`, `start_workers()`(시그널 마스크), `stop_workers()`, `main()`의 `poll` 루프
-  - `handle_connection()`의 `!stop_requested`
+  - `handle_connection()`의 `!atomic_load(&stop_requested)`
   - 테스트: `test_graceful_shutdown_finishes_inflight_request`(SIGTERM과 SIGINT 각각), `test_sudden_client_disconnect`
 
 **확인 질문**

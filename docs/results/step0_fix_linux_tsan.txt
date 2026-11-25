@@ -1,0 +1,49 @@
+make clean
+make[1]: Entering directory '/home/tester/w'
+rm -rf server build *.dSYM
+make[1]: Leaving directory '/home/tester/w'
+make test CFLAGS='-std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer' LDFLAGS='-fsanitize=thread'
+make[1]: Entering directory '/home/tester/w'
+mkdir -p build
+cc -D_XOPEN_SOURCE=700 -Isrc -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer tests/unit/test_http.c src/http.c src/net.c src/static_file.c src/proxy.c -fsanitize=thread -lpthread -o build/test_http
+cc -D_XOPEN_SOURCE=700 -Isrc -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer tests/unit/test_mime.c src/http.c src/net.c src/static_file.c src/proxy.c -fsanitize=thread -lpthread -o build/test_mime
+cc -D_XOPEN_SOURCE=700 -Isrc -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer tests/unit/test_static.c src/http.c src/net.c src/static_file.c src/proxy.c -fsanitize=thread -lpthread -o build/test_static
+cc -D_XOPEN_SOURCE=700 -Isrc -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer tests/unit/test_net.c src/http.c -fsanitize=thread -lpthread -o build/test_net
+cc -D_XOPEN_SOURCE=700 -Isrc -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer tests/unit/test_proxy.c src/http.c src/net.c src/static_file.c src/proxy.c -fsanitize=thread -lpthread -o build/test_proxy
+PASS test_http: request line, headers, body, split delivery, keep-alive, errors, limits, response header
+PASS test_mime: html, css, js, json, txt, png, jpg, gif, svg, ico, pdf, unknown
+PASS test_static: index, query, percent-decode, 404, 403 (.., symlink, permission, dir), 400, 414 (NAME_MAX), 500 (ELOOP)
+PASS test_net: partial send, EINTR, EPIPE, timeout, zero progress, empty input
+PASS test_proxy: rule parsing, longest-prefix routing, round-robin, request rewrite (hop-by-hop, Host)
+cc -D_XOPEN_SOURCE=700 -Isrc -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer src/server.c src/http.c src/net.c src/static_file.c src/proxy.c -fsanitize=thread -lpthread -o server
+python3 tests/functional/test_server.py
+PASS test_concurrent_many_clients (9.82s)
+PASS test_concurrent_slow_client_does_not_block_others (0.20s)
+PASS test_connection_close_and_http10 (0.50s)
+PASS test_graceful_shutdown_finishes_inflight_request (1.13s)
+PASS test_incomplete_header_then_close (0.00s)
+PASS test_incomplete_header_timeout_408 (5.00s)
+PASS test_keepalive_idle_timeout_closes_quietly (5.12s)
+PASS test_keepalive_reuses_connection (0.59s)
+PASS test_large_body_and_long_uri (0.01s)
+PASS test_malformed_requests (0.00s)
+PASS test_pipelined_requests (0.00s)
+PASS test_pool_exhausted_requests_wait_not_fail (5.55s)
+PASS test_proxy_backend_down_502 (0.00s)
+PASS test_proxy_backend_timeout_504 (5.01s)
+PASS test_proxy_client_closes_after_full_response_is_not_an_abort (1.51s)
+PASS test_proxy_client_disconnects_midway (0.00s)
+PASS test_proxy_failover_skips_dead_backend (0.01s)
+PASS test_proxy_forwards_post_body_and_headers (0.00s)
+PASS test_proxy_frees_worker_when_client_leaves (1.01s)
+PASS test_proxy_http10_without_host (0.00s)
+PASS test_proxy_round_robin (0.01s)
+PASS test_proxy_routes_api_to_backend_and_static_locally (0.00s)
+PASS test_server_side_errors_500_and_file_shrinks_midway (0.42s)
+PASS test_slow_request_deadline_408 (10.05s)
+PASS test_static_errors_404_403_405 (0.01s)
+PASS test_static_files_and_mime (0.00s)
+PASS test_static_head_has_no_body (0.00s)
+PASS test_sudden_client_disconnect (0.31s)
+28/28 functional tests passed
+make[1]: Leaving directory '/home/tester/w'

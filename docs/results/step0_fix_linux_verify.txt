@@ -1,0 +1,24 @@
+== 1. make test as tester (gcc 13)
+PASS test_http: request line, headers, body, split delivery, keep-alive, errors, limits, response header
+PASS test_mime: html, css, js, json, txt, png, jpg, gif, svg, ico, pdf, unknown
+PASS test_static: index, query, percent-decode, 404, 403 (.., symlink, permission, dir), 400, 414 (NAME_MAX), 500 (ELOOP)
+PASS test_net: partial send, EINTR, EPIPE, timeout, zero progress, empty input
+PASS test_proxy: rule parsing, longest-prefix routing, round-robin, request rewrite (hop-by-hop, Host)
+28/28 functional tests passed
+RESULT PASS make test (unit + functional) as non-root
+== 2. valgrind: unit tests
+RESULT PASS valgrind test_http (1 lines, 0 valgrind reports)
+RESULT PASS valgrind test_mime (1 lines, 0 valgrind reports)
+RESULT PASS valgrind test_static (1 lines, 0 valgrind reports)
+RESULT PASS valgrind test_net (1 lines, 0 valgrind reports)
+RESULT PASS valgrind test_proxy (1 lines, 0 valgrind reports)
+== 3. valgrind: live server + edge probe
+28/28 edge cases passed (each followed by a liveness check)
+==357== FILE DESCRIPTORS: 4 open (3 std) at exit.
+RESULT PASS edge probe under valgrind
+RESULT PASS valgrind live server: exit 0, no invalid access, no definite/indirect leak (272 request log lines)
+== 4. malloc failure injection
+status codes with malloc(81920) failing: 500 500 500 500 500 
+RESULT PASS malloc failure -> 500, server still running
+
+ALL LINUX CHECKS PASSED
