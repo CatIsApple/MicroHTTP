@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="440" viewBox="0 0 1060 440" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', sans-serif">
+<defs><marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fe4"/></marker><marker id="blue-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#2f6fe4"/></marker><marker id="pink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e0457b"/></marker><marker id="pink-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#e0457b"/></marker><marker id="gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8a8a8a"/></marker><marker id="gray-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#8a8a8a"/></marker></defs>
+<rect width="1060" height="440" fill="#ffffff"/>
+<text x="30" y="42" font-size="22" font-weight="700" fill="#111111">포인터를 넘기면</text>
+<rect x="30" y="90" width="190" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="125.0" y="112.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">작업 스레드 1</text>
+<text x="125.0" y="131.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">/me 응답 만드는 중</text>
+<rect x="30" y="290" width="190" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="125.0" y="312.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">작업 스레드 2</text>
+<text x="125.0" y="331.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">/logout</text>
+<rect x="300" y="190" width="180" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="390.0" y="212.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">Session 노드</text>
+<text x="390.0" y="231.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user = alice</text>
+<line x1="220" y1="112" x2="298" y2="200" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
+<text x="345" y="103.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">① 조회 → 노드 포인터</text>
+<text x="345" y="120.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">받고 락 해제</text>
+<line x1="220" y1="322" x2="298" y2="246" stroke="#e0457b" stroke-width="1.6" marker-end="url(#pink)"/>
+<text x="290" y="316.0" font-size="13" font-weight="400" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">② free()</text>
+<line x1="150" y1="154" x2="330" y2="254" stroke="#e0457b" stroke-width="1.6"/>
+<path d="M323,247 L337,261 M323,261 L337,247" stroke="#e0457b" stroke-width="2"/>
+<text x="120" y="240.0" font-size="13" font-weight="400" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">③ 해제된 메모리 읽기</text>
+<text x="255" y="385.9" font-size="14" font-weight="700" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">ASan: heap-use-after-free</text>
+<text x="255" y="404.1" font-size="14" font-weight="700" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">Valgrind: Invalid read 4건</text>
+<line x1="525" y1="70" x2="525" y2="410" stroke="#dddddd" stroke-width="1"/>
+<text x="570" y="42" font-size="22" font-weight="700" fill="#111111">복사해서 들고 나가면</text>
+<rect x="570" y="90" width="190" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="665.0" y="112.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">작업 스레드 1</text>
+<text x="665.0" y="131.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">SessionInfo 복사본</text>
+<rect x="570" y="290" width="190" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="665.0" y="312.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">작업 스레드 2</text>
+<text x="665.0" y="331.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">/logout</text>
+<rect x="840" y="190" width="180" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="930.0" y="212.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">Session 노드</text>
+<text x="930.0" y="231.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user = alice</text>
+<line x1="760" y1="112" x2="838" y2="200" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
+<text x="885" y="103.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">① 락 안에서 값 복사</text>
+<text x="885" y="120.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">→ 락 해제</text>
+<line x1="760" y1="322" x2="838" y2="246" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
+<text x="830" y="316.0" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">② free()</text>
+<text x="665" y="190.9" font-size="14" font-weight="700" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">③ 복사본으로</text>
+<text x="665" y="209.1" font-size="14" font-weight="700" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">응답 → 안전</text>
+<text x="795" y="395.0" font-size="14" font-weight="700" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">ASan · Valgrind: 0건</text>
+<text x="1044" y="426.0" font-size="12" font-weight="400" fill="#8a8a8a" text-anchor="end" dominant-baseline="middle">실측 · docs/results/step2_uaf_asan.txt, step2_linux_verify.txt</text>
+</svg>
