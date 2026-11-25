@@ -509,6 +509,24 @@ def test_proxy_client_disconnects_midway(server):
     assert server.alive()
 
 
+def test_proxy_frees_worker_when_client_leaves(server):
+    """느린 백엔드를 기다리던 클라이언트들이 떠나면 작업 스레드가 바로 풀려야 한다.
+    스레드(8)의 두 배인 16개를 보내고 모두 끊는다. 감지하지 못하면 스레드가 백엔드 타임아웃(5초)씩
+    두 차례 묶여 새 요청이 최대 10초를 기다린다."""
+    abandoned = [connect() for _ in range(16)]
+    for sock in abandoned:
+        sock.sendall(b"GET /api/slow HTTP/1.1\r\nHost: a\r\n\r\n")
+    time.sleep(0.5)                        # 작업 스레드들이 요청을 읽고 백엔드를 기다리기 시작할 때까지
+    for sock in abandoned:
+        sock.close()                       # FIN: 요청은 이미 도착했고, 이제 응답을 받을 사람이 없음
+    start = time.time()
+    assert get("/index.html")[0] == 200
+    elapsed = time.time() - start
+    assert elapsed < 2.0, f"worker threads stayed busy for {elapsed:.1f}s"
+    time.sleep(0.5)
+    assert "client left while waiting" in server.logs()
+
+
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
 
 

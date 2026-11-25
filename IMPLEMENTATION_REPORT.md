@@ -231,6 +231,8 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | Linux에서 `realpath` 미선언 빌드 실패 | glibc는 XSI 매크로가 있어야 선언 | `_XOPEN_SOURCE=700` |
 | 16KB 넘는 URI가 431 | 요청 줄이 끝나기 전에 헤더 상한 도달 | 요청 줄에 `\r\n`이 없으면 414 |
 | Slowloris로 작업 스레드 무기한 점유 | 타임아웃이 recv 1회 기준 | 요청당 총 한도 10초 → 408 |
+| 긴 파일 이름이 500 | ENAMETOOLONG을 서버 오류로 분류 | 414 |
+| 떠난 클라이언트의 프록시 요청이 스레드를 5초씩 점유 | 백엔드 `recv`만 블로킹 대기 | 백엔드·클라이언트를 함께 `poll`, 클라이언트 EOF/RST면 즉시 중단 |
 
 ---
 

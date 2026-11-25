@@ -53,7 +53,7 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
 - **Code**:
   - `src/net.c` `set_socket_timeout()`, `connect_with_timeout()`
   - `src/server.c` `handle_connection()`의 `EAGAIN` → 408, `request_started` + `monotonic_seconds()` → 408(총 한도)
-  - `src/proxy.c` `proxy_forward()`의 `EAGAIN` → 504
+  - `src/proxy.c` `proxy_forward()`의 시간 초과 → 504, `wait_backend_or_client_gone()`: 백엔드를 기다리는 동안 `poll`로 클라이언트도 지켜보다가 떠나면 즉시 중단
 - 테스트: `test_incomplete_header_timeout_408`, `test_slow_request_deadline_408`, `test_proxy_backend_timeout_504`
 
 **확인 질문**

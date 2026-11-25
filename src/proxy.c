@@ -4,12 +4,13 @@
  * proxy_forward()의 흐름
  *   1) Round-Robin으로 백엔드를 고르고 연결 (실패하면 다음 백엔드, 모두 실패하면 502)
  *   2) 요청 헤더를 다시 만들어 보내고, 본문은 그대로 보냄
- *   3) 백엔드 응답을 받는 대로 클라이언트에게 중계 (첫 응답이 늦으면 504)
+ *   3) 백엔드 응답을 받는 대로 클라이언트에게 중계 (첫 응답이 늦으면 504, 기다리는 중 클라이언트가 떠나면 중단)
  */
 #include "proxy.h"
 #include "net.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,6 +170,37 @@ static int reply_gateway_error(int client_fd, int status, const HttpRequest *req
     return send_error_response(client_fd, status, 0, is_head, NULL) == 0 ? status : -1;
 }
 
+/*
+ * 백엔드 응답을 기다리는 동안 클라이언트도 함께 지켜봅니다.
+ * 이것이 없으면 클라이언트가 이미 떠났어도 백엔드 타임아웃(5초)까지 작업 스레드가 묶여 있습니다.
+ * 반환값: 1 = 백엔드에서 읽을 것이 있음, 0 = 시간 초과, -1 = 클라이언트가 떠남
+ */
+static int wait_backend_or_client_gone(int backend_fd, int client_fd)
+{
+    struct pollfd fds[2] = {
+        {.fd = backend_fd, .events = POLLIN},
+        {.fd = client_fd, .events = POLLIN},
+    };
+    for (;;) {
+        int ready = poll(fds, 2, BACKEND_TIMEOUT_SECONDS * 1000);
+        if (ready == -1 && errno == EINTR) continue;
+        if (ready == -1) return 1;          /* poll 자체 실패: 뒤의 recv가 오류를 알려주게 둡니다 */
+        if (ready == 0) return 0;
+        if (fds[0].revents) return 1;
+        /*
+         * 클라이언트 쪽에 이벤트가 있음. MSG_PEEK로 데이터를 꺼내지 않고 상태만 엿봅니다.
+         * poll이 "읽을 수 있음"이라 했으므로 이 recv는 기다리지 않습니다.
+         *   0  → 클라이언트가 연결을 닫음(EOF),  -1 → RST 등 오류  ⇒ 떠난 것
+         *   >0 → 다음 요청(파이프라이닝)이 먼저 도착 ⇒ 떠난 게 아니므로 더는 감시하지 않음
+         */
+        char byte;
+        ssize_t peeked = recv(client_fd, &byte, 1, MSG_PEEK);
+        if (peeked == 0 || (peeked == -1 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK))
+            return -1;
+        fds[1].fd = -1; /* poll은 음수 fd를 무시합니다 */
+    }
+}
+
 int proxy_forward(int client_fd, const HttpRequest *request, ProxyTable *table, ProxyRoute *route)
 {
     /* ── 1) 백엔드 고르기 + 연결: 연결이 안 되는 백엔드는 건너뛰고 다음 순번 시도 ── */
@@ -199,7 +231,20 @@ int proxy_forward(int client_fd, const HttpRequest *request, ProxyTable *table, 
     size_t relayed = 0;
     int status = 0;
     for (;;) {
-        ssize_t received = recv(backend_fd, chunk, sizeof(chunk), 0);
+        int ready = wait_backend_or_client_gone(backend_fd, client_fd);
+        if (ready == -1) {
+            fprintf(stderr, "[proxy] client left while waiting for %s:%s, dropping request\n",
+                    backend->host, backend->port);
+            status = -1;
+            break;
+        }
+        ssize_t received;
+        if (ready == 0) {
+            received = -1;
+            errno = EAGAIN;   /* 시간 초과 → 아래에서 504 (아직 보낸 것이 없을 때) */
+        } else {
+            received = recv(backend_fd, chunk, sizeof(chunk), 0);
+        }
         if (received == -1 && errno == EINTR) continue;
         if (received <= 0) {
             if (relayed == 0) {

@@ -109,7 +109,7 @@ handle_connection(6)                               server.c:224
 handle_request()                                   server.c:186
  ├─ proxy_find_route(&proxy_table, "/api/echo")    proxy.c:75   → "/api/" 규칙
  ├─ *keep_alive = 0                                server.c:195  응답 끝을 EOF로 알리므로 연결 닫음
- └─ proxy_forward(client_fd, &request, &proxy_table, route)   proxy.c:172
+ └─ proxy_forward(client_fd, &request, &proxy_table, route)   proxy.c:204
       ├─ proxy_next_backend()                      proxy.c:92   mutex 안에서 순번 0 → 다음은 1
       ├─ connect_with_timeout("127.0.0.1","9001",2000)  net.c:73
       │    getaddrinfo → socket → O_NONBLOCK → connect=EINPROGRESS
@@ -119,7 +119,8 @@ handle_request()                                   server.c:186
       │    "POST /api/echo HTTP/1.1\r\n" + 원래 헤더(hop-by-hop 제외) + "Connection: close\r\n\r\n"
       ├─ set_socket_timeout(backend, 5초)
       ├─ send_all(backend, header) ; send_all(backend, body 5바이트)
-      └─ for (;;) recv(backend, 16KiB)
+      └─ for (;;) wait_backend_or_client_gone() → recv(backend, 16KiB)
+           (기다리는 동안 poll로 클라이언트도 감시: 클라이언트가 EOF/RST면 즉시 중단, status=-1)
            첫 조각: 상태 코드 읽기(response_status) → send_all(client)
            이후 조각: 그대로 send_all(client)
            recv == 0 (백엔드가 닫음) → 끝
@@ -142,6 +143,7 @@ handle_connection: keep_alive=0 → break → free(buffer) → 작업 스레드�
 | `serve_static_file` | 헤더 송신 후 read 실패 | 상태를 바꿀 수 없으므로 연결 종료 |
 | `send_all` | 클라이언트가 끊음(EPIPE, SIGPIPE 무시 덕분) | -1 → 연결 종료 |
 | `proxy_forward` | 백엔드 연결 불가 / 응답 없음 | 502 / 504 |
+| `wait_backend_or_client_gone` | 백엔드를 기다리는 중 클라이언트가 떠남 | 백엔드 요청을 버리고 즉시 종료 (스레드 반환) |
 
 ---
 

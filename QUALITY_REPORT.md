@@ -15,8 +15,8 @@ REQUIREMENTS.md의 "품질" 항목을 기준으로 2026-11-25에 다시 검증�
 | 기능 테스트 — 동시 다중 클라이언트 | ✅ 자동 테스트 + 혼합 200병렬 요청 내용 바이트 비교 불일치 0 | 2 |
 | 부하 테스트 | ✅ `ab`, `wrk`, `hey` 세 도구로 동시성별 처리량 측정 | 3 |
 | 메모리 누수 / 잘못된 접근 | ✅ ASan+UBSan(macOS), ASan+LSan+UBSan(Linux 실서버), **Valgrind memcheck**(Linux 단위 5개 + 실서버), macOS leaks 0 | 4 |
-| 엣지 케이스 | ✅ 기능 26/26 (macOS, Linux 일반 사용자) + 엣지 탐침 30/30 (release, ASan, Linux LSan). Valgrind 서버에서는 27/28 — 7절 한계 참고 | 5 |
-| 검증 중 발견한 결함 | 🔧 4건 수정: Linux 빌드 실패, 16KB 넘는 URI가 431, Slowloris, 긴 파일 이름이 500 | 6 |
+| 엣지 케이스 | ✅ 기능 27/27 (macOS release·ASan, Linux 일반 사용자) + 엣지 탐침 30/30 (release, ASan, Linux LSan), 28/28 (Valgrind 서버, 큰 파일 제외) | 5 |
+| 검증 중 발견한 결함 | 🔧 5건 수정: Linux 빌드 실패, 16KB 넘는 URI가 431, Slowloris, 긴 파일 이름이 500, 프록시가 떠난 클라이언트를 감지하지 못함 | 6 |
 | 500 응답 실제 발생 | ✅ 링크 순환(ELOOP) → 500, malloc 실패 주입 → 500, 전송 중 파일 축소 → 연결 끊김 | 5.1 |
 
 ---
@@ -56,7 +56,7 @@ make test     # 단위 + tests/functional/test_server.py
 make asan     # 같은 테스트를 ASan+UBSan 빌드로
 ```
 
-결과: `26/26 functional tests passed` (macOS release·ASan, Linux gcc 일반 사용자 `tester` 모두). 서버 로그에 새니타이저 보고가 있으면 하니스가 실패로 처리합니다.
+결과: `27/27 functional tests passed` (macOS release·ASan, Linux gcc 일반 사용자 `tester` 모두). 서버 로그에 새니타이저 보고가 있으면 하니스가 실패로 처리합니다.
 
 ### 2.2 curl
 
@@ -172,6 +172,7 @@ curl처럼 보내면서 읽는 클라이언트는 응답을 받지만, **다 보
 | 3 | **Slowloris**: 1바이트씩 천천히 보내면 작업 스레드를 무기한 점유 (0.4초 간격 → 11초 뒤 200 응답) | `SO_RCVTIMEO` 5초는 recv 1회 기준이라 바이트가 올 때마다 다시 시작 | 요청 하나를 다 받는 총 한도 `REQUEST_TIMEOUT_SECONDS = 10` (`handle_connection`, `CLOCK_MONOTONIC`) → 408 | `test_slow_request_deadline_408` — 수정 전 서버에서 FAIL, 수정 후 10.04초에 408 |
 
 | 4 | 파일 이름 한 조각이 255바이트를 넘는 요청(`/nnn…300자`)이 **500** | `stat`의 ENAMETOOLONG을 "그 밖의 오류"로 분류 → 클라이언트 입력으로 서버 오류(5xx)를 만들 수 있음 | `status_from_errno`: ENAMETOOLONG → 414 | `test_static.c` |
+| 5 | 느린 백엔드를 기다리던 클라이언트가 떠나도 작업 스레드가 백엔드 타임아웃(5초)까지 묶임. 스레드 8개에 이런 요청 16개 → 새 요청이 **9.5초** 대기. Valgrind 서버의 엣지 탐침에서 처음 드러남 | 프록시가 백엔드 소켓만 보고 `recv`에서 블로킹 | `wait_backend_or_client_gone`: 백엔드와 클라이언트를 함께 `poll`, 클라이언트 쪽 이벤트는 `MSG_PEEK`로 엿봐 EOF/오류면 즉시 중단(다음 요청 데이터면 감시만 멈춤). nginx 기본 동작과 같음 | `test_proxy_frees_worker_when_client_leaves` — 수정 전 9.5초로 FAIL, 수정 후 즉시 응답. 프록시 처리량 7,643 → 7,689 rps(hey c=10)로 변화 없음 |
 
 결함 1은 이전 보고서(IMPLEMENTATION_REPORT 4.7)의 "Linux gcc `-Werror` 빌드 성공" 기록과 어긋나 그 기록도 정정했습니다.
 
@@ -185,12 +186,16 @@ docker build -t microhttp-verify tests/linux
 docker run --rm -v "$PWD":/src:ro microhttp-verify sh /src/tests/linux/verify.sh
 ```
 
-마지막 실행 결과: `make test`(일반 사용자 tester, 26/26) PASS · Valgrind 단위 5개 PASS · Valgrind 실서버 PASS · malloc 주입 500 PASS ·
-**엣지 탐침(Valgrind 서버) 27/28 — FAIL 1건**:
+마지막 실행 결과: `make test`(일반 사용자 tester, 27/27) PASS · Valgrind 단위 5개 PASS · 엣지 탐침(Valgrind 서버) 28/28 PASS · Valgrind 실서버 PASS · malloc 주입 500 PASS → **`ALL LINUX CHECKS PASSED`**
+
+(처음 실행에서는 엣지 탐침이 27/28이었습니다. 그 FAIL 1건이 6절의 결함 5이며, 테스트 조건은 바꾸지 않고 서버를 고쳐 통과시켰습니다.)
+
+남은 설계상 한계:
 
 | 남은 한계 | 내용 |
 |---|---|
-| 프록시 대기 중 클라이언트 이탈을 감지하지 못함 | 느린 백엔드(`/api/slow`)를 기다리는 동안 클라이언트가 끊어도 프록시는 백엔드 타임아웃(5초)까지 작업 스레드를 붙잡습니다. Valgrind로 서버가 느려지면 이런 요청 20개가 스레드 8개를 약 15초 점유해, 탐침의 생존 확인(8초)이 실패합니다. macOS·LSan 실행에서는 RST가 파싱보다 먼저 도착해 드러나지 않았습니다. 다만 끊지 않고 느린 요청만 보내도 같은 점유가 생기므로, 근본 원인은 "블로킹 스레드 풀 + 백엔드 타임아웃" 구조입니다. 테스트 조건은 바꾸지 않았습니다. |
+| 느린 요청의 스레드 점유 | 클라이언트가 **연결을 유지한 채** 느린 백엔드 경로를 요청하면 작업 스레드가 백엔드 타임아웃(5초)까지 묶입니다. 블로킹 스레드 풀 구조의 고유한 비용입니다(이벤트 루프 전환은 범위 밖). |
+| 반쯤 닫은 클라이언트 | 요청을 보낸 뒤 `shutdown(SHUT_WR)`만 하고 응답을 기다리는 클라이언트도 프록시는 "떠났다"고 보고 중단합니다(nginx 기본값과 같음). 정적 파일 경로는 영향 없음. |
 
 | 미검증 | 이유 |
 |---|---|
