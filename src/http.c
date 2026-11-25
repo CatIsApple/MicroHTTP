@@ -152,8 +152,11 @@ HttpParseResult http_parse_request(const unsigned char *data, size_t length,
             break;
         }
     }
-    if (!head_length)
-        return length >= HTTP_MAX_HEADER ? error(431, status) : HTTP_NEED_MORE;
+    if (!head_length) {
+        if (length < HTTP_MAX_HEADER) return HTTP_NEED_MORE;
+        /* 상한까지 요청 줄조차 끝나지 않았다면 원인은 긴 URI → 414, 아니면 헤더가 큼 → 431 */
+        return error(find_crlf(data, data + HTTP_MAX_HEADER) ? 431 : 414, status);
+    }
 
     /* ── 2단계: 요청 줄 ── */
     const unsigned char *end = data + head_length;

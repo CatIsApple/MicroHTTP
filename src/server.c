@@ -22,7 +22,9 @@
  *    ├─ proxy_find_route() 일치 → proxy_forward()   : 백엔드로 전달 (동적 요청, proxy.c)
  *    └─ 그 외              → serve_static_file()    : static_file_open() → 헤더 send → 파일 read/send
  */
-#define _POSIX_C_SOURCE 200809L
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700 /* POSIX.1-2008 + XSI: Linux glibc에서 realpath() 선언에 필요 (Makefile과 같은 값) */
+#endif
 
 #include "http.h"
 #include "net.h"
@@ -47,6 +49,7 @@ enum {
     DEFAULT_PORT = 8080,
     BACKLOG = 128,                    /* accept 전 대기 연결 큐 크기 (OS에 요청하는 값) */
     IDLE_TIMEOUT_SECONDS = 5,         /* 이 시간 동안 아무것도 오가지 않으면 연결을 정리 */
+    REQUEST_TIMEOUT_SECONDS = 10,     /* 요청 하나를 다 받기까지의 총 한도 (slowloris 방지) */
     MAX_REQUESTS_PER_CONNECTION = 100,/* keep-alive 연결 하나가 서버를 독점하지 않도록 제한 */
     FILE_CHUNK_SIZE = 16384,          /* 파일을 이 크기만큼씩 읽어서 보냄 */
     DEFAULT_THREADS = 8,              /* 작업 스레드 수 = 동시에 처리할 수 있는 연결 수 */
@@ -201,6 +204,14 @@ static int handle_request(int client_fd, const HttpRequest *request, int *keep_a
     return serve_static_file(client_fd, request, *keep_alive, is_head);
 }
 
+/* 경과 시간 측정용 시계. 시스템 시각(time())과 달리 사용자가 시계를 바꿔도 되돌아가지 않습니다. */
+static time_t monotonic_seconds(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec;
+}
+
 /*
  * 연결 하나를 처리합니다.
  *
@@ -223,6 +234,12 @@ static void handle_connection(int client_fd)
     }
     size_t used = 0;        /* 버퍼에 쌓인 바이트 수 */
     int handled = 0;        /* 이 연결에서 처리한 요청 수 */
+    /*
+     * 현재 요청의 첫 바이트가 도착한 시각 (0 = 아직 안 옴).
+     * IDLE_TIMEOUT은 recv 한 번마다 다시 시작되므로, 1바이트씩 4초 간격으로 보내는 클라이언트(slowloris)는
+     * 그것만으로는 끊을 수 없습니다. 그래서 요청 하나 전체에도 시간 한도를 둡니다.
+     */
+    time_t request_started = 0;
 
     for (;;) {
         HttpRequest request;
@@ -255,9 +272,16 @@ static void handle_connection(int client_fd)
              */
             memmove(buffer, buffer + consumed, used - consumed);
             used -= consumed;
+            request_started = used > 0 ? monotonic_seconds() : 0; /* 다음 요청의 시계를 새로 시작 */
             continue;
         }
 
+        /* NEED_MORE인데 요청을 받기 시작한 지 너무 오래됐다면 더 기다리지 않습니다. */
+        if (request_started && monotonic_seconds() - request_started >= REQUEST_TIMEOUT_SECONDS) {
+            fprintf(stderr, "[request] fd=%d request not complete within %d s\n", client_fd, REQUEST_TIMEOUT_SECONDS);
+            send_error_response(client_fd, 408, 0, 0, NULL);
+            break;
+        }
         /* NEED_MORE: 버퍼 빈 곳에 이어서 받습니다. 데이터가 오거나 타임아웃이 될 때까지 블로킹. */
         ssize_t received = recv(client_fd, buffer + used, capacity - used, 0);
         if (received == -1) {
@@ -281,6 +305,7 @@ static void handle_connection(int client_fd)
         used += (size_t)received;
         if (config.verbose)
             fprintf(stderr, "[recv] fd=%d bytes=%zd accumulated=%zu\n", client_fd, received, used);
+        if (request_started == 0) request_started = monotonic_seconds();
     }
     free(buffer); /* 모든 종료 경로가 이 한 곳을 지나갑니다 */
 }

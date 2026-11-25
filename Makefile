@@ -7,7 +7,8 @@
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Werror
-CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc
+# _XOPEN_SOURCE=700 = POSIX.1-2008 + XSI 확장. Linux glibc는 _POSIX_C_SOURCE만으로는 realpath()를 선언하지 않습니다.
+CPPFLAGS += -D_XOPEN_SOURCE=700 -Isrc
 LDLIBS  += -lpthread
 PYTHON  ?= python3
 

@@ -8,6 +8,7 @@
     python3 tests/functional/test_server.py static   # 이름에 'static'이 들어간 테스트만
 """
 import os
+import select
 import socket
 import struct
 import subprocess
@@ -21,6 +22,7 @@ SERVER = os.path.join(ROOT, "server")
 WWW = os.path.join(ROOT, "www")
 PORT = 18080
 IDLE_TIMEOUT = 5
+REQUEST_TIMEOUT = 10
 BACKEND_TIMEOUT = 5
 BACKEND_A, BACKEND_B, BACKEND_DEAD = 19001, 19002, 19009
 PROXY_ARGS = [
@@ -276,6 +278,21 @@ def test_incomplete_header_timeout_408(server):
         sock.sendall(b"GET / HTTP/1.1\r\nHost:")
         assert read_response(sock)[0] == 408
         assert time.time() - start >= IDLE_TIMEOUT - 1
+
+
+def test_slow_request_deadline_408(server):
+    """slowloris: 1초마다 1바이트씩 보내면 recv 대기(5초)는 매번 다시 시작되지만, 요청 총 한도(10초)에서 끊긴다."""
+    request = b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: " + b"p" * 64 + b"\r\n\r\n"  # 다 보내려면 100초 이상
+    with connect(timeout=REQUEST_TIMEOUT + IDLE_TIMEOUT + 5) as sock:
+        start = time.time()
+        for byte in request:
+            sock.sendall(bytes([byte]))
+            readable, _, _ = select.select([sock], [], [], 1.0)  # 1초 쉬되, 응답이 오면 바로 멈춤
+            if readable:
+                break
+        assert read_response(sock)[0] == 408
+        elapsed = time.time() - start
+        assert REQUEST_TIMEOUT - 1 <= elapsed <= REQUEST_TIMEOUT + 3, elapsed
 
 
 def test_large_body_and_long_uri(server):
