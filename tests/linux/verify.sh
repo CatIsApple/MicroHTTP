@@ -26,7 +26,7 @@ fi
 echo "== 2. valgrind: unit tests"
 VG="valgrind -q --error-exitcode=99 --leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite,indirect"
 as_tester 'make -s clean && make -s unit CFLAGS="-std=c11 -O0 -g -Wall -Wextra -Wpedantic -Werror"' > /tmp/unit_build.log 2>&1 || { cat /tmp/unit_build.log; result FAIL "unit build"; }
-for t in http mime static net proxy; do
+for t in http mime static net proxy session; do
     if as_tester "$VG ./build/test_$t" > /tmp/vg_$t.log 2>&1; then
         result PASS "valgrind test_$t ($(grep -c . /tmp/vg_$t.log) lines, $(grep -c '==[0-9]*==' /tmp/vg_$t.log) valgrind reports)"
     else
@@ -38,11 +38,16 @@ echo "== 3. valgrind: live server + edge probe"
 as_tester 'make -s clean && make -s server CFLAGS="-std=c11 -O0 -g -Wall -Wextra -Wpedantic -Werror"'
 python3 tools/backend.py 19201 A >/dev/null 2>&1 & BACKEND=$!
 runuser -u tester -- $VG --track-fds=yes --log-file=/tmp/vg_server.log \
-    ./server -p 18200 -r ./www -R /api/=127.0.0.1:19201 -R /down/=127.0.0.1:19209 2> /tmp/server.log &
+    ./server -p 18200 -r ./www -U tests/functional/users.txt -R /api/=127.0.0.1:19201 -R /down/=127.0.0.1:19209 2> /tmp/server.log &
 VG_JOB=$!   # runuser — 끝나면 valgrind의 종료 코드(오류가 있으면 99)를 그대로 돌려줌
 for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:18200/ && break; sleep 0.5; done
 python3 tests/functional/edge_probe.py 18200 > /tmp/probe.log 2>&1; PROBE=$?
 grep -E 'FAIL|passed' /tmp/probe.log
+# 인증 경로도 Valgrind 아래에서: 로그인 → /me → 로그아웃 → /me
+SID=$(curl -s -o /dev/null -D - -d 'username=alice&password=alice-test-pw' http://127.0.0.1:18200/login | tr -d '\r' | sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p')
+AUTH="$(curl -s -o /dev/null -w '%{http_code}' -b sid=$SID http://127.0.0.1:18200/me) $(curl -s -o /dev/null -w '%{http_code}' -d '' -b sid=$SID http://127.0.0.1:18200/logout) $(curl -s -o /dev/null -w '%{http_code}' -b sid=$SID http://127.0.0.1:18200/me)"
+echo "auth under valgrind (me logout me): $AUTH"
+[ "$AUTH" = "200 200 401" ] && result PASS "auth flow under valgrind" || result FAIL "auth flow under valgrind ($AUTH)"
 # runuser의 자식인 valgrind.bin 프로세스에 직접 SIGTERM을 보내고 끝날 때까지 기다립니다.
 SERVER_PID=$(pgrep -f 'valgrind.bin.*-p 18200' | head -1)
 kill -TERM "$SERVER_PID"
@@ -56,6 +61,15 @@ if [ "$VG_EXIT" = 0 ] && grep -q 'shutdown complete' /tmp/server.log && ! grep -
 else
     tail -60 /tmp/vg_server.log; result FAIL "valgrind live server (exit=$VG_EXIT)"
 fi
+
+echo "== 3b. valgrind: STEP 2 UAF experiment (unsafe = pointer, safe = copy)"
+as_tester 'make -s build/step2_uaf CFLAGS="-std=c11 -O0 -g -Wall -Wextra -Wpedantic -Werror"' || result FAIL "step2_uaf build"
+for mode in unsafe safe; do
+    runuser -u tester -- valgrind -q --error-exitcode=99 ./build/step2_uaf $mode > /tmp/vg_uaf_$mode.log 2>&1; code=$?
+    echo "$mode: exit=$code invalid_reads=$(grep -c 'Invalid read' /tmp/vg_uaf_$mode.log) $(grep -E '^(unsafe|safe):' /tmp/vg_uaf_$mode.log)"
+done
+grep -m1 -A4 'Invalid read' /tmp/vg_uaf_unsafe.log
+[ "$(grep -c 'Invalid read' /tmp/vg_uaf_safe.log)" = 0 ] && result PASS "valgrind: safe (copy) has no invalid read" || result FAIL "valgrind: safe mode"
 
 echo "== 4. malloc failure injection"
 as_tester 'make -s clean && make -s server && gcc -shared -fPIC -o fail_malloc.so tests/linux/fail_malloc.c' || result FAIL "fail_malloc.so build"

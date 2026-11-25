@@ -8,3 +8,4 @@ __pycache__/
 !/tests/functional/
 !/tests/linux/
 !/tests/bench/
+!/tests/experiments/

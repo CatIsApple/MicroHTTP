@@ -298,6 +298,48 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
 
 ---
 
+## 13. TCP 연결과 Session의 분리 (인증 STEP 1)
+
+- **What**: TCP 연결은 바이트를 나르는 통로이고, Session은 "누가 로그인했는가"라는 서버 측 상태입니다. 둘을 잇는 것은 클라이언트가 매 요청에 실어 보내는 Cookie의 Session ID입니다.
+- **Why**: HTTP는 요청마다 독립적(Stateless)이고, 연결은 수시로 닫히고 새로 열립니다. 로그인 상태를 연결에 묶으면 새 연결에서 로그인이 풀리거나, 다른 사람이 그 연결 번호를 물려받습니다.
+- **How**: 로그인 성공 → `session_create`가 256비트 난수 ID를 만들어 저장소에 넣음 → `Set-Cookie: sid=…` → 브라우저가 이후 모든 요청에 `Cookie: sid=…` → `session_lookup`이 ID로 사용자를 찾음. 연결(fd)은 어디에도 쓰지 않습니다.
+- **Without**: `build/server_fd_demo`(fd로 식별)에서 A가 로그인하고 연결을 닫자, 아무 자격 증명도 없는 B가 같은 fd 5를 받아 `user: alice`로 인증됨(`docs/results/step1_fd_reuse.md`).
+- **Code**: `src/session.c` `session_create`/`session_lookup`, `src/auth.c` `auth_handle_request`/`cookie_session_id`, `src/http.c` `http_find_header`
+- 테스트: `test_auth_is_per_request_not_per_connection`(한 연결 안에서도 요청마다 판단), `test_auth_login_cookie_attributes_and_new_connections`
+
+**확인 질문**
+- keep-alive 연결 하나로 alice와 bob이 번갈아 요청하면 서버는 누구로 응답하는가? 근거가 되는 테스트는?
+- fd 표를 연결이 닫힐 때 지우면 FD 재사용 사고는 막힌다. 그런데도 fd가 식별자로 부적합한 이유는?
+
+## 14. Cookie 속성과 Session ID (인증 STEP 1·4·5)
+
+- **What**: `HttpOnly`(JavaScript가 못 읽음), `SameSite=Lax`(다른 사이트에서 시작된 POST 등에 안 실림), `Path=/`, `Secure`(HTTPS에서만 전송 — 이 서버는 아직 미적용).
+- **Why**: Session ID를 가진 사람이 곧 그 사용자이므로, ID는 추측할 수 없어야 하고(CSPRNG), 새어 나가기 어려워야 하며(HttpOnly, 로그에 미기록), 로그인 때마다 바뀌어야 합니다(Session 고정 방지).
+- **How**: `randombytes_buf` 32바이트 → 16진수 64자. 조회 전 형식 검사, `sodium_memcmp` 상수 시간 비교. 비밀번호는 argon2id 해시(`crypto_pwhash_str_verify`)로만 비교.
+- **Without**: 순번 ID면 남의 ID를 추측, `user=alice; logged_in=true` 같은 Cookie를 믿으면 누구나 위조(기능 테스트에서 401 확인).
+- **한계**: HTTPS와 Cookie 속성은 **이미 탈취된** ID의 재사용은 막지 못합니다. 만료 시간을 짧게 두는 것이 피해 범위를 줄이는 방법입니다.
+- **Code**: `src/session.c` `session_create`, `valid_id`; `src/auth.c` `COOKIE_ATTRIBUTES`, `check_password`; `tools/hashpw.c`
+
+## 15. 만료: Idle / Absolute, Passive / Active (인증 STEP 2)
+
+- **What**: Idle은 마지막 사용 후, Absolute는 생성 후의 수명. Passive는 조회할 때 발견하면 지우기, Active는 주기적으로 훑어서 지우기.
+- **Why**: 만료가 없으면 탈취된 ID가 영원히 유효하고, 버려진 Session이 메모리를 계속 차지합니다.
+- **How**: `session_lookup`은 만료를 **먼저** 검사하고 만료면 갱신하지 않고 삭제. main의 accept 루프가 1초마다 `session_expire`. 시간은 단조 시계(`session_now`)를 인자로 받아 단위 테스트에서 주입.
+- **Without**: Passive만 있으면 다시 오지 않는 사용자의 Session은 영원히 남습니다. 실서버 실험에서 요청 없이 6개 → 0개 정리 확인(`docs/results/step2_expiration.txt`).
+- **Code**: `src/session.c` `expired`, `session_lookup`, `session_expire`; `src/server.c` main 루프
+- **확인 질문**: 만료 시점에 들어온 조회가 last_seen을 갱신하면 어떤 일이 생기는가? 이를 막는 테스트는?
+
+## 16. 락 안에서 복사하기 — UAF와 락 범위 (인증 STEP 2)
+
+- **What**: 공유 저장소에서 꺼낸 값을 포인터가 아니라 독립된 메모리(SessionInfo)로 복사해서 락을 풀고, 느린 일(응답 생성, send)은 락 밖에서 합니다.
+- **Why**: 포인터를 넘기면 락을 푼 순간 다른 스레드의 로그아웃·만료가 그 노드를 free할 수 있습니다(Use-After-Free). 반대로 send까지 락을 쥐면 모든 사용자의 인증이 그 send를 기다립니다.
+- **How**: `session_lookup`이 락 안에서 user·시각을 복사하고 반환. `/me`는 복사본으로 응답을 만듭니다.
+- **Without** (실측):
+  - 포인터 반환(`step2_uaf unsafe`): ASan heap-use-after-free, Valgrind Invalid read 4건. 복사본(`safe`): 둘 다 0건. TSan은 unsafe도 잡지 못함 → 도구마다 보는 것이 다름.
+  - 넓은 락(`server_wide_lock`): c=8에서 처리량 약 -14%, 평균 락 점유 0.21us → 7.26us. c=50에서는 차이 없음(병목이 스레드 풀 대기).
+- **Code**: `src/session.c` `session_lookup` vs 실험용 `session_lookup_unsafe`/`session_lookup_hold`; `src/auth.c` `/me` 분기
+- **확인 질문**: 로그아웃 요청과 /me 요청이 동시에 오면 /me는 어떤 응답을 받을 수 있는가? 그 정책은 어디에 적혀 있는가?
+
 ## 마무리: 30초 요약
 
 > 커널이 handshake를 끝낸 연결을 main이 `accept`해서 큐에 넣으면, 작업 스레드가 꺼내 `recv`로 바이트를 쌓습니다. 파서가 `\r\n\r\n`과 `Content-Length`로 요청 경계를 찾으면, 경로 규칙에 따라 백엔드로 전달하거나(Reverse Proxy, Round-Robin, 502/504) 루트 안의 파일을 MIME 타입과 함께 보냅니다(403/404). keep-alive면 같은 연결로 다음 요청을 받고, 끝나면 버퍼를 `free`하고 fd를 `close`합니다. SIGTERM이 오면 새 연결을 멈추고 처리 중인 요청을 끝낸 뒤 스레드를 join하고 종료합니다.

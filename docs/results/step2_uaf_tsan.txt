@@ -1,0 +1,7 @@
+# STEP 2 UAF 실험 — TSan (macOS clang 15)
+## unsafe
+   1 unsafe: responses=2605 misses(logged out at lookup)=395 sessions_left=1
+warnings=0
+## safe
+   1 safe: responses=2935 misses(logged out at lookup)=65 sessions_left=1
+warnings=0

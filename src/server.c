@@ -26,9 +26,11 @@
 #define _XOPEN_SOURCE 700 /* POSIX.1-2008 + XSI: Linux glibc에서 realpath() 선언에 필요 (Makefile과 같은 값) */
 #endif
 
+#include "auth.h"
 #include "http.h"
 #include "net.h"
 #include "proxy.h"
+#include "session.h"
 #include "static_file.h"
 
 #include <arpa/inet.h>
@@ -65,7 +67,10 @@ static struct {
     char *root;               /* realpath로 정규화한 정적 파일 루트 (malloc) */
     int threads;
     int verbose;              /* 1이면 [parse]/[recv] 상세 로그 */
-} config = { "127.0.0.1", DEFAULT_PORT, NULL, DEFAULT_THREADS, 0 };
+    const char *users_path;   /* 로그인 사용자 파일 (-U). NULL이면 사용자 없음 */
+    int idle_timeout;         /* Session Idle Timeout 초 (-I) */
+    int absolute_timeout;     /* Session Absolute Timeout 초 (-A) */
+} config = { "127.0.0.1", DEFAULT_PORT, NULL, DEFAULT_THREADS, 0, NULL, 1800, 28800 };
 
 /* Reverse Proxy 라우팅 규칙 (-R 옵션). 규칙 목록은 시작 후 바뀌지 않고, Round-Robin 순번만 lock으로 보호합니다. */
 static ProxyTable proxy_table = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -159,7 +164,7 @@ static int serve_static_file(int client_fd, const HttpRequest *request,
 
     char header[512];
     int header_length = http_response_header(header, sizeof(header), 200, mime_type,
-                                             file_size, keep_alive, NULL);
+                                             file_size, keep_alive, NULL, NULL);
     int ok = header_length > 0 && send_all(client_fd, header, (size_t)header_length) == 0;
 
     /*
@@ -203,6 +208,10 @@ static int handle_request(int client_fd, const HttpRequest *request, int *keep_a
         *keep_alive = 0;
         return proxy_forward(client_fd, request, &proxy_table, route);
     }
+
+    /* 로그인 / 로그아웃 / 인증이 필요한 페이지 (auth.c). 인증 경로가 아니면 0 */
+    int auth_status = auth_handle_request(client_fd, request, *keep_alive);
+    if (auth_status != 0) return auth_status;
 
     int is_head = strcmp(request->method, "HEAD") == 0;
     /* 정적 파일은 읽기 전용이므로 GET/HEAD만 허용합니다. */
@@ -447,7 +456,10 @@ static void print_usage(const char *program)
         "  -t threads       worker threads (default 8)\n"
         "  -R rule          reverse proxy rule, repeatable (e.g. -R /api/=127.0.0.1:9001,127.0.0.1:9002)\n"
         "  -b bind_address  IPv4 address to bind (default 127.0.0.1)\n"
-        "  -v               verbose parse/recv logs\n", program);
+        "  -v               verbose parse/recv logs\n"
+        "  -U users_file    login users, one \"name:argon2id-hash\" per line (make build/hashpw)\n"
+        "  -I seconds       session idle timeout (default 1800)\n"
+        "  -A seconds       session absolute timeout (default 28800)\n", program);
 }
 
 /* 1..max 범위의 정수 인자를 읽습니다. 실패하면 -1. */
@@ -465,7 +477,7 @@ static int parse_arguments(int argc, char **argv)
 {
     const char *root = "./www";
     int option;
-    while ((option = getopt(argc, argv, "p:r:t:R:b:v")) != -1) {
+    while ((option = getopt(argc, argv, "p:r:t:R:b:vU:I:A:")) != -1) {
         if (option == 'p') {
             long port = parse_number(optarg, 65535);
             if (port == -1) { fprintf(stderr, "invalid port: %s\n", optarg); return -1; }
@@ -485,6 +497,13 @@ static int parse_arguments(int argc, char **argv)
             config.bind_address = optarg;
         } else if (option == 'v') {
             config.verbose = 1;
+        } else if (option == 'U') {
+            config.users_path = optarg;
+        } else if (option == 'I' || option == 'A') {
+            long seconds = parse_number(optarg, 7 * 24 * 3600);
+            if (seconds <= 0) { fprintf(stderr, "invalid timeout: %s\n", optarg); return -1; }
+            if (option == 'I') config.idle_timeout = (int)seconds;
+            else config.absolute_timeout = (int)seconds;
         } else {
             return -1;
         }
@@ -512,6 +531,11 @@ int main(int argc, char **argv)
         free(config.root);
         return EXIT_FAILURE;
     }
+    session_set_timeouts(config.idle_timeout, config.absolute_timeout);
+    if (auth_init(config.users_path) == -1) {
+        free(config.root);
+        return EXIT_FAILURE;
+    }
     int listener = create_listener(config.bind_address, config.port);
     if (listener == -1) {
         free(config.root);
@@ -534,7 +558,19 @@ int main(int argc, char **argv)
         fputc('\n', stderr);
     }
 
+    time_t last_sweep = session_now();
     while (!atomic_load(&stop_requested)) {
+        /*
+         * Active Expiration: 요청이 전혀 없어도 만료된 Session이 메모리에 남지 않도록
+         * 1초마다 저장소를 훑습니다. 이 서버에는 이벤트 루프가 없어서(스레드 풀 구조),
+         * 이미 1초마다 깨어나는 이 accept 루프를 타이머로 씁니다.
+         */
+        time_t now = session_now();
+        if (now - last_sweep >= 1) {
+            size_t removed = session_expire(now);
+            if (removed) fprintf(stderr, "[session] expired %zu, remaining %zu\n", removed, session_count());
+            last_sweep = now;
+        }
         /*
          * accept()에 바로 들어가면, 플래그 검사 직후~accept 진입 직전에 시그널이 오는 경우
          * 다음 연결이 올 때까지 셧다운이 미뤄집니다. poll에 1초 제한을 두어
@@ -564,6 +600,10 @@ int main(int argc, char **argv)
     fprintf(stderr, "shutting down: closing listener and waiting for %d workers\n", started);
     close_socket(listener);           /* 새 연결 받기 중단 */
     stop_workers(threads, started);   /* 처리 중·대기 중인 연결을 마무리 */
+#ifdef SESSION_EXPERIMENTS
+    session_lock_report();
+#endif
+    session_clear();                  /* 작업 스레드가 모두 끝난 뒤라 경쟁 없음 */
     free(config.root);
     fprintf(stderr, "shutdown complete\n");
     return EXIT_SUCCESS;

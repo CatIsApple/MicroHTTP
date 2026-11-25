@@ -36,9 +36,10 @@ static int equal_ci(const unsigned char *text, size_t length, const char *name)
 {
     if (length != strlen(name)) return 0;
     for (size_t i = 0; i < length; ++i) {
-        unsigned char c = text[i];
+        unsigned char c = text[i], n = (unsigned char)name[i];
         if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-        if (c != (unsigned char)name[i]) return 0;
+        if (n >= 'A' && n <= 'Z') n += 'a' - 'A';   /* 양쪽 모두 소문자로 비교 ("Cookie" == "cookie") */
+        if (c != n) return 0;
     }
     return 1;
 }
@@ -245,7 +246,9 @@ const char *http_reason(int status)
 {
     switch (status) {
     case 200: return "OK";
+    case 303: return "See Other";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
@@ -266,7 +269,7 @@ const char *http_reason(int status)
 
 int http_response_header(char *output, size_t capacity, int status,
                          const char *content_type, size_t body_length,
-                         int keep_alive, const char *allow)
+                         int keep_alive, const char *allow, const char *extra)
 {
     const char *reason = http_reason(status);
     /* 값에 "\r\n"이 섞이면 헤더를 끼워 넣을 수 있으므로(헤더 주입) 거절합니다. */
@@ -282,9 +285,35 @@ int http_response_header(char *output, size_t capacity, int status,
      */
     int length = snprintf(output, capacity,
         "HTTP/1.1 %d %s\r\nServer: MicroHTTP\r\nContent-Type: %s\r\n"
-        "Content-Length: %zu\r\nConnection: %s\r\n%s%s%s\r\n",
+        "Content-Length: %zu\r\nConnection: %s\r\n%s%s%s%s\r\n",
         status, reason, content_type, body_length, keep_alive ? "keep-alive" : "close",
-        allow ? "Allow: " : "", allow ? allow : "", allow ? "\r\n" : "");
+        allow ? "Allow: " : "", allow ? allow : "", allow ? "\r\n" : "",
+        extra ? extra : "");
     /* snprintf는 잘려도 "필요한 길이"를 돌려주므로 capacity 이상이면 실패 */
     return length < 0 || (size_t)length >= capacity ? -1 : length;
+}
+
+int http_find_header(const HttpRequest *request, const char *name,
+                     const unsigned char **value, size_t *length)
+{
+    size_t name_length = strlen(name);
+    const unsigned char *line = request->headers;
+    const unsigned char *end = request->headers + request->headers_length;
+    while (line < end) {
+        const unsigned char *line_end = find_crlf(line, end);
+        if (!line_end) line_end = end;
+        /* 파서가 이미 "이름: 값" 형식과 이름 뒤 공백 없음을 검증했습니다. */
+        if ((size_t)(line_end - line) > name_length && line[name_length] == ':' &&
+            equal_ci(line, name_length, name)) {
+            const unsigned char *start = line + name_length + 1;
+            const unsigned char *stop = line_end;
+            while (start < stop && (*start == ' ' || *start == '\t')) ++start;
+            while (stop > start && (stop[-1] == ' ' || stop[-1] == '\t')) --stop;
+            *value = start;
+            *length = (size_t)(stop - start);
+            return 1;
+        }
+        line = line_end + 2;
+    }
+    return 0;
 }

@@ -1,0 +1,13 @@
+scenario,run,requests_per_sec,avg_ms,p95_ms,p99_ms,status_200,non_200_or_error
+old_static_keepalive_c8,1,31610.6,0.249,0.500,1.200,20000,0
+new_static_keepalive_c8,1,33233.6,0.234,0.400,1.500,20000,0
+old_static_keepalive_c8,2,32965.2,0.235,0.400,0.800,20000,0
+new_static_keepalive_c8,2,33422.5,0.226,0.400,1.000,20000,0
+old_static_keepalive_c8,3,31974.4,0.249,0.400,1.200,20000,0
+new_static_keepalive_c8,3,37112.6,0.207,0.300,0.600,20000,0
+old_static_keepalive_c8,4,38233.6,0.200,0.300,0.600,20000,0
+new_static_keepalive_c8,4,40625.6,0.186,0.300,0.500,20000,0
+old_static_keepalive_c8,5,40866.4,0.193,0.400,1.400,20000,0
+new_static_keepalive_c8,5,38654.8,0.194,0.300,0.500,20000,0
+old_static_keepalive_c8,6,39992.0,0.195,0.400,0.800,20000,0
+new_static_keepalive_c8,6,40112.3,0.194,0.300,0.700,20000,0

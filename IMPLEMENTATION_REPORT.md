@@ -298,3 +298,47 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | `src/server.c` `stop_requested`, `on_stop_signal`, `handle_connection`, `main` | `volatile sig_atomic_t` → `atomic_int` + `atomic_load`/`atomic_store`, `_Static_assert(ATOMIC_INT_LOCK_FREE == 2)` | 스레드 사이에서 안전하고, lock-free라면 시그널 핸들러에서도 안전(C11 7.14.1.1). 대안인 "작업 스레드는 mutex로 보호되는 `queue.closing`을 읽기"는 요청마다 큐 락을 잡아야 해서 택하지 않음 |
 
 결과와 성능 비교는 EXPERIMENT_REPORT.md STEP 0-1.
+
+---
+
+## 10. 인증 과제 STEP 1~3, 7 — 변경 파일과 기술 선택
+
+### 10.1 변경 파일 · 함수
+
+| 파일 | 함수 / 내용 |
+|---|---|
+| `src/session.h`, `src/session.c` (신규) | `session_create`, `session_lookup`(복사본 반환 + Passive Expiration), `session_destroy`, `session_expire`(Active), `session_count`, `session_clear`, `session_now`. 실험 빌드 전용: `session_lookup_unsafe`, `session_lookup_hold`, `session_release`, `session_lock_report` |
+| `src/auth.h`, `src/auth.c` (신규) | `auth_init`(libsodium 초기화, 사용자 파일), `auth_handle_request`(`/login`, `/logout`, `/me`), `form_value`, `cookie_session_id`, `send_auth_response`, `check_password`. `AUTH_FD_DEMO`, `AUTH_WIDE_LOCK` 실험 분기 |
+| `src/http.c` | 303/401 추가, `http_response_header`에 `extra` 헤더 인자, `http_find_header` 신규, `equal_ci`를 양쪽 소문자 비교로 수정 |
+| `src/server.c` | `handle_request`에 인증 경로 분기, `-U`/`-I`/`-A`, accept 루프의 1초 주기 `session_expire`, 종료 시 `session_clear` |
+| `src/net.c` | `http_response_header` 인자 변경 반영 |
+| `tools/hashpw.c` (신규) | 사용자 파일용 argon2id 해시 생성 (비밀번호는 표준 입력으로) |
+| `Makefile` | libsodium 경로·링크, `build/hashpw`, 실험 빌드 4종(`server_fd_demo`, `server_narrow_lock`, `server_wide_lock`, `step2_uaf`) |
+| 테스트 | `tests/unit/test_session.c`(동시 접근 포함), 기능 테스트 6개, `tests/functional/users.txt`(테스트 계정) |
+| 실험 | `tests/experiments/step1_fd_reuse.py`, `step2_uaf.c`, `step3_proxy_auth.sh`, `step7_two_servers.sh`, `tests/bench/step2_lock_scope.sh` |
+
+### 10.2 기술 선택과 근거
+
+| 선택 | 대안 | 근거 |
+|---|---|---|
+| **libsodium** (argon2id `crypto_pwhash_str`, `randombytes_buf`, `sodium_memcmp`) | 직접 구현, POSIX `crypt()`, `/dev/urandom` | 지침: 검증된 해싱 라이브러리 사용, 직접 구현 금지. 과제 금지 목록은 "완성된 HTTP/이벤트 루프 라이브러리"이고 libsodium은 암호 라이브러리라 충돌하지 않음. `crypt()`는 macOS에서 DES뿐이라 부적합 |
+| Session ID = CSPRNG 256비트, 16진수 64자 | 순번, 시각, 사용자 이름 기반 | 추측 불가능해야 함. 형식이 틀리면 저장소를 뒤지기 전에 거절, 비교는 상수 시간 |
+| 연결 리스트 + mutex 1개 | 해시 테이블, 읽기/쓰기 락 | 학습용 규모에서 가장 단순. 조회는 O(n)이며, STEP 2 성능 측정은 Session 1개 상태에서만 했으므로 Session이 많을 때의 비용은 **미측정**(한계) |
+| 조회 결과는 **복사본**(SessionInfo) | 노드 포인터 반환 | 포인터는 락 밖에서 free될 수 있음 → STEP 2-2에서 ASan·Valgrind로 UAF 확인 |
+| 응답 생성·send는 락 밖(좁은 락) | 넓은 락 | STEP 2-3: c=8에서 처리량 -14%, 락 점유 34배 |
+| Active Expiration = accept 루프의 1초 주기 | 이벤트 루프 타이머, 전용 스레드 | **지침과의 차이**: 이 서버에는 이벤트 루프가 없음(스레드 풀). 이미 1초마다 깨어나는 `poll(1000ms)` 루프를 재사용하면 스레드를 늘리지 않음. 단, `queue_push`가 배압으로 멈추면 정리도 늦어짐 |
+| Cookie `HttpOnly; SameSite=Lax; Path=/`, **Secure 없음** | Secure 포함, SameSite=Strict | HTTP만 지원하므로 Secure를 붙이면 브라우저가 Cookie를 보내지 않음(STEP 5 TLS 미완료). Strict는 외부 링크로 들어올 때도 로그아웃 상태가 되어 사용성이 떨어짐 |
+| 인증 응답 `Cache-Control: no-store` | private, no-cache | 사용자별 응답이 어떤 캐시에도 저장되지 않게 함 |
+| 로그인마다 ID 재발급 + 이전 ID 삭제 | 기존 ID 유지 | Session 고정 공격 방지 |
+
+### 10.3 미완료 항목 (지침 대비)
+
+| 항목 | 상태 | 이유 / 다음 할 일 |
+|---|---|---|
+| STEP 4 확인 | ✅ 대부분 | 위조·변조·형식만 맞춘 ID, 상태를 담은 위조 Cookie 모두 401 (기능 테스트). 로그인 시 재발급 ✅ |
+| STEP 5 HttpOnly / SameSite | ✅ | Secure는 TLS 이후 |
+| STEP 5 CSRF 보호 범위 검증 | ❌ 미완료 | SameSite=Lax만 적용. 토큰 방식과 교차 사이트 요청 실험은 시간 부족 |
+| STEP 5 TLS, HTTP vs HTTPS 비교, 탈취 ID 재사용 실험 | ❌ 미완료 | TLS 종료 방식(OpenSSL 직접 vs 외부 계층) 결정과 검증 시간 부족. 프록시~백엔드 구간은 평문 |
+| STEP 6 TTL 개념도 | ❌ 미완료 | README에 서비스별 방향 표만 |
+| 로그인 실패 타이밍 | ⚠️ | 없는 사용자는 해시 검증을 건너뛰어 응답이 빠름 → 사용자 존재 여부가 시간으로 드러날 수 있음 |
+| 느린 클라이언트에서의 락 범위 비교 | ❌ 미실행 | STEP 2-3 해석 참고 |
