@@ -233,9 +233,16 @@ int proxy_forward(int client_fd, const HttpRequest *request, ProxyTable *table, 
     for (;;) {
         int ready = wait_backend_or_client_gone(backend_fd, client_fd);
         if (ready == -1) {
-            fprintf(stderr, "[proxy] client left while waiting for %s:%s, dropping request\n",
-                    backend->host, backend->port);
-            status = -1;
+            /*
+             * 아직 아무것도 중계하지 않았다면 응답을 받을 사람이 없으니 요청을 버립니다.
+             * 이미 중계했다면 보통 정상입니다: Connection: close 응답을 Content-Length만큼 다 읽은
+             * 클라이언트가 백엔드의 EOF보다 먼저 연결을 닫은 것이므로 상태 코드는 그대로 둡니다.
+             */
+            if (relayed == 0) {
+                fprintf(stderr, "[proxy] client left while waiting for %s:%s, dropping request\n",
+                        backend->host, backend->port);
+                status = -1;
+            }
             break;
         }
         ssize_t received;

@@ -16,7 +16,7 @@ SOURCES = src/http.c src/net.c src/static_file.c src/proxy.c
 HEADERS = $(wildcard src/*.h)
 UNIT_TESTS = build/test_http build/test_mime build/test_static build/test_net build/test_proxy
 
-.PHONY: all test unit functional asan clean
+.PHONY: all test unit functional asan tsan clean
 
 all: server
 
@@ -44,6 +44,11 @@ test: unit functional
 asan:
 	$(MAKE) clean
 	$(MAKE) test CFLAGS='-std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
+
+# ThreadSanitizer: 스레드 사이의 데이터 레이스 검사 (ASan과 동시에 켤 수 없어 따로 빌드)
+tsan:
+	$(MAKE) clean
+	$(MAKE) test CFLAGS='-std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -fno-omit-frame-pointer' LDFLAGS='-fsanitize=thread'
 
 clean:
 	rm -rf server build *.dSYM

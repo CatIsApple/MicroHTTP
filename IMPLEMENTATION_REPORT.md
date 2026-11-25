@@ -274,3 +274,21 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | `feat/kyle-thread-pool` | 스레드 풀, SIGINT/SIGTERM 셧다운, 배압 수정 |
 | `feat/kyle-reverse-proxy` | Reverse Proxy, Round-Robin, 502/504, curl 점검 |
 | `docs/kyle-learning-guide` | 이 보고서, CODE_FLOW.md, STUDY_GUIDE.md |
+| `fix/kyle-linux-realpath` | 품질 검증에서 찾은 결함 5건 수정, Linux 검증 스크립트, QUALITY_REPORT.md |
+| `feat/kyle-auth-step0-baseline` | 인증 과제 STEP 0: 베이스라인 측정 도구와 결과 (아래 9절) |
+
+---
+
+## 9. 인증 과제 STEP 0 — 베이스라인 확보 중 변경한 것
+
+인증 기능은 아직 넣지 않았습니다. 베이스라인을 정확히 재기 위해 필요한 것만 바꿨고, 측정 결과는 EXPERIMENT_REPORT.md에 있습니다.
+
+| 파일 / 함수 | 변경 | 이유 |
+|---|---|---|
+| `src/proxy.c` `proxy_forward` | "백엔드를 기다리는 중 클라이언트가 떠남"은 **아직 아무것도 중계하지 않았을 때만** 중단으로 처리 | 직전 수정(떠난 클라이언트 감지)의 오탐. 응답을 다 받은 클라이언트가 백엔드의 EOF보다 먼저 닫으면 `status=-1`과 "dropping request"로 잘못 기록됨 (hey 프록시 1000건 중 116건). 회귀 테스트 `test_proxy_client_closes_after_full_response_is_not_an_abort` — 수정 전 FAIL 확인 |
+| `tools/backend.py` | listen 대기열 5 → 128, `/api/linger` 경로 추가 | 시험용 백엔드가 c=10에서 연결을 끊어 프록시 502를 만들던 것(시험 도구가 병목). `/api/linger`는 위 오탐을 결정적으로 재현하기 위한 경로 |
+| `Makefile` `tsan` | ThreadSanitizer 빌드로 전체 테스트 | STEP 2의 동시성 실험에 필요. 베이스라인 시점의 TSan 결과를 먼저 남기기 위해 추가 |
+| `tests/functional/test_server.py` | 새니타이저 보고 검사에 `ThreadSanitizer` 추가 | 없으면 TSan 보고가 있어도 테스트가 통과함 |
+| `tests/bench/` | `baseline.sh`, `hey_stats.py`, `summarize.py` | 이후 STEP과 같은 조건으로 비교하기 위한 측정 도구 |
+
+**베이스라인 시점에 남긴 결함 (수정하지 않음)**: TSan이 `stop_requested` 데이터 레이스를 보고합니다(시그널 핸들러가 쓰고 작업 스레드가 읽음). 원인과 수정 계획은 EXPERIMENT_REPORT.md STEP 0에 있습니다.

@@ -509,6 +509,19 @@ def test_proxy_client_disconnects_midway(server):
     assert server.alive()
 
 
+def test_proxy_client_closes_after_full_response_is_not_an_abort(server):
+    """응답을 다 받은 클라이언트가 백엔드보다 먼저 연결을 닫는 것은 정상이다(상태 200으로 기록)."""
+    before = server.logs().count("client left while waiting")
+    with connect() as sock:
+        sock.sendall(b"GET /api/linger HTTP/1.1\r\nHost: a\r\n\r\n")
+        status, headers, body = read_response(sock)        # Content-Length만큼 다 읽음
+        assert status == 200 and b"/api/linger" in body
+    time.sleep(1.5)                                        # 백엔드가 늦게 닫을 때까지
+    logs = server.logs()
+    assert logs.count("client left while waiting") == before
+    assert '"GET /api/linger HTTP/1.1" status=200' in logs
+
+
 def test_proxy_frees_worker_when_client_leaves(server):
     """느린 백엔드를 기다리던 클라이언트들이 떠나면 작업 스레드가 바로 풀려야 한다.
     스레드(8)의 두 배인 16개를 보내고 모두 끊는다. 감지하지 못하면 스레드가 백엔드 타임아웃(5초)씩
@@ -551,8 +564,8 @@ def main():
                 print(server.logs()[-3000:])
                 server.stop()
                 server = Server(*PROXY_ARGS)
-        # 새니타이저 빌드(make asan)에서 서버 로그에 메모리 오류나 UB 보고가 있으면 실패로 처리
-        for marker in ("AddressSanitizer", "LeakSanitizer", "runtime error:"):
+        # 새니타이저 빌드(make asan / make tsan)에서 서버 로그에 메모리 오류, 데이터 레이스, UB 보고가 있으면 실패로 처리
+        for marker in ("AddressSanitizer", "LeakSanitizer", "ThreadSanitizer", "runtime error:"):
             if marker in server.logs():
                 failures += 1
                 print(f"FAIL sanitizer report in server log: {marker}")
