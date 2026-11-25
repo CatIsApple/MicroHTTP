@@ -116,7 +116,7 @@ int main(void)
     {
         feed f = {.pre = "GET / HTTP/1.1\r\nHost: a\r\n\r\nBODY"};
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, sizeof(buf), 1000, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 1000, &hl);
         CHECK_INT(n, (long long)REQ_LEN + 4);
         CHECK_INT(hl, REQ_LEN);
         CHECK_INT(buf[n], '\0');                              /* 항상 NUL 종료 */
@@ -127,7 +127,7 @@ int main(void)
     for (size_t k = REQ_LEN - 3; k < REQ_LEN; k++) {
         feed f = {.pre = REQ, .pre_len = k, .later = REQ + k, .delay_ms = 50};
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, sizeof(buf), 1000, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 1000, &hl);
         CHECK_INT(n, (long long)REQ_LEN);
         CHECK_INT(hl, REQ_LEN);                               /* 쪼개져도 헤더 끝을 찾아야 함 */
         end_feed(fd, pid);
@@ -137,7 +137,7 @@ int main(void)
     {
         feed f = {.pre = "GET / HTTP/1.1\r\n", .later = "Host: a\r\n\r\n", .delay_ms = 5, .drip = 1};
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, sizeof(buf), 2000, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 2000, &hl);
         CHECK_INT(n, (long long)REQ_LEN);
         CHECK_INT(hl, REQ_LEN);
         end_feed(fd, pid);
@@ -147,7 +147,7 @@ int main(void)
     {
         feed f = {.pre = "GET / HTTP/1.1\r\nHost: a\r\n"};      /* 빈 줄 없이 EOF */
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, sizeof(buf), 1000, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 1000, &hl);
         CHECK_INT(n, 25);                                     /* 받은 만큼은 돌려줌 */
         CHECK_INT(hl, 0);                                     /* 헤더 끝 못 찾음 → 호출자가 400 */
         end_feed(fd, pid);
@@ -157,7 +157,7 @@ int main(void)
     {
         feed f = {0};
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, sizeof(buf), 1000, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 1000, &hl);
         CHECK_INT(n, 0);
         CHECK_INT(hl, 0);
         end_feed(fd, pid);
@@ -167,7 +167,7 @@ int main(void)
     {
         feed f = {.pre = "GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\n", .hold_ms = 2000};
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, 16, 1000, &hl);
+        n = tcp_recv_request(fd, buf, 16, 0, 1000, &hl);
         CHECK_INT(n, 15);                                     /* 마지막 1바이트는 '\0' 자리 */
         CHECK_INT(hl, 0);
         CHECK_INT(buf[15], '\0');
@@ -178,13 +178,13 @@ int main(void)
     {
         feed f = {.pre = REQ, .hold_ms = 2000};
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, REQ_LEN + 1, 1000, &hl);
+        n = tcp_recv_request(fd, buf, REQ_LEN + 1, 0, 1000, &hl);
         CHECK_INT(n, (long long)REQ_LEN);
         CHECK_INT(hl, REQ_LEN);
         end_feed(fd, pid);
 
         fd = start_feed(&f, &pid);
-        n = tcp_recv_request(fd, buf, REQ_LEN, 1000, &hl);
+        n = tcp_recv_request(fd, buf, REQ_LEN, 0, 1000, &hl);
         CHECK_INT(n, (long long)REQ_LEN - 1);
         CHECK_INT(hl, 0);
         end_feed(fd, pid);
@@ -196,7 +196,7 @@ int main(void)
         fd = start_feed(&f, &pid);
         long long t0 = now_ms();
         errno = 0;
-        n = tcp_recv_request(fd, buf, sizeof(buf), 200, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 200, &hl);
         long long dt = now_ms() - t0;
         CHECK_INT(n, -1);
         CHECK_INT(errno, ETIMEDOUT);
@@ -211,7 +211,7 @@ int main(void)
         fd = start_feed(&f, &pid);
         long long t0 = now_ms();
         errno = 0;
-        n = tcp_recv_request(fd, buf, sizeof(buf), 300, &hl);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 0, 300, &hl);
         long long dt = now_ms() - t0;
         CHECK_INT(n, -1);
         CHECK_INT(errno, ETIMEDOUT);
@@ -220,7 +220,88 @@ int main(void)
     }
 
     /* cap 0 → -1 */
-    CHECK_INT(tcp_recv_request(-1, buf, 0, 100, &hl), -1);
+    CHECK_INT(tcp_recv_request(-1, buf, 0, 0, 100, &hl), -1);
+
+    /* ==== tcp_recv_request: 이미 받은 바이트(파이프라이닝 잔여) 이어받기 ==== */
+
+    /* 잔여 안에 헤더가 통째로 있음 → 상대가 아무것도 안 보내고 버텨도 즉시 반환 (뒤의 꼬리도 그대로) */
+    {
+        feed f = {.hold_ms = 2000};                           /* 아무것도 안 보내고 연결만 유지 */
+        fd = start_feed(&f, &pid);
+        memcpy(buf, REQ, REQ_LEN);                            /* 잔여 = 요청 하나 + 다음 요청 앞부분 "GE" */
+        memcpy(buf + REQ_LEN, "GE", 2);
+        long long t0 = now_ms();
+        n = tcp_recv_request(fd, buf, sizeof(buf), REQ_LEN + 2, 1000, &hl);
+        CHECK_INT(n, (long long)REQ_LEN + 2);                 /* 받은 것 없음: 잔여 그대로 */
+        CHECK_INT(hl, REQ_LEN);
+        CHECK_INT(buf[n], '\0');
+        CHECK(now_ms() - t0 < 100);                           /* 기다리지 않음 */
+        end_feed(fd, pid);
+    }
+
+    /* 잔여에 '\0' 이 섞여 있어도 그 뒤의 헤더 끝을 찾는다 (strstr 이면 멈춤) */
+    {
+        feed f = {.hold_ms = 2000};
+        fd = start_feed(&f, &pid);
+        memcpy(buf, "X\0Y\r\n\r\n", 7);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 7, 1000, &hl);
+        CHECK_INT(n, 7);
+        CHECK_INT(hl, 7);
+        end_feed(fd, pid);
+    }
+
+    /* 잔여는 헤더 일부뿐 → 나머지를 받아 정확한 header_len */
+    {
+        feed f = {.later = "Host: a\r\n\r\n", .delay_ms = 50};
+        fd = start_feed(&f, &pid);
+        memcpy(buf, "GET / HTTP/1.1\r\n", 16);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 16, 1000, &hl);
+        CHECK_INT(n, (long long)REQ_LEN);
+        CHECK_INT(hl, REQ_LEN);
+        CHECK(memcmp(buf, REQ, REQ_LEN) == 0);                /* 잔여 뒤에 이어 붙음 */
+        end_feed(fd, pid);
+    }
+
+    /* 잔여가 헤더 경계에 걸침: 잔여 "...\r\n\r" + 새로 "\n" (겹침 검색 검증) */
+    {
+        feed f = {.later = "\nBODY", .delay_ms = 50};
+        fd = start_feed(&f, &pid);
+        memcpy(buf, REQ, REQ_LEN - 1);                        /* 마지막 '\n' 만 빠짐 */
+        n = tcp_recv_request(fd, buf, sizeof(buf), REQ_LEN - 1, 1000, &hl);
+        CHECK_INT(n, (long long)REQ_LEN + 4);
+        CHECK_INT(hl, REQ_LEN);
+        end_feed(fd, pid);
+    }
+
+    /* 잔여만으로 꽉 참 (cap-1) + 헤더 끝 없음 → 수신 없이 header_len 0 (호출자가 431) */
+    {
+        feed f = {.hold_ms = 2000};
+        fd = start_feed(&f, &pid);
+        memset(buf, 'a', 15);
+        long long t0 = now_ms();
+        n = tcp_recv_request(fd, buf, 16, 15, 1000, &hl);
+        CHECK_INT(n, 15);
+        CHECK_INT(hl, 0);
+        CHECK_INT(buf[15], '\0');
+        CHECK(now_ms() - t0 < 100);
+        end_feed(fd, pid);
+    }
+
+    /* 잔여가 cap-1 을 넘으면 잘못된 인자 */
+    errno = 0;
+    CHECK_INT(tcp_recv_request(-1, buf, 16, 16, 100, &hl), -1);
+    CHECK_INT(errno, EINVAL);
+
+    /* 잔여 일부 + 상대가 닫음 → 잔여 길이 반환, header_len 0 (호출자가 400) */
+    {
+        feed f = {0};
+        fd = start_feed(&f, &pid);
+        memcpy(buf, "GET /", 5);
+        n = tcp_recv_request(fd, buf, sizeof(buf), 5, 1000, &hl);
+        CHECK_INT(n, 5);
+        CHECK_INT(hl, 0);
+        end_feed(fd, pid);
+    }
 
     /* ==== tcp_recv_exact ==== */
 

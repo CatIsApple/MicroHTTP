@@ -48,12 +48,17 @@ int tcp_sendfile_all(int sock, const void *head, size_t head_len,
                      int file_fd, off_t offset, size_t len, int timeout_ms);
 
 /* 요청 헤더 끝("\r\n\r\n") 또는 EOF 또는 버퍼가 찰 때까지 수신.
+ * used: buf[0..used) 에 이미 있는 바이트 수 (keep-alive 에서 이전 요청 뒤에 딸려 온 파이프라이닝 잔여. 새 연결은 0).
+ *   먼저 그 구간에서 헤더 끝을 찾고, 있으면 시스템콜 없이 바로 반환한다 (상대가 더 안 보내도 기다리지 않음).
+ *   없으면 그 뒤에 이어 받는다 (검색은 새로 받은 구간 + 앞 3바이트 겹침만).
+ *   used >= cap-1 (이미 꽉 참) 인데 헤더 끝이 없으면 받지 않고 header_len 0 으로 반환 (→ 호출자가 431).
  * timeout_ms 는 호출 "전체" 의 마감 시간(천천히 보내는 클라이언트 대비).
- * 반환: 읽은 바이트 수(>=0), 오류·초과 시 -1 (초과 시 errno = ETIMEDOUT).
+ * 반환: buf 에 든 총 바이트 수(잔여 포함, >=0. 잔여 없이 상대가 바로 닫으면 0),
+ *       오류·초과 시 -1 (초과 시 errno = ETIMEDOUT, cap 0 이거나 used > cap-1 이면 EINVAL).
  * *header_len: 헤더 끝(빈 줄 포함)까지의 길이. 헤더 끝을 못 찾았으면 0
  *   → 버퍼가 가득 찼다면 헤더가 너무 큰 것, 아니면 상대가 도중에 닫은 것.
- * buf 는 항상 NUL 종료된다. */
-ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len); /* cap: buf 크기 */
+ * buf 는 항상 NUL 종료된다 (buf[반환값] == '\0'). */
+ssize_t tcp_recv_request(int fd, char *buf, size_t cap, size_t used, int timeout_ms, size_t *header_len); /* cap: buf 크기 */
 
 /* 정확히 len 바이트를 받을 때까지 반복 recv() (본문 수신용).
  * timeout_ms 는 호출 "전체" 의 마감 시간. 성공 0, 실패 -1

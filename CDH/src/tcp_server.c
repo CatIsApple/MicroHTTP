@@ -438,14 +438,35 @@ int tcp_sendfile_all(int sock, const void *head, size_t head_len,
 #endif
 }
 
-ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *header_len) /* HTTP 헤더 끝까지 받기 */
+/* buf[from, to) 에서 "\r\n\r\n" 을 찾는다. 있으면 빈 줄까지 포함한 헤더 길이, 없으면 0.
+ * strstr 대신 길이 기반: 이전 요청이 남긴 바이트에 '\0' 이 섞여 있어도 검색이 중간에 멈추지 않게 */
+static size_t find_header_end(const char *buf, size_t from, size_t to)
 {
-    *header_len = 0;  /* 기본값: 헤더 끝을 아직 못 찾음 */
-    if (cap == 0)     /* 버퍼 크기가 0 이면 NUL 문자조차 못 넣음 */
-        return -1;    /* 잘못된 인자 */
+    for (size_t i = from; i + 4 <= to; i++)                     /* 4바이트 창을 한 칸씩 민다 */
+        if (memcmp(buf + i, "\r\n\r\n", 4) == 0)                /* 빈 줄(CRLF 두 번) */
+            return i + 4;                                       /* 빈 줄까지 포함한 길이 */
+    return 0;                                                   /* 못 찾음 */
+}
 
-    size_t used = 0;                            /* 지금까지 buf 에 받은 바이트 수 */
-    buf[0] = '\0';                              /* 빈 문자열로 시작 (아무것도 못 받아도 문자열로 안전) */
+ssize_t tcp_recv_request(int fd, char *buf, size_t cap, size_t used, int timeout_ms, size_t *header_len) /* HTTP 헤더 끝까지 받기 */
+{
+    *header_len = 0;                  /* 기본값: 헤더 끝을 아직 못 찾음 */
+    if (cap == 0 || used > cap - 1) { /* NUL 자리조차 없음 / 이미 받은 양이 버퍼를 넘음 (호출자 버그) */
+        errno = EINVAL;               /* 잘못된 인자 */
+        return -1;
+    }
+
+    /* keep-alive 파이프라이닝: 이전 요청 뒤에 딸려 온 바이트가 buf[0..used) 에 이미 있다.
+     * 그 안에 다음 요청 헤더가 통째로 있으면 시스템콜 없이 바로 돌려준다 (상대가 더 안 보내도 기다리지 않음) */
+    buf[used] = '\0';                                  /* 문자열로도 안전하게 (잔여가 없으면 빈 문자열) */
+    size_t end = find_header_end(buf, 0, used);        /* 잔여 전체에서 헤더 끝 찾기 */
+    if (end != 0) {                                    /* 이미 다 와 있음 */
+        *header_len = end;                             /* 빈 줄까지 포함한 헤더 길이 */
+        return (ssize_t)used;                          /* 수신 없이 반환 */
+    }
+    if (used >= cap - 1)                               /* 이미 꽉 찼는데 헤더 끝이 없음 */
+        return (ssize_t)used;                          /* header_len 0 → 호출자가 431 */
+
     long long deadline = now_ms() + timeout_ms; /* 요청 수신 전체의 마감 시각 */
 
     /* TCP 는 바이트 스트림이라 한 번의 recv 로 요청이 다 온다는 보장이 없다.
@@ -462,18 +483,18 @@ ssize_t tcp_recv_request(int fd, char *buf, size_t cap, int timeout_ms, size_t *
         if (n == 0) /* 상대가 연결을 닫음 */
             break;  /* 받은 데이터까지만 가지고 나감 (헤더 끝을 못 찾았으면 header_len 은 0) */
 
-        /* 새로 받은 구간만 검사한다. 단 "\r\n\r\n" 이 이전 데이터와 걸칠 수
-         * 있으므로 3바이트 앞부터. (매번 처음부터 strstr 하면 O(n^2)) */
+        /* 새로 받은 구간만 검사한다. 단 "\r\n\r\n" 이 이전 데이터(잔여 포함)와 걸칠 수
+         * 있으므로 3바이트 앞부터. (매번 처음부터 찾으면 O(n^2)) */
         size_t scan_from = used >= 3 ? used - 3 : 0;  /* 검색 시작 위치: 직전까지 받은 끝에서 3바이트 앞 (앞쪽이 3바이트 미만이면 0) */
         used += (size_t)n;                            /* 받은 바이트 수 누적 */
-        buf[used] = '\0';                             /* 문자열 끝 표시 → strstr 같은 문자열 함수를 쓸 수 있음 */
-        char *end = strstr(buf + scan_from, "\r\n\r\n"); /* 헤더 끝 = 빈 줄(CRLF 두 번)을 찾음 */
-        if (end != NULL) {                            /* 찾았으면 */
-            *header_len = (size_t)(end - buf) + 4; /* 빈 줄까지 포함한 헤더 길이 */
+        buf[used] = '\0';                             /* 문자열 끝 표시 → 호출자가 문자열 함수를 써도 안전 */
+        end = find_header_end(buf, scan_from, used);  /* 헤더 끝 = 빈 줄(CRLF 두 번)을 찾음 */
+        if (end != 0) {                               /* 찾았으면 */
+            *header_len = end;                        /* 빈 줄까지 포함한 헤더 길이 */
             break;                                    /* 헤더를 다 받았으니 수신 종료 */
         }
     }
-    return (ssize_t)used; /* 받은 총 바이트 수 (헤더 뒤 본문 일부가 섞여 있을 수 있음) */
+    return (ssize_t)used; /* buf 의 총 바이트 수 (잔여 포함. 헤더 뒤 본문·다음 요청 일부가 섞여 있을 수 있음) */
 }
 
 int tcp_recv_exact(int fd, void *buf, size_t len, int timeout_ms) /* 정확히 len 바이트를 받을 때까지 반복 수신 */

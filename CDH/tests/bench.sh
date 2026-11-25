@@ -45,9 +45,14 @@ done
 echo "server: $BIN (pid $pid), port $PORT, ${DUR}s per run, $(nproc 2>/dev/null || sysctl -n hw.ncpu) cpus"
 printf "%-14s %5s %10s %9s %8s %8s %8s %8s %8s %6s\n" path conc "req/s" "MB/s" avg_ms p50_ms p99_ms max_ms ok fail
 status=0
-for p in $PATHS; do
-    for c in $CONCS; do
-        "$BENCH" -c "$c" -d "$DUR" -p "$PORT" "$p" || status=1   # 실패 요청이 있으면 종료 코드 2
+for mode in close keep; do                                       # 요청마다 새 연결 / keep-alive 재사용
+    echo "[$mode]"
+    k=""
+    [ "$mode" = keep ] && k="-k"
+    for p in $PATHS; do
+        for c in $CONCS; do
+            "$BENCH" $k -c "$c" -d "$DUR" -p "$PORT" "$p" || status=1   # 실패 요청이 있으면 종료 코드 2
+        done
     done
 done
 

@@ -3,7 +3,9 @@
  * curl 로 손으로 확인하던 것을 자동화한 것. 외부 도구(curl, nc) 없이 소켓으로 직접 보내서
  * macOS / Linux 어디서나 같은 결과가 나오게 했다. 단위 테스트가 못 보는 main.c 의 흐름
  * (정적 파일 200/301/304/403/404·HEAD·큰 파일, 431, 반쯤 닫힌 요청 400, echo, 100-continue,
- *  비정상 종료 뒤 생존, SIGINT 종료) 을 검사한다. 문서 루트는 임시 디렉터리에 만들어 -r 로 넘긴다.
+ *  비정상 종료 뒤 생존, keep-alive·파이프라이닝·쉬는 연결 타임아웃·쉬는 연결이 워커를 안 잡는지,
+ *  쉬는 연결이 있는 채 SIGINT 종료) 을 검사한다. 문서 루트는 임시 디렉터리에 만들어 -r 로 넘긴다.
+ * 서버는 세 번 띄운다: 기본 설정 / -t 2 -i 300 (쉬는 시간 타임아웃) / -t 2 (쉬는 연결 50개).
  *
  * 서버 경로: 환경 변수 MICROHTTP_BIN (기본 "./microhttp"). make test 가 먼저 빌드해 둔다. */
 
@@ -78,8 +80,8 @@ static unsigned free_port(void)
     return ntohs(a.sin_port);
 }
 
-/* 서버 실행 후 접속될 때까지 대기. 성공 0 */
-static int start_server(const char *bin)
+/* 서버 실행 후 접속될 때까지 대기. 성공 0. threads / idle_ms 가 NULL 이 아니면 -t / -i 로 넘김 */
+static int start_server(const char *bin, const char *threads, const char *idle_ms)
 {
     unsigned port = free_port();
     memset(&g_addr, 0, sizeof(g_addr));
@@ -94,7 +96,23 @@ static int start_server(const char *bin)
         int dn = open("/dev/null", O_WRONLY);
         dup2(dn, 1);
         dup2(dn, 2);
-        execl(bin, bin, "-q", "-r", g_root, ps, (char *)NULL);
+        char *args[12];                          /* bin -q -r root [-t n] [-i ms] port NULL */
+        int k = 0;
+        args[k++] = (char *)bin;
+        args[k++] = "-q";
+        args[k++] = "-r";
+        args[k++] = g_root;
+        if (threads) {
+            args[k++] = "-t";
+            args[k++] = (char *)threads;
+        }
+        if (idle_ms) {
+            args[k++] = "-i";
+            args[k++] = (char *)idle_ms;
+        }
+        args[k++] = ps;
+        args[k] = NULL;
+        execv(bin, args);
         _Exit(127);                              /* exec 실패 (경로 틀림 등) */
     }
     for (int i = 0; i < 300; i++) {              /* 최대 3초 동안 접속 시도 */
@@ -115,7 +133,55 @@ static char g_resp[4 * 1024 * 1024]; /* 마지막 응답 (큰 파일 테스트�
 static size_t g_len;            /* 마지막 응답 길이 */
 static int g_read_err;          /* 읽다가 오류(ECONNRESET 등)가 났으면 errno, 아니면 0 */
 
-/* 요청을 보내고 서버가 닫을 때까지 응답을 전부 받는다. half_close: 보낸 뒤 송신 방향 닫기 (FIN) */
+/* buf[0..len) 의 맨 앞 응답 하나가 다 왔으면 그 전체 길이, 아직(또는 길이를 모름)이면 0.
+ * head_req: HEAD 요청에 대한 응답 (본문 없음). 204 / 304 도 본문 없음 */
+static size_t resp_len(const char *buf, size_t len, int head_req)
+{
+    const char *e = NULL;
+    for (size_t i = 0; i + 4 <= len && e == NULL; i++)        /* 머리 끝 */
+        if (memcmp(buf + i, "\r\n\r\n", 4) == 0)
+            e = buf + i;
+    if (e == NULL)
+        return 0;
+    size_t hl = (size_t)(e - buf) + 4;
+    int st = len >= 12 ? (int)strtol(buf + 9, NULL, 10) : 0;  /* "HTTP/1.1 200" */
+    size_t cl = 0;
+    if (!head_req && st != 204 && st != 304) {
+        const char *c = NULL;                                 /* 머리 안의 Content-Length */
+        for (const char *p = buf; p + 18 <= e && c == NULL; p++)
+            if (memcmp(p, "\r\nContent-Length: ", 18) == 0)
+                c = p + 18;
+        if (c == NULL)
+            return 0;                                         /* 길이를 모름 → EOF 까지 */
+        cl = (size_t)strtoull(c, NULL, 10);
+    }
+    return len >= hl + cl ? hl + cl : 0;
+}
+
+/* fd 에서 응답을 받아 g_resp 에. 상대가 닫을 때(EOF·오류)까지 읽되,
+ * stop: 0 = "Connection: keep-alive" 응답이 다 왔을 때만 멈춤 (close 응답은 EOF 까지 읽어서 RST 여부까지 본다)
+ *       1 = 응답 하나가 다 오면 멈춤 / 2 = 멈추지 않고 EOF 까지 (파이프라이닝 응답 여러 개) */
+static void read_resp(int fd, int head_req, int stop)
+{
+    g_len = 0;
+    g_resp[0] = '\0';
+    g_read_err = 0;
+    for (;;) {
+        ssize_t r = read(fd, g_resp + g_len, sizeof(g_resp) - 1 - g_len);
+        if (r < 0)
+            g_read_err = errno;
+        if (r <= 0)
+            break;
+        g_len += (size_t)r;
+        g_resp[g_len] = '\0';
+        if (stop != 2 && resp_len(g_resp, g_len, head_req) != 0 &&           /* 2: 무조건 EOF 까지 (파이프라이닝) */
+            (stop == 1 || strstr(g_resp, "\r\nConnection: keep-alive\r\n") != NULL))
+            break;
+    }
+    g_resp[g_len] = '\0';
+}
+
+/* 요청을 보내고 응답을 받는다 (close 응답이면 서버가 닫을 때까지). half_close: 보낸 뒤 송신 방향 닫기 (FIN) */
 static void exchange(const char *req, size_t len, int half_close)
 {
     g_len = 0;
@@ -129,15 +195,7 @@ static void exchange(const char *req, size_t len, int half_close)
     write_all(fd, req, len);
     if (half_close)
         shutdown(fd, SHUT_WR);
-    for (;;) {
-        ssize_t r = read(fd, g_resp + g_len, sizeof(g_resp) - 1 - g_len);
-        if (r < 0)
-            g_read_err = errno;
-        if (r <= 0)
-            break;
-        g_len += (size_t)r;
-    }
-    g_resp[g_len] = '\0';
+    read_resp(fd, len >= 5 && memcmp(req, "HEAD ", 5) == 0, 0);
     close(fd);
 }
 
@@ -186,6 +244,8 @@ static const char *header(const char *name)
     return (h && b && h < b) ? h + strlen(key) : NULL;
 }
 
+/* 응답 형식 검사: Content-Length 가 실제 본문 길이와 같고, Connection 헤더가 있고, 오류 없이 받음
+ * (keep-alive 가 생긴 뒤로 정상 응답은 keep-alive, 오류 응답은 close — 그건 is_close / is_keep 으로 따로 본다) */
 static int framing_ok(void)
 {
     const char *b = body();
@@ -193,7 +253,70 @@ static int framing_ok(void)
     if (b == NULL || cl == NULL || cl > b || g_read_err != 0)
         return 0;
     size_t want = (size_t)strtoull(cl + 18, NULL, 10);
-    return want == g_len - (size_t)(b - g_resp) && strstr(g_resp, "\r\nConnection: close\r\n") < b;
+    const char *conn = header("Connection");
+    return want == g_len - (size_t)(b - g_resp) && conn != NULL &&
+           (strncmp(conn, "close\r\n", 7) == 0 || strncmp(conn, "keep-alive\r\n", 12) == 0);
+}
+
+static int is_close(void) /* 응답 머리가 Connection: close */
+{
+    const char *conn = header("Connection");
+    return conn != NULL && strncmp(conn, "close\r\n", 7) == 0;
+}
+
+static int is_keep(void) /* 응답 머리가 Connection: keep-alive */
+{
+    const char *conn = header("Connection");
+    return conn != NULL && strncmp(conn, "keep-alive\r\n", 12) == 0;
+}
+
+/* SIGINT 를 보내고 limit_ms 안에 종료 코드 0 으로 끝나는지. 안 끝나면 강제 종료 */
+static int stop_server(int limit_ms)
+{
+    kill(g_server, SIGINT);
+    int st = 0, done = 0;
+    for (int i = 0; i < limit_ms / 10 && !done; i++) {
+        if (waitpid(g_server, &st, WNOHANG) == g_server)
+            done = 1;
+        else
+            sleep_ms(10);
+    }
+    if (!done) {                                          /* 안 죽었으면 강제 종료 */
+        fprintf(stderr, "server did not exit within %d ms\n", limit_ms);
+        kill(g_server, SIGKILL);
+        waitpid(g_server, NULL, 0);
+    }
+    g_server = -1;
+    return done && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* 같은 연결에 요청 하나를 보내고 응답 하나를 받는다 (keep-alive 연결용) */
+static void send_on(int fd, const char *req)
+{
+    write_all(fd, req, strlen(req));
+    read_resp(fd, strncmp(req, "HEAD ", 5) == 0, 1);
+}
+
+/* keep-alive 연결 n 개를 열어 각각 GET 하나씩 보내고 응답을 받은 채 둔다. 성공한 개수 */
+static int open_idle(int *fds, int n)
+{
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        fds[i] = connect_server();
+        if (fds[i] < 0)
+            continue;
+        send_on(fds[i], "GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+        if (status() == 200 && is_keep())
+            ok++;
+    }
+    return ok;
+}
+
+static void close_all(int *fds, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (fds[i] >= 0)
+            close(fds[i]);
 }
 
 int main(void)
@@ -223,7 +346,7 @@ int main(void)
         big[i] = (char)(i * 31 + (i >> 12));
     put_file("big.bin", big, big_len);
 
-    if (start_server(bin) != 0) {
+    if (start_server(bin, NULL, NULL) != 0) {
         fprintf(stderr, "cannot start server: %s (run `make` first)\n", bin);
         return 1;
     }
@@ -357,11 +480,7 @@ int main(void)
         ssize_t r = read(fd, c100, 25);                   /* "HTTP/1.1 100 Continue\r\n\r\n" = 25 */
         CHECK(r == 25 && strcmp(c100, "HTTP/1.1 100 Continue\r\n\r\n") == 0);
         write_all(fd, "wxyz", 4);
-        g_len = 0;
-        while ((r = read(fd, g_resp + g_len, sizeof(g_resp) - 1 - g_len)) > 0)
-            g_len += (size_t)r;
-        g_resp[g_len] = '\0';
-        g_read_err = r < 0 ? errno : 0;
+        read_resp(fd, 0, 1);                              /* 응답 하나 (keep-alive 라 서버는 안 닫음) */
         close(fd);
         CHECK_INT(status(), 200);
         CHECK(framing_ok());
@@ -384,6 +503,7 @@ int main(void)
         send_str(BAD[i].req);
         CHECK_INT(status(), BAD[i].code);
         CHECK(framing_ok());
+        CHECK(is_close());                                /* 오류 응답은 항상 close */
         char want[64];
         snprintf(want, sizeof(want), "%d ", BAD[i].code);
         CHECK(body() && strncmp(body(), want, strlen(want)) == 0); /* 본문 "<코드> <이유>\n" */
@@ -428,7 +548,7 @@ int main(void)
     /* 응답 뒤에 안 읽힌 바이트가 남아도 응답이 RST 로 잘리지 않음 (tcp_close_graceful) */
     {
         static char req[20000];
-        int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"); /* close 경로 */
         memset(req + n, 'x', 16000);
         exchange(req, (size_t)n + 16000, 0);
         CHECK_INT(status(), 200);
@@ -451,22 +571,159 @@ int main(void)
         CHECK_INT(status(), 200);                         /* 다음 요청은 정상 처리 */
     }
 
-    /* ---- SIGINT → 정상 종료 (종료 코드 0) ---- */
+    /* ---- keep-alive ---- */
+
+    /* 한 연결에서 GET 두 번 순차: 둘 다 200, 첫 응답은 keep-alive (Content-Length 만큼만 읽고 다음 요청) */
     {
-        kill(g_server, SIGINT);
-        int st = 0, done = 0;
-        for (int i = 0; i < 300 && !done; i++) {          /* 최대 3초 */
-            if (waitpid(g_server, &st, WNOHANG) == g_server)
-                done = 1;
-            else
-                sleep_ms(10);
+        int fd = connect_server();
+        CHECK(fd >= 0);
+        send_on(fd, "GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+        CHECK_INT(status(), 200);
+        CHECK(framing_ok());
+        CHECK(is_keep());
+        CHECK_STR(body(), "body{}");
+        send_on(fd, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");     /* 같은 연결로 두 번째 */
+        CHECK_INT(status(), 200);
+        CHECK(framing_ok());
+        CHECK_STR(body(), INDEX);
+        send_on(fd, "HEAD /style.css HTTP/1.1\r\nHost: t\r\n\r\n"); /* HEAD 도 keep-alive (본문 없음) */
+        CHECK_INT(status(), 200);
+        CHECK(is_keep());
+        CHECK(body() && *body() == '\0');
+        send_on(fd, "GET /nope HTTP/1.1\r\nHost: t\r\n\r\n");  /* 404 는 요청을 끝까지 읽은 정상 응답 → 연결 유지 */
+        CHECK_INT(status(), 404);
+        CHECK(framing_ok());
+        CHECK(is_keep());
+        CHECK_STR(body(), "404 Not Found\n");
+        send_on(fd, "GET /nope HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"); /* 클라가 close 요청 */
+        CHECK_INT(status(), 404);
+        CHECK(is_close());
+        char c;
+        CHECK(read(fd, &c, 1) == 0);                          /* 서버가 닫음 */
+        close(fd);
+    }
+
+    /* 파이프라이닝: GET 두 개를 한 번에 → 응답 두 개가 순서대로 (두 번째가 close 라 서버가 닫음) */
+    {
+        int fd = connect_server();
+        CHECK(fd >= 0);
+        const char *two = "GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n"
+                          "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        write_all(fd, two, strlen(two));
+        read_resp(fd, 0, 2);                                  /* EOF 까지 (두 응답 모두) */
+        close(fd);
+        CHECK(g_read_err == 0);
+        size_t first = resp_len(g_resp, g_len, 0);
+        CHECK(first > 0);
+        CHECK_INT(status(), 200);
+        CHECK(is_keep());
+        CHECK(first > 6 && memcmp(g_resp + first - 6, "body{}", 6) == 0);
+        if (first > 0 && first < g_len) {                     /* 두 번째 응답만 앞으로 당겨서 같은 검사 */
+            memmove(g_resp, g_resp + first, g_len - first + 1);
+            g_len -= first;
+            CHECK_INT(status(), 200);
+            CHECK(framing_ok());                              /* 남은 길이 = 정확히 응답 하나 */
+            CHECK(is_close());
+            CHECK_STR(body(), INDEX);
+        } else {
+            CHECK(!"second pipelined response missing");
         }
-        CHECK(done);
-        CHECK(done && WIFEXITED(st) && WEXITSTATUS(st) == 0);
-        if (!done) {                                      /* 안 죽었으면 강제 종료 */
-            kill(g_server, SIGKILL);
-            waitpid(g_server, NULL, 0);
+    }
+
+    /* 파이프라이닝 + 본문: POST(본문 3바이트) 바로 뒤에 GET → 본문 뒤 잔여가 다음 요청으로 */
+    {
+        int fd = connect_server();
+        CHECK(fd >= 0);
+        const char *two = "POST /p HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc"
+                          "GET /style.css HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        write_all(fd, two, strlen(two));
+        read_resp(fd, 0, 2);                                  /* EOF 까지 */
+        close(fd);
+        size_t first = resp_len(g_resp, g_len, 0);
+        CHECK_INT(status(), 200);
+        CHECK(first > 3 && memcmp(g_resp + first - 3, "abc", 3) == 0); /* echo 본문 끝 = abc */
+        if (first > 0 && first < g_len) {
+            memmove(g_resp, g_resp + first, g_len - first + 1);
+            g_len -= first;
+            CHECK_INT(status(), 200);
+            CHECK(framing_ok());
+            CHECK_STR(body(), "body{}");
+        } else {
+            CHECK(!"response after POST missing");
         }
+    }
+
+    /* Connection: close 요청 → close 응답 뒤 서버가 닫음 (exchange 는 EOF 까지 읽음, 오류·타임아웃 없어야 함) */
+    send_str("GET /style.css HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    CHECK_INT(status(), 200);
+    CHECK(framing_ok());
+    CHECK(is_close());
+
+    /* HTTP/1.0 (keep-alive 헤더 없음) → close / HTTP/1.0 + Connection: keep-alive → 유지 */
+    send_str("GET /style.css HTTP/1.0\r\n\r\n");
+    CHECK_INT(status(), 200);
+    CHECK(framing_ok());
+    CHECK(is_close());
+    {
+        int fd = connect_server();
+        CHECK(fd >= 0);
+        send_on(fd, "GET /style.css HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+        CHECK_INT(status(), 200);
+        CHECK(is_keep());
+        send_on(fd, "GET /style.css HTTP/1.0\r\n\r\n");
+        CHECK_INT(status(), 200);
+        CHECK(is_close());
+        close(fd);
+    }
+
+    /* ---- SIGINT → 정상 종료 (종료 코드 0): keep-alive 로 쉬는 연결이 열려 있어도 2초 안에 ---- */
+    {
+        int fds[8];
+        CHECK_INT(open_idle(fds, 8), 8);
+        CHECK(stop_server(2000));
+        close_all(fds, 8);
+    }
+
+    /* ---- 쉬는 연결 타임아웃: -i 300 → 응답 뒤 아무것도 안 보내면 ~0.3초 뒤 서버가 닫음 ---- */
+    if (start_server(bin, "2", "300") != 0) {
+        CHECK(!"cannot start server -t 2 -i 300");
+    } else {
+        int fd = connect_server();
+        CHECK(fd >= 0);
+        send_on(fd, "GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+        CHECK_INT(status(), 200);
+        CHECK(is_keep());
+        long long t0 = now_ms();
+        char c;
+        ssize_t r = read(fd, &c, 1);                          /* 서버가 닫으면 0 (SO_RCVTIMEO 3초) */
+        long long dt = now_ms() - t0;
+        CHECK_INT(r, 0);
+        CHECK(dt >= 200 && dt < 1500);
+        if (r != 0 || dt < 200 || dt >= 1500)
+            fprintf(stderr, "idle close: r=%zd after %lld ms\n", r, dt);
+        close(fd);
+        CHECK(stop_server(2000));
+    }
+
+    /* ---- 쉬는 연결이 워커를 안 잡음: 워커 2개 서버에 keep-alive 연결 50개가 쉬는 중에도 새 요청이 바로 처리됨 ---- */
+    if (start_server(bin, "2", NULL) != 0) {                  /* 쉬는 시간은 기본(5초) → 테스트 동안 안 닫힘 */
+        CHECK(!"cannot start server -t 2");
+    } else {
+        int fds[50];
+        CHECK_INT(open_idle(fds, 50), 50);
+        long long t0 = now_ms();
+        send_str("GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+        long long dt = now_ms() - t0;
+        CHECK_INT(status(), 200);
+        CHECK(dt < 1000);
+        int fd = fds[0];                                      /* 쉬던 연결도 다시 쓸 수 있음 (poller → 워커) */
+        if (fd >= 0) {
+            send_on(fd, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+            CHECK_INT(status(), 200);
+            CHECK_STR(body(), INDEX);
+        }
+        CHECK(stop_server(2000));                             /* 쉬는 연결 50개를 둔 채 종료 */
+        close_all(fds, 50);
     }
 
     /* 문서 루트 정리 */

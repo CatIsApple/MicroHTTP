@@ -92,7 +92,7 @@ static outcome run(const scenario *s)
     close(sv[1]);
     char *buf = malloc(s->cap);
     size_t header_len = 0;
-    ssize_t n = tcp_recv_request(sv[0], buf, s->cap, 1000, &header_len);
+    ssize_t n = tcp_recv_request(sv[0], buf, s->cap, 0, 1000, &header_len);
     http_request req;
     o.rc = (n > 0 && header_len > 0) ? http_parse_request(buf, header_len, &req) : -998;
     char *heap = NULL;
