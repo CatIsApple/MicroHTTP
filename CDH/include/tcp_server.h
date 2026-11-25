@@ -4,6 +4,7 @@
 #ifndef TCP_SERVER_H /* 인클루드 가드: 이 헤더가 아직 포함된 적 없을 때만 아래 내용을 읽는다 */
 #define TCP_SERVER_H /* "이미 포함됨" 표시. 같은 파일을 두 번 include 해도 선언이 중복되지 않음 */
 
+#include <netinet/in.h> /* struct sockaddr_in (tcp_connect 의 대상 주소) */
 #include <stddef.h>    /* size_t (바이트 수·길이를 나타내는 부호 없는 정수 타입) */
 #include <stdint.h>    /* uint16_t (포트 번호용 16비트 부호 없는 정수) */
 #include <sys/types.h> /* ssize_t (바이트 수 또는 -1 에러를 담는 부호 있는 정수, POSIX), off_t (파일 위치) */
@@ -64,6 +65,14 @@ ssize_t tcp_recv_request(int fd, char *buf, size_t cap, size_t used, int timeout
  * timeout_ms 는 호출 "전체" 의 마감 시간. 성공 0, 실패 -1
  * (초과 시 errno = ETIMEDOUT, 다 받기 전에 상대가 닫으면 errno = ECONNRESET) */
 int tcp_recv_exact(int fd, void *buf, size_t len, int timeout_ms); /* buf 에 len 바이트를 채움 */
+
+/* 지금 와 있는 만큼(최대 cap) 받는다. 아무것도 없으면 timeout_ms 까지 기다린다 (프록시 본문 중계용).
+ * 반환: 받은 바이트 수(>0), 상대가 닫음 0, 실패·초과 -1 (초과 시 errno = ETIMEDOUT) */
+ssize_t tcp_recv_some(int fd, void *buf, size_t cap, int timeout_ms);
+
+/* addr 로 TCP 연결 (논블로킹 connect + poll 로 timeout_ms 안에). 돌려주는 소켓은 논블로킹 + CLOEXEC.
+ * 성공 시 fd, 실패 -1 (거절 ECONNREFUSED, 초과 ETIMEDOUT 등 errno) */
+int tcp_connect(const struct sockaddr_in *addr, int timeout_ms);
 
 /* 정상 종료. 읽지 않은 수신 데이터가 없으면 바로 close().
  * 남아 있으면 shutdown(SHUT_WR) 로 FIN 을 먼저 보내고 최대 0.5초·64KB 비운 뒤 close().

@@ -3,8 +3,11 @@
  * 한 연결에서 요청 → 응답을 반복한다 (HTTP/1.1 keep-alive):
  *   1. tcp_recv_request 로 헤더 수신 (앞 요청이 남긴 파이프라이닝 잔여가 있으면 그 뒤에 이어서)
  *   2. 파싱(http_parser) → 본문 수신(http_body) → 응답
+ *        -F 켜짐 + CONNECT / "http://..." → 포워드 프록시 (fproxy: 목적지로 전달 / 터널)
+ *        -P 라우트에 맞는 경로 → 백엔드로 전달 (rproxy, 메서드 무관)
  *        GET / HEAD → 문서 루트의 정적 파일 (static_file + sendfile)
  *        POST       → 요청 내용을 그대로 보여 주는 echo
+ *        그 외 메서드 → 501
  *   3. 계속할지(keep) 결정: 클라이언트가 원함 + 정상 응답 + 요청 수 상한 미만 + 종료 중 아님 + 큐가 한가함
  *   4. 다음 요청 바이트가 이미 버퍼에 있거나(파이프라이닝) 소켓에 와 있으면 바로 반복,
  *      아무것도 없으면 idle poller 에 맡기고 워커를 놓아 준다 (쉬는 연결이 워커를 붙잡지 않게).
@@ -171,6 +174,74 @@ static int send_echo(const server_ctx *c, int cfd, const char *peer, const http_
     return log_sent(c, tcp_sendv_all(cfd, iov, 3, CLIENT_TIMEOUT_MS), peer, 200); /* 전송 + 로그 */
 }
 
+/* Reverse Proxy (rproxy): 라우트에 맞는 요청을 백엔드로 전달하고 응답을 중계한다. *keep 은 serve_static 과 같은 뜻 */
+static int serve_rproxy(const server_ctx *c, int cfd, const char *peer, const char *ip, const http_request *req,
+                       rproxy_route *rt, int *keep) /* 반환: 0 = 보냄, -1 = 송신·중계 실패 (연결 abort) */
+{
+    int status = 0;                                           /* 백엔드 응답 코드 (로그용) */
+    int r = rproxy_handle(c->rproxy, rt, cfd, req, ip, keep, &status, CLIENT_TIMEOUT_MS);
+    if (r > 0) {                                              /* 아직 아무것도 안 보냄 → 502 / 504 / 500 */
+        *keep = 0;                                            /* 오류 응답은 close */
+        if (!c->quiet)
+            fprintf(stderr, "[%s] proxy %s -> %d\n", peer, rt->prefix, r);
+        return send_error(c, cfd, peer, r, req->method == HTTP_METHOD_HEAD);
+    }
+    if (r < 0) {                                              /* 중계 도중 실패: 응답 일부가 나갔을 수 있음 */
+        char eb[128];
+        fprintf(stderr, "[%s] proxy relay failed: %s\n", peer, err_str(errno, eb, sizeof(eb)));
+        return -1;
+    }
+    if (!c->quiet)
+        printf("[%s] -> %d %s (proxy %s)\n", peer, status, http_reason(status), rt->prefix);
+    return 0;
+}
+
+/* Forward Proxy (fproxy): absolute-form 요청을 클라이언트가 고른 목적지로 전달. 반환·*keep 은 serve_rproxy 와 같음 */
+static int serve_fproxy(const server_ctx *c, int cfd, const char *peer, const char *ip, const http_request *req,
+                        int *keep)
+{
+    int status = 0;
+    int r = fproxy_handle(c->fproxy, cfd, req, ip, keep, &status, CLIENT_TIMEOUT_MS);
+    if (r > 0) {                                              /* 400 / 502 / 504: 아직 아무것도 안 보냄 */
+        *keep = 0;
+        if (!c->quiet)
+            fprintf(stderr, "[%s] forward proxy -> %d\n", peer, r);
+        return send_error(c, cfd, peer, r, req->method == HTTP_METHOD_HEAD);
+    }
+    if (r < 0) {
+        char eb[128];
+        fprintf(stderr, "[%s] forward proxy relay failed: %s\n", peer, err_str(errno, eb, sizeof(eb)));
+        return -1;
+    }
+    if (!c->quiet)
+        printf("[%s] -> %d %s (forward proxy)\n", peer, status, http_reason(status));
+    return 0;
+}
+
+static int stop_requested(void *arg) /* 터널이 서버 종료를 알아채는 콜백 (arg = server_ctx) */
+{
+    const server_ctx *c = arg;
+    return c->pool != NULL && tp_stopping(c->pool);
+}
+
+/* CONNECT 터널. pre[0..pre_len): 머리 뒤에 이미 같이 온 바이트. 반환: CONN_GRACEFUL / CONN_ABORT (터널 뒤엔 keep-alive 없음) */
+static int serve_tunnel(const server_ctx *c, int cfd, const char *peer, const http_request *req, const char *pre,
+                        size_t pre_len)
+{
+    unsigned long long bytes = 0;
+    int r = fproxy_tunnel(c->fproxy, cfd, req, pre, pre_len, CLIENT_TIMEOUT_MS, stop_requested, (void *)c, &bytes);
+    if (r > 0) {                                              /* 400 / 502 / 504 */
+        if (!c->quiet)
+            fprintf(stderr, "[%s] CONNECT %s -> %d\n", peer, req->uri, r);
+        return send_error(c, cfd, peer, r, 0) == 0 ? CONN_GRACEFUL : CONN_ABORT;
+    }
+    if (r < 0)
+        return CONN_ABORT;
+    if (!c->quiet)
+        printf("[%s] tunnel %s closed (%llu bytes)\n", peer, req->uri, bytes);
+    return CONN_GRACEFUL;
+}
+
 /* 오류 응답을 보내고 연결 처리 방법을 돌려준다 (보냈으면 graceful, 실패면 abort) */
 static int error_and_close(const server_ctx *c, int cfd, const char *peer, int status, int head_only) /* 반환: CONN_GRACEFUL / CONN_ABORT */
 {
@@ -225,6 +296,28 @@ static int handle_request(const server_ctx *c, conn_job *job, char *buf, size_t 
     if (rc != 0)                                          /* 문법 오류·미지원 등 */
         return error_and_close(c, cfd, peer, rc, head_only); /* 파서가 정한 상태 코드로 응답 후 닫기 */
 
+    /* 포워드 프록시 대상: CONNECT 또는 absolute-form("http://...") 요청 (켜져 있을 때만) */
+    int forward = c->fproxy != NULL && (req.method == HTTP_METHOD_CONNECT || fproxy_is_absolute(req.uri));
+    rproxy_route *route = !forward && c->rproxy ? rproxy_match(c->rproxy, req.uri) : NULL; /* 리버스 프록시 경로인지 (가장 긴 prefix) */
+    if (!forward && route == NULL && (req.method == HTTP_METHOD_OTHER || req.method == HTTP_METHOD_CONNECT))
+        return error_and_close(c, cfd, peer, 501, head_only); /* PUT/DELETE/CONNECT 등은 프록시 경로에서만 → 501 */
+
+    char ip[CONN_PEER_MAX];                               /* "IP:포트" → "IP" (X-Forwarded-For, 포워드 허용 검사) */
+    snprintf(ip, sizeof(ip), "%s", peer);
+    char *colon = strrchr(ip, ':');
+    if (colon != NULL)
+        *colon = '\0';
+    if (forward) {
+        if (!fproxy_client_allowed(c->fproxy, ip))        /* open proxy 방지: 기본은 로컬 클라이언트만 */
+            return error_and_close(c, cfd, peer, 403, head_only);
+        if (req.method == HTTP_METHOD_CONNECT) {          /* 터널: 본문 없음, 끝나면 연결도 끝 */
+            if (req.content_length > 0)
+                return error_and_close(c, cfd, peer, 400, 0);
+            job->nreq++;
+            return serve_tunnel(c, cfd, peer, &req, buf + header_len, (size_t)n - header_len);
+        }
+    }
+
     char *heap = NULL;                                    /* 본문이 버퍼에 안 들어가면 http_read_body 가 malloc 한 포인터 */
     rc = http_read_body(cfd, &req, buf, cap, (size_t)n, header_len, CLIENT_TIMEOUT_MS, &heap); /* 본문 마저 받기 (정확히 필요한 만큼만) */
     if (rc < 0) {                                         /* 본문 수신 중 타임아웃·끊김 (heap 은 이미 반납됨) */
@@ -240,7 +333,11 @@ static int handle_request(const server_ctx *c, conn_job *job, char *buf, size_t 
     if (keep && c->pool != NULL)                          /* 풀 없이 부르는 경우(테스트)는 여기까지만 */
         keep = !tp_stopping(c->pool) && tp_queued(c->pool) * 4 < tp_capacity(c->pool) * 3; /* 종료 중 아님 + 큐 75% 미만 */
 
-    if (req.method == HTTP_METHOD_POST)                   /* POST → echo */
+    if (forward)                                          /* 포워드 프록시 → 클라이언트가 고른 목적지로 */
+        rc = serve_fproxy(c, cfd, peer, ip, &req, &keep);
+    else if (route != NULL)                               /* 리버스 프록시 라우트 → 백엔드로 전달 */
+        rc = serve_rproxy(c, cfd, peer, ip, &req, route, &keep); /* 길이를 모르는 응답이면 keep 이 0 이 됨 */
+    else if (req.method == HTTP_METHOD_POST)              /* POST → echo */
         rc = send_echo(c, cfd, peer, &req, &keep);          /* 요약 + 받은 본문을 그대로 돌려줌 */
     else                                                  /* GET / HEAD → 정적 파일 (오류 응답이면 keep 이 0 이 됨) */
         rc = serve_static(c, cfd, peer, &req, &keep);       /* 문서 루트에서 파일 찾아 sendfile */

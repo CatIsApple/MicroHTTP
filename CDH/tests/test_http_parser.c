@@ -128,10 +128,32 @@ static void test_errors(void)
     CHECK_INT(code("GET / HTTP/0.9\r\nHost: a\r\n\r\n"), 505);
 
     /* 메서드 */
-    CHECK_INT(code("PUT / HTTP/1.1\r\nHost: a\r\n\r\n"), 501);
-    CHECK_INT(code("DELETE / HTTP/1.1\r\nHost: a\r\n\r\n"), 501);
-    CHECK_INT(code("get / HTTP/1.1\r\nHost: a\r\n\r\n"), 501);         /* 대소문자 구분 */
-    CHECK_INT(code("PUT / HTTP/1.1\r\n\r\n"), 400);                    /* 문법 오류(Host 없음)가 501 보다 먼저 */
+    /* 모르는 메서드는 파서에서 통과 (OTHER) → 프록시는 전달, 정적 경로는 server.c 가 501 */
+    {
+        http_request m;
+        CHECK_INT(parse("PUT /x HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n", &m), 0);
+        CHECK_INT(m.method, HTTP_METHOD_OTHER);
+        CHECK_STR(m.method_str, "PUT");
+        CHECK_INT(m.keep_alive, 1);                                    /* keep-alive 판정까지 끝난 상태 */
+        CHECK_INT(m.content_length, 2);
+        CHECK_INT(parse("DELETE / HTTP/1.1\r\nHost: a\r\n\r\n", &m), 0);
+        CHECK_INT(m.method, HTTP_METHOD_OTHER);
+        CHECK_INT(parse("get / HTTP/1.1\r\nHost: a\r\n\r\n", &m), 0); /* 대소문자 구분 → GET 아님 */
+        CHECK_INT(m.method, HTTP_METHOD_OTHER);
+    }
+    /* CONNECT: authority-form("host:port") 만 허용 (RFC 7230 5.3.3), 다른 메서드는 authority-form 불가 */
+    {
+        http_request m;
+        CHECK_INT(parse("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n", &m), 0);
+        CHECK_INT(m.method, HTTP_METHOD_CONNECT);
+        CHECK_STR(m.uri, "example.com:443");
+    }
+    CHECK_INT(code("CONNECT / HTTP/1.1\r\nHost: a\r\n\r\n"), 400);
+    CHECK_INT(code("CONNECT http://a/ HTTP/1.1\r\nHost: a\r\n\r\n"), 400);
+    CHECK_INT(code("GET example.com:443 HTTP/1.1\r\nHost: a\r\n\r\n"), 400);
+    CHECK_INT(code("connect a:443 HTTP/1.1\r\nHost: a\r\n\r\n"), 400); /* 소문자는 CONNECT 아님 → authority-form 불가 */
+    CHECK_INT(code("PUT / HTTP/1.1\r\n\r\n"), 400);                    /* 문법 오류(Host 없음)는 여전히 400 */
+    CHECK_INT(code("PUT / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"), 501); /* TE 는 메서드와 무관하게 501 */
 
     /* 헤더 줄 */
     CHECK_INT(code("GET / HTTP/1.1\r\nHost : a\r\n\r\n"), 400);        /* 콜론 앞 공백 */

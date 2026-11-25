@@ -14,7 +14,7 @@ THREAD_FLAGS := -pthread
 
 # 라이브러리 소스: main 을 뺀 모듈들 (서버 실행 파일과 단위 테스트가 함께 씀)
 LIB_SRCS := src/tcp_server.c src/http_parser.c src/http_body.c src/http_response.c src/mime.c src/static_file.c \
-            src/thread_pool.c src/idle_poller.c src/server.c
+            src/thread_pool.c src/idle_poller.c src/server.c src/proxy_core.c src/rproxy.c src/fproxy.c
 # 서버 소스 목록 = main + 라이브러리
 SRCS := src/main.c $(LIB_SRCS)
 # 오브젝트 파일 목록: src/xxx.c → build/xxx.o 로 이름만 바꿔서 만듦

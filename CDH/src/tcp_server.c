@@ -520,6 +520,61 @@ int tcp_recv_exact(int fd, void *buf, size_t len, int timeout_ms) /* 정확히 l
     return 0; /* 전부 받음 */
 }
 
+ssize_t tcp_recv_some(int fd, void *buf, size_t cap, int timeout_ms) /* 와 있는 만큼 받기 (없으면 마감까지 기다림) */
+{
+    long long deadline = now_ms() + timeout_ms;          /* 이 호출의 마감 시각 */
+    for (;;) {
+        ssize_t n = recv(fd, buf, cap, MSG_DONTWAIT);    /* 먼저 시도 (데이터가 보통 이미 와 있음 → poll 시스템콜 절약) */
+        if (n >= 0)                                      /* 받음(>0) 또는 상대가 닫음(0) */
+            return n;
+        if (errno == EINTR)                              /* 시그널 → 재시도 */
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)     /* ECONNRESET 등 진짜 오류 */
+            return -1;
+        if (wait_until(fd, POLLIN, deadline) <= 0)       /* 아직 없음 → 마감 안에서 기다림 */
+            return -1;                                   /* 시간 초과(errno=ETIMEDOUT) 또는 오류 */
+    }
+}
+
+int tcp_connect(const struct sockaddr_in *addr, int timeout_ms) /* 마감 시간이 있는 connect */
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);            /* IPv4 TCP 소켓 */
+    if (fd < 0)
+        return -1;
+    int fl = fcntl(fd, F_GETFL);                         /* 논블로킹 + CLOEXEC (accept4 가 없는 곳과 같은 방식) */
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    if (connect(fd, (const struct sockaddr *)addr, sizeof(*addr)) == 0) /* 루프백은 바로 성공하기도 함 */
+        return fd;
+    if (errno != EINPROGRESS && errno != EINTR) {        /* 즉시 실패 (ECONNREFUSED, ENETUNREACH ...) */
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    /* 3-way handshake 진행 중: 쓰기 가능해지면 끝난 것 (성공/실패는 SO_ERROR 로 확인) */
+    if (wait_until(fd, POLLOUT, now_ms() + timeout_ms) <= 0) {
+        int e = errno;                                   /* ETIMEDOUT: SYN 에 답이 없음 (꺼진 호스트, 방화벽) */
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        err = errno;
+    if (err != 0) {                                      /* handshake 실패 (ECONNREFUSED 등) */
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;                                           /* 연결됨 */
+}
+
 #define DRAIN_TIMEOUT_MS 500          /* 남은 데이터 비우기에 쓸 수 있는 최대 시간 (전체 기준) */
 #define DRAIN_MAX_BYTES (64 * 1024)   /* 비우기로 읽어 버릴 최대 바이트 수 */
 

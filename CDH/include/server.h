@@ -11,7 +11,9 @@
 #define SERVER_H
 
 #include "conn_job.h"    /* conn_job */
+#include "fproxy.h"      /* fproxy_config */
 #include "idle_poller.h" /* idle_poller */
+#include "rproxy.h"      /* rproxy_table */
 #include "thread_pool.h" /* thread_pool */
 
 #define SERVER_KEEPALIVE_MAX 100 /* 한 연결에서 처리할 최대 요청 수 기본값 (넘으면 Connection: close) */
@@ -23,6 +25,8 @@ typedef struct {
     unsigned keepalive_max; /* 한 연결의 최대 요청 수 (기본 SERVER_KEEPALIVE_MAX) */
     thread_pool *pool;      /* 워커 풀 (부하 판단·poller 에서 되돌려 보낼 곳) */
     idle_poller *idle;      /* 쉬는 연결을 맡길 곳 */
+    rproxy_table *rproxy;   /* Reverse Proxy 라우트 (-P). NULL 이면 없음. 라운드 로빈 카운터만 원자적으로 바뀜 */
+    const fproxy_config *fproxy; /* Forward Proxy 설정 (-F). NULL 이면 꺼짐 (absolute-form 은 정적 파일, CONNECT 는 501) */
 } server_ctx;
 
 /* tp_job_fn: 워커에서 호출. job->fd 의 소유권을 받는다 → 끝날 때 close 하거나 idle poller 에 넘긴다.

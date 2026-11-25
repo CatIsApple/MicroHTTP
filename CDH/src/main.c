@@ -150,10 +150,36 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
     long threads = DEFAULT_THREADS;            /* 워커 수 */
     long idle_ms = DEFAULT_IDLE_MS;            /* keep-alive 쉬는 시간 */
     int quiet = 0;                             /* -q */
+    static rproxy_table rproxy;                 /* Reverse Proxy 라우트 (static: 스택에 두기엔 큼, 수백 KB) */
+    rproxy_init(&rproxy);
+    fproxy_config fproxy;                       /* Forward Proxy 설정 (-F 로 켬) */
+    fproxy_init(&fproxy);
+    int forward_on = 0;
     for (int i = 1; i < argc; i++) {           /* argv[1] 부터 인자를 하나씩 확인 */
         int ok = 1;                            /* 이 인자를 해석했는지 */
         if (strcmp(argv[i], "-q") == 0)                               /* "-q": 조용 모드 */
             quiet = 1;
+        else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {        /* "-P /api/=host:port[,host:port]" 라우트 (여러 번 가능) */
+            const char *why = NULL;
+            if (rproxy_add_route(&rproxy, argv[++i], &why) < 0) {
+                fprintf(stderr, "-P %s: %s\n", argv[i], why);
+                ok = 0;
+            }
+        } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {      /* "-T <ms>" 백엔드 응답 타임아웃 1ms~10분 */
+            long v;
+            ok = parse_range(argv[++i], 1, 600L * 1000, &v) == 0;
+            if (ok) {
+                rproxy.timeout_ms = (int)v;
+                fproxy.timeout_ms = (int)v;                           /* 포워드 프록시 목적지 타임아웃도 같은 값 */
+            }
+        } else if (strcmp(argv[i], "-F") == 0 && i + 1 < argc) {      /* "-F local|any" 포워드 프록시 켜기 */
+            const char *m = argv[++i];
+            ok = strcmp(m, "local") == 0 || strcmp(m, "any") == 0;
+            if (ok) {
+                forward_on = 1;
+                fproxy.any_client = strcmp(m, "any") == 0;
+            }
+        }
         else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc)          /* "-r <디렉터리>" */
             root = argv[++i];
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)          /* "-t <워커 수>" 1~1024 */
@@ -164,8 +190,14 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
             ok = parse_port(argv[i], &port) == 0;
         if (!ok) {
             fprintf(stderr, "usage: %s [-q] [-r docroot] [-t threads(1-%d, default %d)] "
-                            "[-i keepalive_idle_ms(default %d)] [port]\n",
-                    argv[0], MAX_THREADS, DEFAULT_THREADS, DEFAULT_IDLE_MS);
+                            "[-i keepalive_idle_ms(default %d)]\n"
+                            "       [-P /prefix=host:port[,host:port...]]... [-F local|any] "
+                            "[-T backend_timeout_ms(default %d)] [port]\n"
+                            "  -P  reverse proxy route: requests whose path starts with prefix go to the backends\n"
+                            "      (round-robin, next backend on connect failure). Longest prefix wins.\n"
+                            "  -F  forward proxy: \"GET http://host/...\" and \"CONNECT host:port\" go where the client asks.\n"
+                            "      local = only 127.x clients (default choice), any = everyone (open proxy, be careful)\n",
+                    argv[0], MAX_THREADS, DEFAULT_THREADS, DEFAULT_IDLE_MS, RPROXY_DEFAULT_TIMEOUT_MS);
             return EXIT_FAILURE;                                      /* 종료 코드 1 */
         }
     }
@@ -206,6 +238,8 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
         .keepalive_max = SERVER_KEEPALIVE_MAX,
         .pool = NULL,
         .idle = NULL,
+        .rproxy = rproxy.nroutes > 0 ? &rproxy : NULL, /* 라우트가 없으면 프록시 단계 자체를 건너뜀 */
+        .fproxy = forward_on ? &fproxy : NULL,          /* -F 가 없으면 포워드 프록시 꺼짐 */
     };
     ctx.pool = tp_create((int)threads, QUEUE_CAP, 0, serve_connection, &ctx); /* 워커 N개 (스택 기본 256KB) */
     if (ctx.pool == NULL) {
@@ -228,6 +262,15 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
      * 모아서 쓴다(요청마다 write 시스템콜 X). 시작 메시지만 즉시 내보낸다. */
     printf("listening on 0.0.0.0:%u, docroot %s, %ld threads, keep-alive idle %ld ms (Ctrl+C to stop)%s\n",
            (unsigned)port, root, threads, idle_ms, quiet ? " [quiet]" : "");
+    for (int r = 0; r < rproxy.nroutes; r++) {  /* 프록시 라우트 목록 */
+        printf("proxy %s ->", rproxy.routes[r].prefix);
+        for (int b = 0; b < rproxy.routes[r].nbackends; b++)
+            printf(" %s", rproxy.routes[r].backends[b].name);
+        printf(" (timeout %d ms)\n", rproxy.timeout_ms);
+    }
+    if (forward_on)
+        printf("forward proxy on (%s clients, timeout %d ms)\n", fproxy.any_client ? "all" : "127.x only",
+               fproxy.timeout_ms);
     fflush(stdout);
 
     struct pollfd pfd[2] = {                         /* 메인 스레드가 기다리는 두 가지 */

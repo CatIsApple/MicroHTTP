@@ -14,12 +14,14 @@
 #define HTTP_MAX_HEADERS 64   /* 헤더 줄 최대 개수. 넘으면 431 (헤더 폭탄 방지 + 고정 크기 배열 크기) */
 #define HTTP_MAX_URI_LEN 2048 /* URI 최대 길이(바이트). 넘으면 414 (브라우저·서버들의 흔한 상한) */
 
-/* 요청 메서드. GET/POST/HEAD 만 지원, 그 외 문법상 올바른 메서드는 OTHER(→ 501) */
+/* 요청 메서드. GET/POST/HEAD 는 서버가 직접 처리, 그 외 문법상 올바른 메서드는 OTHER
+ * (파서는 통과시키고, 프록시 경로면 그대로 전달 / 아니면 server.c 가 501) */
 typedef enum {          /* enum: 이름 붙은 정수 상수 묶음. 문자열 비교를 한 번만 하고 이후엔 정수로 분기 */
     HTTP_METHOD_GET,    /* "GET"  (= 0) : 리소스 조회 */
     HTTP_METHOD_POST,   /* "POST" (= 1) : 본문을 서버로 전송 */
     HTTP_METHOD_HEAD,   /* "HEAD" (= 2) : GET 과 같은 머리, 본문 없음 (curl -I). 범용 서버는 GET·HEAD 필수 (RFC 7231 4.1) */
-    HTTP_METHOD_OTHER   /* 그 외 ("PUT", "DELETE" 등) : 문법은 맞지만 구현 안 함 → 501 */
+    HTTP_METHOD_OTHER,  /* 그 외 ("PUT", "DELETE" 등) : 프록시 경로만 전달, 나머지는 501 */
+    HTTP_METHOD_CONNECT /* "CONNECT host:port" : 포워드 프록시 터널 (URI 는 authority-form). 꺼져 있으면 501 */
 } http_method;          /* 타입 이름 */
 
 /* 헤더 한 줄. name, value 모두 '\0' 종료 문자열 (value 는 앞뒤 공백 제거됨) */
@@ -32,7 +34,7 @@ typedef struct {          /* 헤더 하나 = 이름 + 값 쌍 */
 typedef struct {
     http_method method;     /* 메서드 종류 (GET / POST / OTHER) */
     const char *method_str; /* 메서드 원문 ("GET", "PUT" 등). 로그·501 응답용 */
-    const char *uri;        /* 요청 대상 ("/index.html?x=1" 또는 "http://host/path") */
+    const char *uri;        /* 요청 대상 ("/index.html?x=1", "http://host/path", CONNECT 면 "host:443") */
     int version_minor;      /* HTTP/1.0 → 0, HTTP/1.1 → 1 (major 는 항상 1 이라 저장 안 함) */
 
     http_header headers[HTTP_MAX_HEADERS]; /* 받은 순서대로의 헤더 목록 (구조체 안 고정 배열 → malloc 불필요) */
@@ -52,7 +54,8 @@ typedef struct {
  * header_len : 빈 줄("\r\n\r\n")까지 포함한 헤더 길이 (tcp_recv_request 가 준 값)
  * 반환: 0 = 성공, 그 외 = 클라이언트에게 보낼 HTTP 상태 코드
  *   400 문법 오류 / 414 URI 너무 김 / 431 헤더 개수 초과
- *   501 지원 안 하는 메서드·Transfer-Encoding / 505 지원 안 하는 HTTP 버전 */
+ *   501 지원 안 하는 Transfer-Encoding / 505 지원 안 하는 HTTP 버전
+ *   (모르는 메서드는 0 + method = HTTP_METHOD_OTHER 로 돌려준다 — 거절 여부는 호출자가 경로를 보고 정함) */
 int http_parse_request(char *buf, size_t header_len, http_request *req); /* req: 결과를 채울 구조체 */
 
 /* 이름으로 헤더 값 찾기 (대소문자 무시). 여러 개면 첫 번째, 없으면 NULL */

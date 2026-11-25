@@ -132,9 +132,14 @@ static int parse_request_line(char *line, char *eol, http_request *req) /* eol: 
         if (c <= 0x20 || c == 0x7f) /* 제어 문자·공백·DEL 불가 (SP 는 이미 구분자로 썼음) */
             return 400;                                  /* 잘못된 요청 */
     }
-    /* origin-form("/path") 또는 absolute-form("http://host/path", 포워드 프록시용)만 허용 */
-    if (uri[0] != '/' && !(uri_len > 7 && ieq_n(uri, 7, "http://"))) /* '/' 로도 "http://" 로도 시작 안 하면 */
+    int is_connect = (size_t)(sp1 - line) == 7 && memcmp(line, "CONNECT", 7) == 0; /* CONNECT 만 대상 형식이 다름 */
+    int absolute = uri_len > 7 && ieq_n(uri, 7, "http://");                         /* absolute-form (포워드 프록시용) */
+    if (is_connect) {                                    /* CONNECT 는 authority-form("host:port")만 (RFC 7230 5.3.3) */
+        if (uri[0] == '/' || absolute)
+            return 400;
+    } else if (uri[0] != '/' && !absolute) {             /* 그 밖엔 origin-form("/path") 또는 absolute-form 만 */
         return 400;                                      /* 잘못된 요청 ("index.html" 같은 형태) */
+    }
 
     /* 3) 버전: 나머지 전부. 정확히 "HTTP/숫자.숫자" (8바이트) */
     char *ver = sp2 + 1;                                 /* 두 번째 공백 다음이 버전 시작 */
@@ -158,8 +163,10 @@ static int parse_request_line(char *line, char *eol, http_request *req) /* eol: 
         req->method = HTTP_METHOD_POST;   /* POST */
     else if (strcmp(line, "HEAD") == 0)   /* HEAD 인지 */
         req->method = HTTP_METHOD_HEAD;   /* HEAD */
+    else if (is_connect)                  /* CONNECT (포워드 프록시 터널) */
+        req->method = HTTP_METHOD_CONNECT;
     else                                  /* 그 밖의 메서드 */
-        req->method = HTTP_METHOD_OTHER;  /* 나중에 501 로 거절 (헤더까지 다 검사한 뒤) */
+        req->method = HTTP_METHOD_OTHER;  /* 파서는 통과 → 프록시 경로가 아니면 server.c 가 501 */
     return 0; /* 성공 */
 }
 
@@ -274,8 +281,8 @@ int http_parse_request(char *buf, size_t header_len, http_request *req) /* 헤�
         return 400;                                    /* 잘못된 요청 */
     if (has_transfer_encoding) /* chunked 등은 미지원. CL 과 같이 오면 스머글링 위험도 있음 */
         return 501;            /* 501 Not Implemented */
-    if (req->method == HTTP_METHOD_OTHER) /* 문법은 맞지만 구현 안 한 메서드 (문법 오류 400 을 먼저 가린 뒤 판정) */
-        return 501;                       /* 501 Not Implemented */
+    /* HTTP_METHOD_OTHER (PUT, DELETE ...) 는 문법만 맞으면 통과시킨다: 프록시 경로는 그대로 백엔드에 전달하고,
+     * 정적 파일·echo 경로는 server.c 가 501 로 거절한다 (어느 경로인지는 파서가 모름) */
 
     /* keep-alive 결정: 1.1 은 기본 유지, 1.0 은 기본 종료. "close" 가 있으면 무조건 종료 */
     if (conn_close)                         /* close 가 최우선 */
