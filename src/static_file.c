@@ -101,7 +101,9 @@ static int status_from_errno(int error)
 {
     if (error == ENOENT || error == ENOTDIR) return 404;
     if (error == EACCES) return 403;
-    return 500;
+    /* 파일 이름 한 조각이 NAME_MAX(보통 255)를 넘는 등 요청이 만든 문제 → 서버 오류(5xx)가 아님 */
+    if (error == ENAMETOOLONG) return 414;
+    return 500; /* 예: 심볼릭 링크 순환(ELOOP), 디스크 오류(EIO) → 서버 쪽 문제 */
 }
 
 int static_file_open(const char *root, const char *target,

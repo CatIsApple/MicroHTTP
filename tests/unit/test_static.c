@@ -63,6 +63,13 @@ int main(void)
     snprintf(link_target, sizeof(link_target), "%s/outside.txt", base);
     snprintf(link_path, sizeof(link_path), "%s/root/escape.txt", base);
     assert(symlink(link_target, link_path) == 0);
+    /* 서로를 가리키는 심볼릭 링크 (서버 설정 실수 → stat이 ELOOP) */
+    snprintf(link_target, sizeof(link_target), "loop_b");
+    snprintf(link_path, sizeof(link_path), "%s/root/loop_a", base);
+    assert(symlink(link_target, link_path) == 0);
+    snprintf(link_target, sizeof(link_target), "loop_a");
+    snprintf(link_path, sizeof(link_path), "%s/root/loop_b", base);
+    assert(symlink(link_target, link_path) == 0);
     /* 읽기 권한이 없는 파일 */
     snprintf(path, sizeof(path), "%s/root/secret.txt", base);
     assert(chmod(path, 0000) == 0);
@@ -84,6 +91,10 @@ int main(void)
     assert(open_target("/escape.txt", NULL, NULL) == 403);                    /* 심볼릭 링크 탈출 */
     assert(open_target("/a%zzb", NULL, NULL) == 400);                         /* 잘못된 인코딩 */
     assert(open_target("/a%00.html", NULL, NULL) == 400);                     /* NUL 주입 */
+    assert(open_target("/loop_a", NULL, NULL) == 500);                        /* 링크 순환 = 서버 쪽 오류 */
+    char long_name[400] = "/";
+    memset(long_name + 1, 'n', 300);                                          /* 이름 한 조각 > NAME_MAX */
+    assert(open_target(long_name, NULL, NULL) == 414);
     if (geteuid() != 0)                                                       /* root는 권한 검사를 무시함 */
         assert(open_target("/secret.txt", NULL, NULL) == 403);
 
@@ -93,6 +104,6 @@ int main(void)
     snprintf(command, sizeof(command), "chmod -R u+rwx '%s' && rm -rf '%s'", base, base);
     assert(system(command) == 0);
     free(root);
-    puts("PASS test_static: index, query, percent-decode, 404, 403 (.., symlink, permission, dir), 400");
+    puts("PASS test_static: index, query, percent-decode, 404, 403 (.., symlink, permission, dir), 400, 414 (NAME_MAX), 500 (ELOOP)");
     return 0;
 }

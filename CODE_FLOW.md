@@ -17,30 +17,30 @@ src/net.c          send_all, 소켓 타임아웃, 오류 응답, 타임아웃 �
 ```text
 ./server -p 8080 -r ./www -t 8 -R /api/=127.0.0.1:9001,127.0.0.1:9002
 
-main()                                             server.c:471
- ├─ parse_arguments()                              server.c:431
+main()                                             server.c:496
+ ├─ parse_arguments()                              server.c:456
  │    getopt로 -p -r -t -R -b -v 읽기
- │    -R 마다 proxy_add_route()                    proxy.c:49   → proxy_table.routes[]
- │    realpath(root) → config.root (malloc)         server.c:462
- ├─ install_signal_handlers()                      server.c:350
+ │    -R 마다 proxy_add_route()                    proxy.c:50   → proxy_table.routes[]
+ │    realpath(root) → config.root (malloc)         server.c:487
+ ├─ install_signal_handlers()                      server.c:375
  │    SIGINT, SIGTERM → on_stop_signal (stop_requested = 1)
  │    SIGPIPE → SIG_IGN
- ├─ create_listener()                              server.c:97
- │    socket(AF_INET, SOCK_STREAM)                 server.c:99
- │    setsockopt(SO_REUSEADDR)                     server.c:107
- │    bind(127.0.0.1:8080)                         server.c:117
- │    listen(BACKLOG=128)                          server.c:125
- ├─ start_workers()                                server.c:379
+ ├─ create_listener()                              server.c:100
+ │    socket(AF_INET, SOCK_STREAM)                 server.c:102
+ │    setsockopt(SO_REUSEADDR)                     server.c:110
+ │    bind(127.0.0.1:8080)                         server.c:120
+ │    listen(BACKLOG=128)                          server.c:128
+ ├─ start_workers()                                server.c:404
  │    SIGINT/SIGTERM 막기 → pthread_create × 8 (worker_main) → 마스크 복구
  │
- ├─ while (!stop_requested)                        server.c:504~
- │    poll(listener, 1초)                          server.c:511
- │    accept()                                     server.c:520  → client_fd
- │    queue_push(client_fd)                        server.c:528  (가득 차면 not_full에서 대기)
+ ├─ while (!stop_requested)                        server.c:529~
+ │    poll(listener, 1초)                          server.c:536
+ │    accept()                                     server.c:545  → client_fd
+ │    queue_push(client_fd)                        server.c:553  (가득 차면 not_full에서 대기)
  │
  └─ 종료 (Ctrl+C 또는 kill)
-      close_socket(listener)                       server.c:532  새 연결 중단
-      stop_workers()                               server.c:399  closing=1, broadcast, pthread_join
+      close_socket(listener)                       server.c:557  새 연결 중단
+      stop_workers()                               server.c:424  closing=1, broadcast, pthread_join
       free(config.root)
       return 0  ("shutdown complete")
 ```
@@ -48,11 +48,11 @@ main()                                             server.c:471
 작업 스레드 8개는 처음부터 끝까지 이 루프를 돕니다.
 
 ```text
-worker_main()                                      server.c:330
+worker_main()                                      server.c:355
  └─ for (;;)
-      client_fd = queue_pop()                      server.c:312  비었으면 not_empty에서 잠듦
+      client_fd = queue_pop()                      server.c:337  비었으면 not_empty에서 잠듦
       if (client_fd == -1) break                   셧다운 + 큐 비었음 → 스레드 종료
-      handle_connection(client_fd)                 server.c:213
+      handle_connection(client_fd)                 server.c:224
       close_socket(client_fd)                      연결을 닫는 곳은 여기 한 곳
 ```
 
@@ -67,20 +67,20 @@ worker_main()                                      server.c:330
 [main] poll이 깨어남 → accept → client_fd=6 → queue_push(6) → pthread_cond_signal(not_empty)
 [작업 스레드] queue_pop() = 6
 
-handle_connection(6)                               server.c:213
+handle_connection(6)                               server.c:224
  ├─ set_socket_timeout(6, 5초)                     net.c:43     SO_RCVTIMEO / SO_SNDTIMEO
- ├─ buffer = malloc(16384 + 65536)                 server.c:219
+ ├─ buffer = malloc(16384 + 65536)                 server.c:230
  └─ for (;;)
      ├─ http_parse_request(buffer, used, ...)      http.c:133
      │    used=0 → HTTP_NEED_MORE
-     ├─ recv(6, buffer+used, ...)                  server.c:262  → 53바이트 도착, used=53
+     ├─ recv(6, buffer+used, ...)                  server.c:286  → 53바이트 도착, used=53
      ├─ http_parse_request(...)                    → HTTP_COMPLETE, consumed=53
      │    request = { method "GET", target "/css/style.css", version "HTTP/1.1",
      │                host "localhost:8080", keep_alive 1, body_length 0 }
-     ├─ keep_alive = request.keep_alive && 처리수 < 100 && !stop_requested   server.c:245
-     ├─ handle_request(6, &request, &keep_alive)   server.c:183
+     ├─ keep_alive = request.keep_alive && 처리수 < 100 && !stop_requested   server.c:262
+     ├─ handle_request(6, &request, &keep_alive)   server.c:186
      │    proxy_find_route(&proxy_table, "/css/style.css") → NULL (규칙 없음)
-     │    method가 GET → serve_static_file()        server.c:139
+     │    method가 GET → serve_static_file()        server.c:142
      │      static_file_open(root, target, ...)    static_file.c:107
      │        decode_target_path → "/css/style.css"
      │        has_parent_segment → 없음
@@ -89,37 +89,38 @@ handle_connection(6)                               server.c:213
      │        open → file_fd, fstat → size=386
      │        mime_type_for_path → "text/css; charset=utf-8"
      │        return 200
-     │      http_response_header(...)               http.c:264
+     │      http_response_header(...)               http.c:267
      │        "HTTP/1.1 200 OK\r\n...Content-Length: 386\r\nConnection: keep-alive\r\n\r\n"
      │      send_all(6, header)                     net.c:26
      │      while: read(file_fd, 16KiB) → send_all(6, chunk)
      │      close(file_fd)
      │      return 200
      ├─ 로그: [request] fd=6 "GET /css/style.css HTTP/1.1" status=200 keep_alive=1
-     ├─ memmove(buffer, buffer+53, used-53)         server.c:256  다음 요청을 앞으로
+     ├─ memmove(buffer, buffer+53, used-53)         server.c:273  다음 요청을 앞으로
      └─ 다시 parse → NEED_MORE → recv에서 다음 요청을 기다림
           5초 동안 아무것도 안 오면 EAGAIN → 조용히 break
- free(buffer)                                      server.c:285
+ free(buffer)                                      server.c:310
 [작업 스레드] close_socket(6)
 ```
 
 ### 2.2 프록시 요청: `POST /api/echo` (본문 5바이트)
 
 ```text
-handle_request()                                   server.c:183
- ├─ proxy_find_route(&proxy_table, "/api/echo")    proxy.c:75   → "/api/" 규칙
- ├─ *keep_alive = 0                                server.c:192  응답 끝을 EOF로 알리므로 연결 닫음
- └─ proxy_forward(client_fd, &request, &proxy_table, route)   proxy.c:172
-      ├─ proxy_next_backend()                      proxy.c:92   mutex 안에서 순번 0 → 다음은 1
+handle_request()                                   server.c:186
+ ├─ proxy_find_route(&proxy_table, "/api/echo")    proxy.c:76   → "/api/" 규칙
+ ├─ *keep_alive = 0                                server.c:195  응답 끝을 EOF로 알리므로 연결 닫음
+ └─ proxy_forward(client_fd, &request, &proxy_table, route)   proxy.c:204
+      ├─ proxy_next_backend()                      proxy.c:93   mutex 안에서 순번 0 → 다음은 1
       ├─ connect_with_timeout("127.0.0.1","9001",2000)  net.c:73
       │    getaddrinfo → socket → O_NONBLOCK → connect=EINPROGRESS
       │    poll(POLLOUT, 2초) → getsockopt(SO_ERROR)=0 → 블로킹으로 복구
       │    (실패하면 다음 백엔드 시도, 모두 실패 → 502)
-      ├─ proxy_build_request()                     proxy.c:117
+      ├─ proxy_build_request()                     proxy.c:118
       │    "POST /api/echo HTTP/1.1\r\n" + 원래 헤더(hop-by-hop 제외) + "Connection: close\r\n\r\n"
       ├─ set_socket_timeout(backend, 5초)
       ├─ send_all(backend, header) ; send_all(backend, body 5바이트)
-      └─ for (;;) recv(backend, 16KiB)
+      └─ for (;;) wait_backend_or_client_gone() → recv(backend, 16KiB)
+           (기다리는 동안 poll로 클라이언트도 감시: 클라이언트가 EOF/RST면 즉시 중단, status=-1)
            첫 조각: 상태 코드 읽기(response_status) → send_all(client)
            이후 조각: 그대로 send_all(client)
            recv == 0 (백엔드가 닫음) → 끝
@@ -134,6 +135,7 @@ handle_connection: keep_alive=0 → break → free(buffer) → 작업 스레드�
 |---|---|---|
 | `http_parse_request` | 문법 오류, 크기 초과, 버전 | `send_error_response(status, keep_alive=0)` 후 연결 종료 |
 | `handle_connection` recv | 요청 도중 5초 무응답 | 408 후 종료 |
+| `handle_connection` | 요청 첫 바이트 후 10초 안에 완성되지 않음(Slowloris) | 408 후 종료 |
 | `handle_connection` recv | 요청 도중 EOF | 400 후 종료 |
 | `handle_connection` recv | keep-alive 대기 중 무응답·EOF | 조용히 종료 |
 | `handle_request` | 정적 경로에 GET/HEAD 외 | 405 + `Allow: GET, HEAD` (연결 유지 가능) |
@@ -141,6 +143,7 @@ handle_connection: keep_alive=0 → break → free(buffer) → 작업 스레드�
 | `serve_static_file` | 헤더 송신 후 read 실패 | 상태를 바꿀 수 없으므로 연결 종료 |
 | `send_all` | 클라이언트가 끊음(EPIPE, SIGPIPE 무시 덕분) | -1 → 연결 종료 |
 | `proxy_forward` | 백엔드 연결 불가 / 응답 없음 | 502 / 504 |
+| `wait_backend_or_client_gone` | 백엔드를 기다리는 중 클라이언트가 떠남 | 백엔드 요청을 버리고 즉시 종료 (스레드 반환) |
 
 ---
 

@@ -8,6 +8,7 @@
     python3 tests/functional/test_server.py static   # 이름에 'static'이 들어간 테스트만
 """
 import os
+import select
 import socket
 import struct
 import subprocess
@@ -21,6 +22,7 @@ SERVER = os.path.join(ROOT, "server")
 WWW = os.path.join(ROOT, "www")
 PORT = 18080
 IDLE_TIMEOUT = 5
+REQUEST_TIMEOUT = 10
 BACKEND_TIMEOUT = 5
 BACKEND_A, BACKEND_B, BACKEND_DEAD = 19001, 19002, 19009
 PROXY_ARGS = [
@@ -46,11 +48,11 @@ def wait_for_port(port, timeout=5.0):
 class Server:
     """./server를 실행하고 stderr 로그를 임시 파일에 모읍니다."""
 
-    def __init__(self, *extra_args, port=PORT):
+    def __init__(self, *extra_args, port=PORT, root=WWW):
         self.port = port
         self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(
-            [SERVER, "-p", str(port), "-r", WWW, *extra_args],
+            [SERVER, "-p", str(port), "-r", root, *extra_args],
             stdout=subprocess.DEVNULL, stderr=self.log)
         wait_for_port(port)
 
@@ -278,6 +280,62 @@ def test_incomplete_header_timeout_408(server):
         assert time.time() - start >= IDLE_TIMEOUT - 1
 
 
+def test_server_side_errors_500_and_file_shrinks_midway(server):
+    """서버 쪽 문제: 링크 순환 → 500, 보내는 도중 파일이 줄어듦 → 200 헤더 뒤라 500으로 못 바꾸니 연결을 끊음."""
+    big_size = 32 * 1024 * 1024
+    with tempfile.TemporaryDirectory() as root:
+        os.symlink("loop_b", os.path.join(root, "loop_a"))
+        os.symlink("loop_a", os.path.join(root, "loop_b"))
+        big = os.path.join(root, "big.bin")
+        with open(big, "wb") as f:
+            f.truncate(big_size)
+        with open(os.path.join(root, "ok.txt"), "w") as f:
+            f.write("ok")
+        other = Server(port=PORT + 7, root=root)
+        try:
+            # 1) 500: 요청은 정상인데 서버의 파일 시스템 설정이 잘못됨 (keep-alive는 유지)
+            with connect(PORT + 7) as sock:
+                sock.sendall(b"GET /loop_a HTTP/1.1\r\nHost: a\r\n\r\n")
+                status, headers, _ = read_response(sock)
+                assert status == 500 and headers["connection"] == "keep-alive"
+                sock.sendall(b"GET /" + b"n" * 300 + b" HTTP/1.1\r\nHost: a\r\n\r\n")
+                assert read_response(sock)[0] == 414          # 이름이 너무 김 = 클라이언트 쪽 문제
+
+            # 2) 헤더(200, Content-Length 32MB)를 받은 뒤 파일을 0바이트로 자름
+            with connect(PORT + 7, timeout=15) as sock:
+                sock.sendall(b"GET /big.bin HTTP/1.1\r\nHost: a\r\n\r\n")
+                status, headers, _ = read_response(sock, head=True)
+                assert status == 200 and int(headers["content-length"]) == big_size
+                time.sleep(0.3)                     # 서버가 소켓 버퍼를 채우고 send에서 멈출 때까지
+                os.truncate(big, 0)                 # 이후 read()는 0(EOF)을 돌려줌
+                received = len(sock.buffer)
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                assert received < big_size, received    # 덜 받고 연결이 끊김 → 클라이언트가 실패를 알 수 있음
+            assert get("/ok.txt", port=PORT + 7)[2] == b"ok"   # 서버는 계속 동작
+            assert other.alive()
+        finally:
+            other.stop()
+
+
+def test_slow_request_deadline_408(server):
+    """slowloris: 1초마다 1바이트씩 보내면 recv 대기(5초)는 매번 다시 시작되지만, 요청 총 한도(10초)에서 끊긴다."""
+    request = b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: " + b"p" * 64 + b"\r\n\r\n"  # 다 보내려면 100초 이상
+    with connect(timeout=REQUEST_TIMEOUT + IDLE_TIMEOUT + 5) as sock:
+        start = time.time()
+        for byte in request:
+            sock.sendall(bytes([byte]))
+            readable, _, _ = select.select([sock], [], [], 1.0)  # 1초 쉬되, 응답이 오면 바로 멈춤
+            if readable:
+                break
+        assert read_response(sock)[0] == 408
+        elapsed = time.time() - start
+        assert REQUEST_TIMEOUT - 1 <= elapsed <= REQUEST_TIMEOUT + 3, elapsed
+
+
 def test_large_body_and_long_uri(server):
     status, _, _ = request(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 999999999\r\n\r\n")
     assert status == 413
@@ -449,6 +507,24 @@ def test_proxy_client_disconnects_midway(server):
     sock.close()                                       # 백엔드 응답 전에 클라이언트가 떠남
     assert proxy_get("/api/after")[0] == 200
     assert server.alive()
+
+
+def test_proxy_frees_worker_when_client_leaves(server):
+    """느린 백엔드를 기다리던 클라이언트들이 떠나면 작업 스레드가 바로 풀려야 한다.
+    스레드(8)의 두 배인 16개를 보내고 모두 끊는다. 감지하지 못하면 스레드가 백엔드 타임아웃(5초)씩
+    두 차례 묶여 새 요청이 최대 10초를 기다린다."""
+    abandoned = [connect() for _ in range(16)]
+    for sock in abandoned:
+        sock.sendall(b"GET /api/slow HTTP/1.1\r\nHost: a\r\n\r\n")
+    time.sleep(0.5)                        # 작업 스레드들이 요청을 읽고 백엔드를 기다리기 시작할 때까지
+    for sock in abandoned:
+        sock.close()                       # FIN: 요청은 이미 도착했고, 이제 응답을 받을 사람이 없음
+    start = time.time()
+    assert get("/index.html")[0] == 200
+    elapsed = time.time() - start
+    assert elapsed < 2.0, f"worker threads stayed busy for {elapsed:.1f}s"
+    time.sleep(0.5)
+    assert "client left while waiting" in server.logs()
 
 
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]

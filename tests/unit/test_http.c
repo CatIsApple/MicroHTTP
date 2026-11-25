@@ -112,6 +112,11 @@ static void test_size_limits(void)
     memset(text + n, 'a', HTTP_MAX_TARGET);
     snprintf(text + n + HTTP_MAX_TARGET, sizeof(text) - (size_t)n - HTTP_MAX_TARGET, " HTTP/1.1\r\nHost: a\r\n\r\n");
     expect_error(text, 414);
+    /* 헤더 상한(16KB)보다 긴 URI: 요청 줄이 끝나기 전에 상한 도달 → 431이 아니라 414 */
+    n = snprintf(text, sizeof(text), "GET /");
+    memset(text + n, 'a', HTTP_MAX_HEADER);
+    text[n + HTTP_MAX_HEADER] = '\0';
+    expect_error(text, 414);
     /* 헤더가 상한까지 끝나지 않음 → 431 */
     n = snprintf(text, sizeof(text), "GET / HTTP/1.1\r\nHost: a\r\nX: ");
     memset(text + n, 'b', HTTP_MAX_HEADER);
