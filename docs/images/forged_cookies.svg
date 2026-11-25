@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', sans-serif">
+<defs><marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fe4"/></marker><marker id="blue-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#2f6fe4"/></marker><marker id="pink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e0457b"/></marker><marker id="pink-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#e0457b"/></marker><marker id="gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8a8a8a"/></marker><marker id="gray-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#8a8a8a"/></marker></defs>
+<rect width="960" height="470" fill="#ffffff"/>
+<text x="30" y="42" font-size="22" font-weight="700" fill="#111111">클라이언트가 보낸 값은 '열쇠'일 뿐, 상태가 아니다</text>
+<rect x="30" y="80" width="270" height="44" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="165.0" y="102.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">Cookie: sid=정상 64자</text>
+<line x1="300" y1="102" x2="560" y2="240" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
+<text x="312" y="88.0" font-size="14" font-weight="700" fill="#2f6fe4" text-anchor="start" dominant-baseline="middle">200</text>
+<rect x="30" y="140" width="270" height="44" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="165.0" y="162.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">Cookie 없음</text>
+<line x1="300" y1="162" x2="560" y2="240" stroke="#e0457b" stroke-width="1.6"/>
+<path d="M553,233 L567,247 M553,247 L567,233" stroke="#e0457b" stroke-width="2"/>
+<text x="312" y="148.0" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">401</text>
+<rect x="30" y="200" width="270" height="44" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="165.0" y="222.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">sid 한 글자 변조</text>
+<line x1="300" y1="222" x2="560" y2="240" stroke="#e0457b" stroke-width="1.6"/>
+<path d="M553,233 L567,247 M553,247 L567,233" stroke="#e0457b" stroke-width="2"/>
+<text x="312" y="208.0" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">401</text>
+<rect x="30" y="260" width="270" height="44" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="165.0" y="282.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">sid=aaaa…a (형식만 맞춤)</text>
+<line x1="300" y1="282" x2="560" y2="240" stroke="#e0457b" stroke-width="1.6"/>
+<path d="M553,233 L567,247 M553,247 L567,233" stroke="#e0457b" stroke-width="2"/>
+<text x="312" y="298.0" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">401</text>
+<rect x="30" y="320" width="270" height="44" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="165.0" y="342.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user=alice; logged_in=true</text>
+<line x1="300" y1="342" x2="560" y2="240" stroke="#e0457b" stroke-width="1.6"/>
+<path d="M553,233 L567,247 M553,247 L567,233" stroke="#e0457b" stroke-width="2"/>
+<text x="312" y="358.0" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">401</text>
+<rect x="30" y="380" width="270" height="44" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="165.0" y="402.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">로그아웃한 sid 재사용</text>
+<line x1="300" y1="402" x2="560" y2="240" stroke="#e0457b" stroke-width="1.6"/>
+<path d="M553,233 L567,247 M553,247 L567,233" stroke="#e0457b" stroke-width="2"/>
+<text x="312" y="418.0" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">401</text>
+<rect x="560" y="200" width="200" height="80" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="660.0" y="221.8" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">서버 측 Session 저장소</text>
+<text x="660.0" y="240.0" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">이 sid가 있고</text>
+<text x="660.0" y="258.2" font-size="14" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">만료 전인가?</text>
+<rect x="800" y="210" width="130" height="60" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
+<text x="865.0" y="240.0" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user: alice</text>
+<line x1="760" y1="240" x2="798" y2="240" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
+<text x="780" y="291.6" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">형식 검사 → 상수 시간 비교</text>
+<text x="780" y="308.4" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">→ 만료 검사</text>
+<text x="944" y="456.0" font-size="12" font-weight="400" fill="#8a8a8a" text-anchor="end" dominant-baseline="middle">실측 · tests/functional/test_server.py test_auth_*</text>
+</svg>

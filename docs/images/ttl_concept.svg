@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', sans-serif">
+<defs><marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fe4"/></marker><marker id="blue-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#2f6fe4"/></marker><marker id="pink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e0457b"/></marker><marker id="pink-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#e0457b"/></marker><marker id="gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8a8a8a"/></marker><marker id="gray-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#8a8a8a"/></marker></defs>
+<rect width="960" height="420" fill="#ffffff"/>
+<text x="30" y="42" font-size="22" font-weight="700" fill="#111111">TTL을 얼마로 할까</text>
+<line x1="120" y1="340" x2="780" y2="340" stroke="#111111" stroke-width="1.6" marker-end="url(#blue)"/>
+<line x1="120" y1="340" x2="120" y2="70" stroke="#111111" stroke-width="1.6" marker-end="url(#blue)"/>
+<text x="440.0" y="370.0" font-size="14" font-weight="400" fill="#111111" text-anchor="middle" dominant-baseline="middle">Session 수명 (TTL)  짧게 ←→ 길게</text>
+<text x="100" y="215.0" font-size="14" font-weight="400" fill="#111111" text-anchor="end" dominant-baseline="middle">부담</text>
+<path d="M140,320 C370,310 510,210 760,100" fill="none" stroke="#e0457b" stroke-width="2.2"/>
+<path d="M140,100 C320,260 560,320 760,325" fill="none" stroke="#2f6fe4" stroke-width="2.2"/>
+<text x="770" y="90.9" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">탈취된 ID가</text>
+<text x="770" y="109.1" font-size="14" font-weight="700" fill="#e0457b" text-anchor="start" dominant-baseline="middle">유효한 시간</text>
+<text x="150" y="75.9" font-size="14" font-weight="700" fill="#2f6fe4" text-anchor="start" dominant-baseline="middle">다시 로그인하는</text>
+<text x="150" y="94.1" font-size="14" font-weight="700" fill="#2f6fe4" text-anchor="start" dominant-baseline="middle">번거로움</text>
+<text x="470" y="385.0" font-size="13" font-weight="400" fill="#8a8a8a" text-anchor="middle" dominant-baseline="middle">개념 설명용 — 측정값이 아니며, 두 곡선의 교점을 최적값으로 단정하지 않습니다</text>
+<text x="944" y="406.0" font-size="12" font-weight="400" fill="#8a8a8a" text-anchor="end" dominant-baseline="middle">개념도</text>
+</svg>
