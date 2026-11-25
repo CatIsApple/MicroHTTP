@@ -20,7 +20,7 @@ src/net.c          send_all, 소켓 타임아웃, 오류 응답, 타임아웃 �
 main()                                             server.c:496
  ├─ parse_arguments()                              server.c:456
  │    getopt로 -p -r -t -R -b -v 읽기
- │    -R 마다 proxy_add_route()                    proxy.c:49   → proxy_table.routes[]
+ │    -R 마다 proxy_add_route()                    proxy.c:50   → proxy_table.routes[]
  │    realpath(root) → config.root (malloc)         server.c:487
  ├─ install_signal_handlers()                      server.c:375
  │    SIGINT, SIGTERM → on_stop_signal (stop_requested = 1)
@@ -107,15 +107,15 @@ handle_connection(6)                               server.c:224
 
 ```text
 handle_request()                                   server.c:186
- ├─ proxy_find_route(&proxy_table, "/api/echo")    proxy.c:75   → "/api/" 규칙
+ ├─ proxy_find_route(&proxy_table, "/api/echo")    proxy.c:76   → "/api/" 규칙
  ├─ *keep_alive = 0                                server.c:195  응답 끝을 EOF로 알리므로 연결 닫음
  └─ proxy_forward(client_fd, &request, &proxy_table, route)   proxy.c:204
-      ├─ proxy_next_backend()                      proxy.c:92   mutex 안에서 순번 0 → 다음은 1
+      ├─ proxy_next_backend()                      proxy.c:93   mutex 안에서 순번 0 → 다음은 1
       ├─ connect_with_timeout("127.0.0.1","9001",2000)  net.c:73
       │    getaddrinfo → socket → O_NONBLOCK → connect=EINPROGRESS
       │    poll(POLLOUT, 2초) → getsockopt(SO_ERROR)=0 → 블로킹으로 복구
       │    (실패하면 다음 백엔드 시도, 모두 실패 → 502)
-      ├─ proxy_build_request()                     proxy.c:117
+      ├─ proxy_build_request()                     proxy.c:118
       │    "POST /api/echo HTTP/1.1\r\n" + 원래 헤더(hop-by-hop 제외) + "Connection: close\r\n\r\n"
       ├─ set_socket_timeout(backend, 5초)
       ├─ send_all(backend, header) ; send_all(backend, body 5바이트)
