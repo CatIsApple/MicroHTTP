@@ -47,13 +47,14 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
 - **Why**: 블로킹은 코드를 위에서 아래로 쓸 수 있어 읽기 쉽지만, 상대가 아무것도 보내지 않으면 스레드가 영원히 멈춥니다.
 - **How**:
   - 클라이언트 쪽은 **블로킹 + 타임아웃**입니다. `SO_RCVTIMEO`/`SO_SNDTIMEO`를 5초로 걸면, 5초 동안 진행이 없을 때 `recv`가 `EAGAIN`으로 돌아옵니다.
+  - 이 5초는 recv **한 번**의 대기 한도라 바이트가 올 때마다 다시 시작됩니다. 그래서 요청 하나를 다 받는 **총 한도**(`REQUEST_TIMEOUT_SECONDS` 10초)를 따로 둡니다. 첫 바이트 시각을 `CLOCK_MONOTONIC`으로 기록하고, 아직 NEED_MORE인데 10초가 지났으면 408을 보냅니다.
   - 백엔드 연결은 **논블로킹 connect + poll**입니다. `O_NONBLOCK`으로 바꾸면 `connect`가 즉시 `EINPROGRESS`로 돌아옵니다. 그다음 `poll(POLLOUT, 2초)`로 연결 완료를 기다리고, `SO_ERROR`로 성공 여부를 확인한 뒤 블로킹으로 되돌립니다.
 - **Without**: 헤더를 보내다 멈춘 클라이언트 하나가 작업 스레드를 영원히 붙잡습니다. 응답 없는 백엔드 IP에 블로킹 connect를 하면 OS 기본값(수십 초 이상)만큼 멈춥니다.
 - **Code**:
   - `src/net.c` `set_socket_timeout()`, `connect_with_timeout()`
-  - `src/server.c` `handle_connection()`의 `EAGAIN` → 408
+  - `src/server.c` `handle_connection()`의 `EAGAIN` → 408, `request_started` + `monotonic_seconds()` → 408(총 한도)
   - `src/proxy.c` `proxy_forward()`의 `EAGAIN` → 504
-- 테스트: `test_incomplete_header_timeout_408`, `test_proxy_backend_timeout_504`
+- 테스트: `test_incomplete_header_timeout_408`, `test_slow_request_deadline_408`, `test_proxy_backend_timeout_504`
 
 **확인 질문**
 - 우리 타임아웃 5초는 "요청 전체를 5초 안에"인가, "recv 한 번이 5초 안에"인가? 그 차이로 남는 공격(Slowloris)은?

@@ -6,6 +6,8 @@
 
 ---
 
+> 품질 기준(단위·기능·부하·메모리·엣지 케이스)별 재검증 결과는 **QUALITY_REPORT.md**에 있습니다.
+
 ## 1. 기존 코드 분석 (STEP 1)
 
 | 분류 | 항목 | 처리 |
@@ -74,7 +76,7 @@
 |---|---|---|
 | Makefile | ✅ | `make`, `make test`, `make asan` |
 | 포트, 루트, 라우팅 규칙을 CLI로 | ✅ | `-p`, `-r`, `-R`, (`-t`, `-b`, `-v`) — `parse_arguments` |
-| macOS / Linux 이식성 | ✅ | `_POSIX_C_SOURCE=200809L`, macOS clang·Linux gcc 모두 `-Werror` 빌드 |
+| macOS / Linux 이식성 | ✅ | `_XOPEN_SOURCE=700`(POSIX.1-2008 + XSI), macOS clang·Linux gcc 모두 `-Werror` 빌드 (QUALITY_REPORT 6절에서 수정) |
 | 외부 HTTP/이벤트 라이브러리 미사용 | ✅ | libc + POSIX(pthread)만 링크 |
 
 ### 중점 포인트
@@ -110,7 +112,7 @@ PASS test_static: index, query, percent-decode, 404, 403 (.., symlink, permissio
 PASS test_net: partial send, EINTR, EPIPE, timeout, zero progress, empty input
 PASS test_proxy: rule parsing, longest-prefix routing, round-robin, request rewrite (hop-by-hop, Host)
 ...
-24/24 functional tests passed
+25/25 functional tests passed
 ```
 
 | 요구된 단위 테스트 | 파일 | 결과 |
@@ -122,13 +124,13 @@ PASS test_proxy: rule parsing, longest-prefix routing, round-robin, request rewr
 | 정적 경로 해석 | `tests/unit/test_static.c` | PASS |
 | send_all | `tests/unit/test_net.c` | PASS |
 
-### 4.2 기능 테스트 (실제 TCP, `tests/functional/test_server.py`) — 24/24 PASS
+### 4.2 기능 테스트 (실제 TCP, `tests/functional/test_server.py`) — 25/25 PASS
 
 | 분류 | 테스트 |
 |---|---|
 | 정적·MIME | `test_static_files_and_mime`, `test_static_head_has_no_body`, `test_static_errors_404_403_405` |
 | keep-alive | `test_keepalive_reuses_connection`, `test_connection_close_and_http10`, `test_pipelined_requests`, `test_keepalive_idle_timeout_closes_quietly` |
-| 비정상 요청 | `test_malformed_requests`(505, 400×4, 411, 501), `test_incomplete_header_then_close`(400), `test_incomplete_header_timeout_408`, `test_large_body_and_long_uri`(413, 414, 431) |
+| 비정상 요청 | `test_malformed_requests`(505, 400×4, 411, 501), `test_incomplete_header_then_close`(400), `test_incomplete_header_timeout_408`, `test_slow_request_deadline_408`(Slowloris), `test_large_body_and_long_uri`(413, 414, 431) |
 | 연결 종료 | `test_sudden_client_disconnect`(헤더 도중 끊기, RST, 응답 안 읽고 끊기 ×20) |
 | 동시 처리 | `test_concurrent_slow_client_does_not_block_others`, `test_concurrent_many_clients`(200연결×10요청, 50병렬), `test_pool_exhausted_requests_wait_not_fail` |
 | 셧다운 | `test_graceful_shutdown_finishes_inflight_request`(SIGTERM, SIGINT 각각: 처리 중 요청 200 완료, exit 0, 리스너 닫힘) |
@@ -212,6 +214,8 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 
 결과: Linux 7.0.12-linuxkit / gcc 13.3에서 `-Werror` 일반 빌드 성공, 새니타이저 빌드 단위 테스트 5개 PASS.
 
+> **정정 (2026-11-25)**: c8eedd1을 위 명령으로 다시 빌드하니 `realpath` 미선언 오류로 **실패**했습니다(glibc는 `_POSIX_C_SOURCE`만으로 `realpath`를 선언하지 않음). `_XOPEN_SOURCE=700`으로 수정한 뒤 일반·새니타이저 빌드와 단위 테스트가 모두 통과합니다. 자세한 내용은 QUALITY_REPORT.md 6절.
+
 ---
 
 ## 5. 실패 → 원인 → 수정 이력
@@ -224,6 +228,9 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | ASan 빌드에서 503 테스트 `ECONNRESET` | 미수신 요청이 남은 소켓을 응답 직후 close → RST가 503을 덮음 | 큐가 차면 main이 기다리는 배압(`not_full`)으로 변경, 503 제거 |
 | ab 결과가 비어 있음 | 비 keep-alive 10만 연결로 클라이언트 ephemeral 포트 고갈(TIME_WAIT) | keep-alive 스윕과 소량 배치+휴식으로 분리 |
 | 헤더 원문을 `strstr`로 탐색 | NUL 종료가 보장되지 않는 버퍼 | `memchr`로 범위 제한 |
+| Linux에서 `realpath` 미선언 빌드 실패 | glibc는 XSI 매크로가 있어야 선언 | `_XOPEN_SOURCE=700` |
+| 16KB 넘는 URI가 431 | 요청 줄이 끝나기 전에 헤더 상한 도달 | 요청 줄에 `\r\n`이 없으면 414 |
+| Slowloris로 작업 스레드 무기한 점유 | 타임아웃이 recv 1회 기준 | 요청당 총 한도 10초 → 408 |
 
 ---
 
@@ -232,7 +239,8 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 | 항목 | 내용 |
 |---|---|
 | keep-alive + 스레드 풀 | 동시 keep-alive 연결 수가 스레드 수를 넘으면 처리량 급락(4.6). 유휴 타임아웃 5초 |
-| 느린 전송(Slowloris) | 타임아웃은 recv 1회 대기 기준이라 조금씩 계속 보내는 클라이언트는 스레드를 오래 점유 가능 |
+| 느린 전송(Slowloris) | 요청당 총 한도 10초로 막았지만(408), 연결이 스레드 수만큼 동시에 들어오면 그 10초 동안은 다른 연결이 기다림 |
+| 큰 요청의 조기 거절 | 413/414/431 후 남은 입력을 읽지 않고 닫음(lingering close 없음) → 다 보낸 뒤에야 읽는 클라이언트는 응답 대신 RST를 볼 수 있음 |
 | 백엔드 타임아웃 | recv 1회 대기 5초 기준. 계속 조금씩 보내는 백엔드는 전체 기한 없음 |
 | 프록시 연결 | 프록시 응답 후 클라이언트 연결을 닫음(keep-alive 안 함), 백엔드 연결 재사용 없음 |
 | 프록시 헤더 | Connection 헤더 값에 나열된 추가 hop-by-hop 헤더는 제거하지 않음. X-Forwarded-For 없음 |

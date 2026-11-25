@@ -8,6 +8,7 @@
 | [CODE_FLOW.md](CODE_FLOW.md) | 서버 실행부터 종료까지, 연결부터 응답까지의 함수 호출 순서 |
 | [STUDY_GUIDE.md](STUDY_GUIDE.md) | 핵심 개념 12개를 What/Why/How/Without/Code로 정리 + 확인 질문 |
 | [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) | 요구사항별 구현 상태, 테스트 명령어와 실제 결과, 한계 |
+| [QUALITY_REPORT.md](QUALITY_REPORT.md) | 품질 기준(단위·기능·부하·메모리·엣지 케이스)별 검증 결과와 발견·수정한 결함 |
 
 ## 빌드와 실행
 
@@ -45,6 +46,7 @@ curl http://127.0.0.1:8080/api/hello  # A, B가 번갈아 응답 (Round-Robin)
 make test   # 단위 테스트(tests/unit) + 기능 테스트(tests/functional)
 make asan   # AddressSanitizer/UBSan 빌드로 전체 테스트
 sh tests/functional/curl_check.sh   # curl로 정적 파일·프록시 확인
+python3 tests/functional/edge_probe.py <port>   # 떠 있는 서버에 엣지 케이스 30개 (사용법은 파일 머리말)
 ```
 
 ## 소스 구조
