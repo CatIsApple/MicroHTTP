@@ -13,10 +13,11 @@ REQUIREMENTS.md의 "품질" 항목을 기준으로 2026-11-25에 다시 검증�
 | 단위 테스트 (HTTP 파서, MIME, 라우팅/프록시 전달) | ✅ 5개 모듈 PASS (macOS, Linux, Linux+새니타이저) | 1 |
 | 기능 테스트 — curl / 브라우저 | ✅ curl 13/13, 브라우저 하위 자원 4개 200 + 프록시 fetch 200 | 2 |
 | 기능 테스트 — 동시 다중 클라이언트 | ✅ 자동 테스트 + 혼합 200병렬 요청 내용 바이트 비교 불일치 0 | 2 |
-| 부하 테스트 | ✅ `ab`로 동시성별 처리량 측정 (wrk/hey는 미설치 → 미검증) | 3 |
-| 메모리 누수 / 잘못된 접근 | ✅ ASan+UBSan(macOS), ASan+LSan+UBSan(Linux 실서버), macOS leaks 0 (Valgrind 미검증) | 4 |
-| 엣지 케이스 | ✅ 기능 25/25 + 엣지 탐침 30/30 (release, ASan, Linux LSan 세 빌드 모두) | 5 |
-| 검증 중 발견한 결함 | 🔧 3건 수정: Linux 빌드 실패, 16KB 넘는 URI가 431, Slowloris | 6 |
+| 부하 테스트 | ✅ `ab`, `wrk`, `hey` 세 도구로 동시성별 처리량 측정 | 3 |
+| 메모리 누수 / 잘못된 접근 | ✅ ASan+UBSan(macOS), ASan+LSan+UBSan(Linux 실서버), **Valgrind memcheck**(Linux 단위 5개 + 실서버), macOS leaks 0 | 4 |
+| 엣지 케이스 | ✅ 기능 26/26 (macOS, Linux 일반 사용자) + 엣지 탐침 30/30 (release, ASan, Linux LSan). Valgrind 서버에서는 27/28 — 7절 한계 참고 | 5 |
+| 검증 중 발견한 결함 | 🔧 4건 수정: Linux 빌드 실패, 16KB 넘는 URI가 431, Slowloris, 긴 파일 이름이 500 | 6 |
+| 500 응답 실제 발생 | ✅ 링크 순환(ELOOP) → 500, malloc 실패 주입 → 500, 전송 중 파일 축소 → 연결 끊김 | 5.1 |
 
 ---
 
@@ -55,7 +56,7 @@ make test     # 단위 + tests/functional/test_server.py
 make asan     # 같은 테스트를 ASan+UBSan 빌드로
 ```
 
-결과: `25/25 functional tests passed` (release, ASan 모두). 서버 로그에 새니타이저 보고가 있으면 하니스가 실패로 처리합니다.
+결과: `26/26 functional tests passed` (macOS release·ASan, Linux gcc 일반 사용자 `tester` 모두). 서버 로그에 새니타이저 보고가 있으면 하니스가 실패로 처리합니다.
 
 ### 2.2 curl
 
@@ -104,6 +105,26 @@ CSS 적용(`font-family: system-ui`), PNG·JPG 로드 완료, 하위 자원 `sty
   실서비스에서는 백엔드 연결 재사용(keep-alive 풀)으로 줄이지만 범위 밖입니다.
 - 비교용으로 백엔드(Python `ThreadingHTTPServer`, listen 대기열 5)에 직접 `ab -c 10`을 걸면 첫 요청에서 `Connection reset by peer`로 중단됩니다. 프록시 경유 시에는 실패 0이었습니다.
 
+### 3.1 wrk / hey (같은 서버, 수정 후 빌드)
+
+| 도구 · 시나리오 | c | 요청/초 | p99 | 오류 |
+|---|---:|---:|---:|---|
+| `wrk -d 10s` keep-alive `GET /` | 1 | 21,421 | 1.38ms | 0 |
+| | 8 | 47,876 | 1.87ms | 0 |
+| | 16 | 53,376 | 18.6ms | 0 |
+| | 64 | 51,821 | 137.7ms | 0 |
+| `hey -n 20000` keep-alive | 10 | 33,637 | 0.7ms | 200 × 20000 |
+| | 50 | 38,415 | 3.0ms | 200 × 20000 |
+| | 100 | 3,615 | 16.8ms | 200 × 20000 |
+| `hey -n 3000 -disable-keepalive` | 10 | 14,582 | 2.0ms | 200 × 3000 |
+| | 50 | 17,522 | 8.0ms | 200 × 3000 |
+| `hey -n 1000` 프록시 `/api/x` | 10 | 7,643 | 6.1ms | 200 × 1000 |
+| `wrk -d 3s` 프록시 `/api/x` (TIME_WAIT 식힌 뒤) | 10 | 2,701 | 361ms | 0 (8,165건) |
+
+- wrk는 keep-alive c=16·64에서도 처리량이 유지됐습니다. 연결당 100요청 제한으로 서버가 연결을 닫으면 wrk는 곧바로 다시 연결하기 때문입니다(ab는 이때 Length 실패로 셉니다). hey c=100에서는 ab처럼 급락했습니다 — 스레드 8 < 연결 100.
+- **wrk 프록시 10초 실행**은 TIME_WAIT 소켓이 18,627개까지 쌓여 ephemeral 포트 범위(16,384)를 넘었고, 백엔드 connect가 2초 타임아웃 → 두 백엔드 모두 실패 → **502 1건**, wrk timeout 3건이 났습니다. 설계대로의 장애 처리(장애 백엔드 건너뛰기 → 모두 실패 시 502)이며, 측정 환경의 포트 고갈이 원인입니다. 3초 실행에서는 오류 0.
+- 서버 fd: 측정 전 7 → 전체 측정 후 7.
+
 ## 4. 메모리 안전성
 
 | 검사 | 방법 | 결과 |
@@ -112,7 +133,7 @@ CSS 적용(`font-family: system-ui`), PNG·JPG 로드 완료, 하위 자원 `sty
 | ASan + UBSan, 실서버 (macOS) | ASan 빌드 서버에 엣지 탐침 30케이스(64MB 다운로드 중 끊기 포함) → SIGTERM | 30/30, exit 0, 로그의 `AddressSanitizer`/`runtime error` 0건, fd 8 → 8 |
 | ASan + **LSan** + UBSan, 실서버 (Linux) | 컨테이너 서버에 호스트에서 엣지 탐침 30케이스 + `ab` 정적 5000(c=50) + keep-alive 5000 + 프록시 300 → `docker stop`(SIGTERM) | 30/30, 실패 0, `shutdown complete`, exit 0, **요청 10,571건 처리 후 누수·오류 보고 0**, 종료 직전 fd 4개(stdio + 리스너) |
 | macOS leaks | `MallocStackLogging=1 leaks --atExit -- ./server ...` + 엣지 탐침 + ab 3300 → SIGTERM | `0 leaks for 0 total leaked bytes`, fd 10 → 10 |
-| Valgrind | — | **미검증** (macOS·컨테이너에 없음) |
+| **Valgrind memcheck** (Linux) | `tests/linux/verify.sh` 2·3단계: `-O0 -g` 빌드, `--leak-check=full --errors-for-leak-kinds=definite,indirect --error-exitcode=99` | 단위 5개 보고 0 · 실서버에 엣지 탐침 28케이스 후 SIGTERM → exit 0, `shutdown complete`, 잘못된 접근·definite/indirect 누수 0, `--track-fds` 종료 시 열린 fd = stdio 3개 + valgrind 로그 1개(리스너·연결·파일 모두 닫힘) |
 
 ## 5. 엣지 케이스
 
@@ -134,6 +155,14 @@ release · macOS ASan · Linux LSan 세 빌드 모두 **30/30 PASS**.
 curl처럼 보내면서 읽는 클라이언트는 응답을 받지만, **다 보낸 뒤에야 읽는** 클라이언트는 송신 중 EPIPE/RST를 먼저 볼 수 있습니다
 (nginx는 "lingering close"로 남은 입력을 잠시 버려 주지만 단순성을 위해 생략).
 
+### 5.1 500 응답과 "헤더 뒤 실패"의 실제 발생
+
+| 상황 | 재현 방법 | 결과 | 검증 위치 |
+|---|---|---|---|
+| 서버 설정 오류: 심볼릭 링크 순환 | 루트에 `loop_a → loop_b → loop_a` | `stat`이 ELOOP → **500**, keep-alive 유지 | `test_static.c`, `test_server_side_errors_500_and_file_shrinks_midway` |
+| 메모리 부족: 연결 버퍼 `malloc(81920)` 실패 | `tests/linux/fail_malloc.c`를 `LD_PRELOAD` (서버 코드 변경 없음) | **500** × 5, 서버 계속 동작 | `tests/linux/verify.sh` 4단계 |
+| 200 헤더를 보낸 뒤 `read` 실패 | 32MB 파일 전송 중 `truncate(0)` → `read`가 0 | 상태를 바꿀 수 없으므로 **연결을 끊음**, 클라이언트는 Content-Length보다 덜 받아 실패를 알 수 있음, 서버 계속 동작 | `test_server_side_errors_500_and_file_shrinks_midway` |
+
 ## 6. 검증 중 발견해 수정한 결함
 
 | # | 증상 | 원인 | 수정 | 회귀 테스트 |
@@ -142,14 +171,28 @@ curl처럼 보내면서 읽는 클라이언트는 응답을 받지만, **다 보
 | 2 | 16KB(헤더 상한)를 넘는 URI가 **431**로 응답 | 요청 줄이 끝나기 전에 헤더 상한에 먼저 걸림 | 상한 도달 시 요청 줄에 `\r\n`이 없으면 414 (`http_parse_request`) | `test_http.c` `test_size_limits` — 수정 전 코드에서 FAIL 확인 |
 | 3 | **Slowloris**: 1바이트씩 천천히 보내면 작업 스레드를 무기한 점유 (0.4초 간격 → 11초 뒤 200 응답) | `SO_RCVTIMEO` 5초는 recv 1회 기준이라 바이트가 올 때마다 다시 시작 | 요청 하나를 다 받는 총 한도 `REQUEST_TIMEOUT_SECONDS = 10` (`handle_connection`, `CLOCK_MONOTONIC`) → 408 | `test_slow_request_deadline_408` — 수정 전 서버에서 FAIL, 수정 후 10.04초에 408 |
 
+| 4 | 파일 이름 한 조각이 255바이트를 넘는 요청(`/nnn…300자`)이 **500** | `stat`의 ENAMETOOLONG을 "그 밖의 오류"로 분류 → 클라이언트 입력으로 서버 오류(5xx)를 만들 수 있음 | `status_from_errno`: ENAMETOOLONG → 414 | `test_static.c` |
+
 결함 1은 이전 보고서(IMPLEMENTATION_REPORT 4.7)의 "Linux gcc `-Werror` 빌드 성공" 기록과 어긋나 그 기록도 정정했습니다.
 
-## 7. 미검증 항목
+## 7. 남은 한계와 미검증 항목
 
-| 항목 | 이유 |
+이전에 미검증이던 항목(Valgrind, wrk/hey, Linux Python 기능 테스트, 500 응답, Linux 권한 403)은 모두 위에서 실행했습니다.
+Linux 검증은 한 번에 다시 실행할 수 있습니다:
+
+```sh
+docker build -t microhttp-verify tests/linux
+docker run --rm -v "$PWD":/src:ro microhttp-verify sh /src/tests/linux/verify.sh
+```
+
+마지막 실행 결과: `make test`(일반 사용자 tester, 26/26) PASS · Valgrind 단위 5개 PASS · Valgrind 실서버 PASS · malloc 주입 500 PASS ·
+**엣지 탐침(Valgrind 서버) 27/28 — FAIL 1건**:
+
+| 남은 한계 | 내용 |
 |---|---|
-| Valgrind | 설치되어 있지 않음. ASan/LSan/UBSan + macOS leaks로 대체 |
-| wrk / hey | 설치되어 있지 않음. `ab`만 사용 |
-| Linux에서 Python 기능 테스트(`test_server.py`) | 컨테이너에 Python 없음. Linux 서버는 호스트에서 엣지 탐침·ab로 시험 |
-| 500 응답의 실제 발생 | EIO 같은 오류를 정상 환경에서 재현하지 못함. 코드 경로만 존재 |
-| 다른 컴퓨터에서의 부하 테스트 | 모든 측정이 루프백 한 대. 네트워크 지연이 있는 환경의 수치는 다를 수 있음 |
+| 프록시 대기 중 클라이언트 이탈을 감지하지 못함 | 느린 백엔드(`/api/slow`)를 기다리는 동안 클라이언트가 끊어도 프록시는 백엔드 타임아웃(5초)까지 작업 스레드를 붙잡습니다. Valgrind로 서버가 느려지면 이런 요청 20개가 스레드 8개를 약 15초 점유해, 탐침의 생존 확인(8초)이 실패합니다. macOS·LSan 실행에서는 RST가 파싱보다 먼저 도착해 드러나지 않았습니다. 다만 끊지 않고 느린 요청만 보내도 같은 점유가 생기므로, 근본 원인은 "블로킹 스레드 풀 + 백엔드 타임아웃" 구조입니다. 테스트 조건은 바꾸지 않았습니다. |
+
+| 미검증 | 이유 |
+|---|---|
+| EIO 같은 실제 디스크 오류로 인한 500 | 정상 장비에서 재현 불가. 같은 코드 경로(`status_from_errno` → 500)를 ELOOP로 확인 |
+| 여러 대에 걸친 부하 테스트 | 모든 측정이 루프백 한 대. 실제 네트워크에서는 수치가 다를 수 있음 |

@@ -106,7 +106,8 @@ if BIG:
     time.sleep(7); s.close()
     case("disconnect", "client stops reading 64MB download (7s)", "-", "-")
 # 5) slowloris: 1바이트씩 → 5초 뒤 408
-s = conn(15); t = time.time(); req = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"; resp = b""
+s = conn(15); t = time.time(); # 다 보내려면 약 28초 → 10초 한도보다 충분히 길어야 "한도에서 끊기는지"를 시험할 수 있음
+req = b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: " + b"p" * 40 + b"\r\n\r\n"; resp = b""
 try:
     for b in req:
         s.sendall(bytes([b])); time.sleep(0.4)

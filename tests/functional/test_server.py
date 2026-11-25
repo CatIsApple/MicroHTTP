@@ -48,11 +48,11 @@ def wait_for_port(port, timeout=5.0):
 class Server:
     """./server를 실행하고 stderr 로그를 임시 파일에 모읍니다."""
 
-    def __init__(self, *extra_args, port=PORT):
+    def __init__(self, *extra_args, port=PORT, root=WWW):
         self.port = port
         self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(
-            [SERVER, "-p", str(port), "-r", WWW, *extra_args],
+            [SERVER, "-p", str(port), "-r", root, *extra_args],
             stdout=subprocess.DEVNULL, stderr=self.log)
         wait_for_port(port)
 
@@ -278,6 +278,47 @@ def test_incomplete_header_timeout_408(server):
         sock.sendall(b"GET / HTTP/1.1\r\nHost:")
         assert read_response(sock)[0] == 408
         assert time.time() - start >= IDLE_TIMEOUT - 1
+
+
+def test_server_side_errors_500_and_file_shrinks_midway(server):
+    """서버 쪽 문제: 링크 순환 → 500, 보내는 도중 파일이 줄어듦 → 200 헤더 뒤라 500으로 못 바꾸니 연결을 끊음."""
+    big_size = 32 * 1024 * 1024
+    with tempfile.TemporaryDirectory() as root:
+        os.symlink("loop_b", os.path.join(root, "loop_a"))
+        os.symlink("loop_a", os.path.join(root, "loop_b"))
+        big = os.path.join(root, "big.bin")
+        with open(big, "wb") as f:
+            f.truncate(big_size)
+        with open(os.path.join(root, "ok.txt"), "w") as f:
+            f.write("ok")
+        other = Server(port=PORT + 7, root=root)
+        try:
+            # 1) 500: 요청은 정상인데 서버의 파일 시스템 설정이 잘못됨 (keep-alive는 유지)
+            with connect(PORT + 7) as sock:
+                sock.sendall(b"GET /loop_a HTTP/1.1\r\nHost: a\r\n\r\n")
+                status, headers, _ = read_response(sock)
+                assert status == 500 and headers["connection"] == "keep-alive"
+                sock.sendall(b"GET /" + b"n" * 300 + b" HTTP/1.1\r\nHost: a\r\n\r\n")
+                assert read_response(sock)[0] == 414          # 이름이 너무 김 = 클라이언트 쪽 문제
+
+            # 2) 헤더(200, Content-Length 32MB)를 받은 뒤 파일을 0바이트로 자름
+            with connect(PORT + 7, timeout=15) as sock:
+                sock.sendall(b"GET /big.bin HTTP/1.1\r\nHost: a\r\n\r\n")
+                status, headers, _ = read_response(sock, head=True)
+                assert status == 200 and int(headers["content-length"]) == big_size
+                time.sleep(0.3)                     # 서버가 소켓 버퍼를 채우고 send에서 멈출 때까지
+                os.truncate(big, 0)                 # 이후 read()는 0(EOF)을 돌려줌
+                received = len(sock.buffer)
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                assert received < big_size, received    # 덜 받고 연결이 끊김 → 클라이언트가 실패를 알 수 있음
+            assert get("/ok.txt", port=PORT + 7)[2] == b"ok"   # 서버는 계속 동작
+            assert other.alive()
+        finally:
+            other.stop()
 
 
 def test_slow_request_deadline_408(server):

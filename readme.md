@@ -47,6 +47,7 @@ make test   # 단위 테스트(tests/unit) + 기능 테스트(tests/functional)
 make asan   # AddressSanitizer/UBSan 빌드로 전체 테스트
 sh tests/functional/curl_check.sh   # curl로 정적 파일·프록시 확인
 python3 tests/functional/edge_probe.py <port>   # 떠 있는 서버에 엣지 케이스 30개 (사용법은 파일 머리말)
+docker build -t microhttp-verify tests/linux && docker run --rm -v "$PWD":/src:ro microhttp-verify sh /src/tests/linux/verify.sh   # Linux: 일반 사용자 테스트, Valgrind, malloc 실패 주입
 ```
 
 ## 소스 구조

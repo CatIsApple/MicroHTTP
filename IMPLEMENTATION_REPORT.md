@@ -252,6 +252,8 @@ docker run --rm -v "$PWD":/src:ro memdbg:latest sh -c '... make server CC=gcc; m
 
 ## 7. 미검증 항목
 
+> **갱신 (2026-11-25)**: 아래 항목은 모두 이후에 검증했습니다 — Valgrind·Linux 기능 테스트·권한 403·malloc 실패 500은 `tests/linux/verify.sh`, wrk/hey와 ELOOP 500은 QUALITY_REPORT.md 3·5.1절. 아래 표는 당시 기록입니다.
+
 | 항목 | 이유 |
 |---|---|
 | Valgrind | 설치되어 있지 않음. ASan/UBSan/LSan으로 대체 검증 |
