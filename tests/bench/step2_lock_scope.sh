@@ -17,7 +17,7 @@ echo "scenario,run,requests_per_sec,avg_ms,p95_ms,p99_ms,status_200,non_200_or_e
 for variant in narrow wide; do
     build/server_${variant}_lock -p $PORT -r ./www -U tests/functional/users.txt 2> /tmp/microhttp_lock_$variant.log & SERVER=$!
     sleep 0.5
-    SID=$(curl -s -o /dev/null -D - -d 'username=alice&password=alice-test-pw' http://127.0.0.1:$PORT/login \
+    SID=$(curl -s -o /dev/null -D - -d 'username=userA&password=userA-test-pw' http://127.0.0.1:$PORT/login \
           | sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p')
     for concurrency in 8 50; do
         run=1

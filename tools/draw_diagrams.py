@@ -63,22 +63,17 @@ class Svg:
 
 
 def architecture():
-    s = Svg(960, 420)
-    s.title(30, 42, "MicroHTTP 구조")
-    s.box(30, 200, 150, 64, "브라우저")
-    s.box(270, 200, 170, 64, ["main 스레드", "accept 루프"])
-    s.box(520, 200, 170, 64, ["작업 스레드 ×8"])
-    s.box(520, 70, 170, 64, ["Session 저장소", "리스트 + mutex"], size=15)
-    s.box(770, 70, 170, 64, ["auth.c", "/login /logout /me"], size=15)
-    s.box(770, 200, 170, 64, "정적 파일")
-    s.box(770, 320, 170, 64, ["proxy.c", "→ 백엔드 서버"], size=15)
-    s.arrow(180, 232, 268, 232, label=["TCP 연결", "Cookie: sid=…"], ly=204)
-    s.arrow(440, 232, 518, 232, label=["fd → 큐"], ly=218)
-    s.arrow(690, 220, 768, 130, label="인증 경로", lx=760, ly=168)
-    s.arrow(690, 232, 768, 232)
-    s.arrow(690, 244, 768, 344, label="-R 규칙", lx=760, ly=292)
-    s.arrow(768, 102, 692, 102, label=["조회 결과는", "복사본만"], lx=730, ly=58)
-    s.arrow(355, 200, 518, 116, color=GRAY, dashed=True, label=["1초마다", "만료 정리"], lx=400, ly=128)
+    s = Svg(920, 300)
+    s.title(30, 42, "한눈에 보기")
+    s.box(30, 120, 170, 70, "브라우저")
+    s.box(370, 120, 190, 70, ["웹 서버", "작업 스레드 ×8"], size=16)
+    s.box(720, 120, 170, 70, ["Session 저장소", "서버 메모리"], size=16)
+    s.arrow(200, 140, 368, 140, label=["Cookie: sid=…"], ly=124)
+    s.arrow(368, 172, 202, 172, label=["Set-Cookie: sid=…", "(로그인할 때)"], ly=204)
+    s.arrow(560, 140, 718, 140, label=["sid로 조회"], ly=124)
+    s.arrow(718, 172, 562, 172, label=["값을 복사해 반환"], ly=192)
+    s.text(805, 222, "1초마다 만료 정리", color=GRAY, size=13)
+    s.text(460, 262, "연결(fd)은 식별에 쓰지 않음 — 사람은 Cookie의 Session ID로 구분", color=BLUE, size=14)
     s.tag("개념도")
     s.save("architecture.svg")
 
@@ -86,10 +81,10 @@ def architecture():
 def fd_vs_session():
     s = Svg(1040, 400)
     for ox, heading, server, b_label, b_result, b_ok in (
-            (0, "연결(fd)로 사람을 구분하면", ["MicroHTTP", "fd 5 = alice"], ["연결 2 (fd 5 재사용)", "Cookie 없음"], ["200  user: alice", "남이 alice가 됨"], False),
-            (530, "Session ID로 사람을 구분하면", ["MicroHTTP", "sid X = alice"], ["연결 2 (fd 5 재사용)", "Cookie 없음"], ["401", "누군지 모름"], True)):
+            (0, "연결(fd)로 사람을 구분하면", ["MicroHTTP", "fd 5 = userA"], ["연결 2 (fd 5 재사용)", "Cookie 없음"], ["200  user: userA", "남이 userA가 됨"], False),
+            (530, "Session ID로 사람을 구분하면", ["MicroHTTP", "sid X = userA"], ["연결 2 (fd 5 재사용)", "Cookie 없음"], ["401", "누군지 모름"], True)):
         s.title(30 + ox, 42, heading)
-        s.box(30 + ox, 90, 150, 64, ["A (alice)"])
+        s.box(30 + ox, 90, 150, 64, ["A (userA)"])
         s.box(30 + ox, 270, 150, 64, ["B", "(로그인 안 함)"], size=15)
         s.box(300 + ox, 180, 170, 70, server, size=16)
         a_label = ["연결 1 (fd 5)", "로그인 후 연결 종료"] if not b_ok else ["어느 연결이든", "Cookie: sid=X → 200"]
@@ -112,7 +107,7 @@ def forged_cookies():
             ("Cookie 없음", False, "401"),
             ("sid 한 글자 변조", False, "401"),
             ("sid=aaaa…a (형식만 맞춤)", False, "401"),
-            ("user=alice; logged_in=true", False, "401"),
+            ("user=userA; logged_in=true", False, "401"),
             ("로그아웃한 sid 재사용", False, "401")]
     for i, (label, ok, result) in enumerate(rows):
         y = 80 + i * 60
@@ -121,7 +116,7 @@ def forged_cookies():
         s.arrow(300, y + 22, 560, 240, color=color, cross=not ok)
         s.text(312, y + (8 if y + 22 <= 240 else 38), result, color=color, size=14, weight=700, anchor="start")
     s.box(560, 200, 200, 80, ["서버 측 Session 저장소", "이 sid가 있고", "만료 전인가?"], size=14)
-    s.box(800, 210, 130, 60, ["user: alice"], size=15)
+    s.box(800, 210, 130, 60, ["user: userA"], size=15)
     s.arrow(760, 240, 798, 240)
     s.text(780, 300, ["형식 검사 → 상수 시간 비교", "→ 만료 검사"], color=BLUE, size=13)
     s.tag("실측 · tests/functional/test_server.py test_auth_*")
@@ -133,7 +128,7 @@ def uaf():
     s.title(30, 42, "포인터를 넘기면")
     s.box(30, 90, 190, 64, ["작업 스레드 1", "/me 응답 만드는 중"], size=15)
     s.box(30, 290, 190, 64, ["작업 스레드 2", "/logout"], size=15)
-    s.box(300, 190, 180, 64, ["Session 노드", "user = alice"], size=15, dashed=True)
+    s.box(300, 190, 180, 64, ["Session 노드", "user = userA"], size=15, dashed=True)
     s.arrow(220, 112, 298, 200, label=["① 조회 → 노드 포인터", "받고 락 해제"], lx=345, ly=112)
     s.arrow(220, 322, 298, 246, color=PINK, label=["② free()"], lx=290, ly=316)
     s.arrow(150, 154, 330, 254, color=PINK, cross=True, label=["③ 해제된 메모리 읽기"], lx=120, ly=240)
@@ -144,7 +139,7 @@ def uaf():
     s.title(30 + ox, 42, "복사해서 들고 나가면")
     s.box(30 + ox, 90, 190, 64, ["작업 스레드 1", "SessionInfo 복사본"], size=15)
     s.box(30 + ox, 290, 190, 64, ["작업 스레드 2", "/logout"], size=15)
-    s.box(300 + ox, 190, 180, 64, ["Session 노드", "user = alice"], size=15, dashed=True)
+    s.box(300 + ox, 190, 180, 64, ["Session 노드", "user = userA"], size=15, dashed=True)
     s.arrow(220 + ox, 112, 298 + ox, 200, label=["① 락 안에서 값 복사", "→ 락 해제"], lx=345 + ox, ly=112)
     s.arrow(220 + ox, 322, 298 + ox, 246, label=["② free()"], lx=290 + ox, ly=316)
     s.text(125 + ox, 200, ["③ 복사본으로", "응답 → 안전"], color=BLUE, size=14, weight=700)

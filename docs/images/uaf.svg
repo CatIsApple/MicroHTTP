@@ -10,7 +10,7 @@
 <text x="125.0" y="331.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">/logout</text>
 <rect x="300" y="190" width="180" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6" stroke-dasharray="6 4"/>
 <text x="390.0" y="212.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">Session 노드</text>
-<text x="390.0" y="231.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user = alice</text>
+<text x="390.0" y="231.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user = userA</text>
 <line x1="220" y1="112" x2="298" y2="200" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
 <text x="345" y="103.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">① 조회 → 노드 포인터</text>
 <text x="345" y="120.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">받고 락 해제</text>
@@ -31,7 +31,7 @@
 <text x="665.0" y="331.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">/logout</text>
 <rect x="840" y="190" width="180" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6" stroke-dasharray="6 4"/>
 <text x="930.0" y="212.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">Session 노드</text>
-<text x="930.0" y="231.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user = alice</text>
+<text x="930.0" y="231.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">user = userA</text>
 <line x1="760" y1="112" x2="838" y2="200" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
 <text x="885" y="103.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">① 락 안에서 값 복사</text>
 <text x="885" y="120.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">→ 락 해제</text>

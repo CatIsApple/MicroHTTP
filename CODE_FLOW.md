@@ -132,14 +132,14 @@ handle_connection: keep_alive=0 → break → free(buffer) → 작업 스레드�
 ### 2.4 인증 요청: 로그인 → 새 연결로 `/me` → 로그아웃
 
 ```text
-[연결 1] POST /login  (username=alice&password=…)
+[연결 1] POST /login  (username=userA&password=…)
 handle_request                                         server.c:213
  └─ auth_handle_request(fd, &request, keep_alive)      auth.c:193   경로가 /login·/logout·/me가 아니면 0 → 정적 파일
       ├─ cookie_session_id → http_find_header("Cookie") auth.c:115, http.c:296
       ├─ form_value("username"), form_value("password") auth.c:82   %XX·'+' 디코딩
       ├─ check_password → crypto_pwhash_str_verify      auth.c:152   (libsodium argon2id)
       ├─ (이전 sid가 있으면) session_destroy(old)                    Session 고정 방지
-      ├─ session_create("alice", session_now(), new_id) auth.c:257 → session.c:91
+      ├─ session_create("userA", session_now(), new_id) auth.c:257 → session.c:91
       │    randombytes_buf(32바이트) → 16진수 64자, malloc 노드
       │    LOCK → 리스트 앞에 연결 → id 복사 → UNLOCK
       └─ send_auth_response(303, "Location: /me\r\nSet-Cookie: sid=…; Path=/; HttpOnly; SameSite=Lax")
@@ -153,7 +153,7 @@ auth_handle_request
  │    형식 검사(64자 16진수) → LOCK → sodium_memcmp로 찾기
  │    만료면 리스트에서 빼고 free, 0 반환 (Passive Expiration, 갱신하지 않음)
  │    유효하면 last_seen = now, user를 info에 **복사** → UNLOCK
- └─ (락 밖) "user: alice" 응답 생성·send           ← info는 복사본이라 그사이 로그아웃돼도 안전
+ └─ (락 밖) "user: userA" 응답 생성·send           ← info는 복사본이라 그사이 로그아웃돼도 안전
 
 [연결 3] POST /logout  Cookie: sid=<64자>
  └─ session_destroy(id)                                auth.c:237 → session.c:144   LOCK → 빼고 free → UNLOCK

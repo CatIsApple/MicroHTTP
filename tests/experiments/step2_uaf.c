@@ -66,7 +66,7 @@ static void *writer(void *unused)
         pthread_mutex_unlock(&id_lock);
         pause_us(100);
         session_destroy(old_id);                                       /* 로그아웃 → free */
-        session_create("alice", 100, new_id);                          /* 다시 로그인 */
+        session_create("userA", 100, new_id);                          /* 다시 로그인 */
         pthread_mutex_lock(&id_lock);
         memcpy(current_id, new_id, sizeof(current_id));
         pthread_mutex_unlock(&id_lock);
@@ -83,7 +83,7 @@ int main(int argc, char **argv)
     unsafe_mode = strcmp(argv[1], "unsafe") == 0;
     if (sodium_init() < 0) return 1;
     session_set_timeouts(3600, 3600);
-    session_create("alice", 100, current_id);
+    session_create("userA", 100, current_id);
     pthread_t read_thread, write_thread;
     pthread_create(&read_thread, NULL, reader, NULL);
     pthread_create(&write_thread, NULL, writer, NULL);

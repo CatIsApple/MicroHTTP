@@ -37,7 +37,7 @@ def scenario(binary, port):
     server = subprocess.Popen([binary, "-p", str(port), "-r", os.path.join(ROOT, "www"), "-U", USERS],
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     time.sleep(0.5)
-    body = b"username=alice&password=alice-test-pw"
+    body = b"username=userA&password=userA-test-pw"
     login = (b"POST /login HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Length: "
              + str(len(body)).encode() + b"\r\n\r\n" + body)
     rows = []

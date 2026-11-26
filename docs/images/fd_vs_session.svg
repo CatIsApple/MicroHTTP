@@ -3,30 +3,30 @@
 <rect width="1040" height="400" fill="#ffffff"/>
 <text x="30" y="42" font-size="22" font-weight="700" fill="#111111">연결(fd)로 사람을 구분하면</text>
 <rect x="30" y="90" width="150" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
-<text x="105.0" y="122.0" font-size="17" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">A (alice)</text>
+<text x="105.0" y="122.0" font-size="17" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">A (userA)</text>
 <rect x="30" y="270" width="150" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
 <text x="105.0" y="292.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">B</text>
 <text x="105.0" y="311.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">(로그인 안 함)</text>
 <rect x="300" y="180" width="170" height="70" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
 <text x="385.0" y="204.6" font-size="16" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">MicroHTTP</text>
-<text x="385.0" y="225.4" font-size="16" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">fd 5 = alice</text>
+<text x="385.0" y="225.4" font-size="16" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">fd 5 = userA</text>
 <line x1="180" y1="122" x2="298" y2="200" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
 <text x="270" y="101.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">연결 1 (fd 5)</text>
 <text x="270" y="118.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">로그인 후 연결 종료</text>
 <line x1="180" y1="302" x2="298" y2="236" stroke="#e0457b" stroke-width="1.6" marker-end="url(#pink)"/>
 <text x="250" y="321.6" font-size="13" font-weight="400" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">연결 2 (fd 5 재사용)</text>
 <text x="250" y="338.4" font-size="13" font-weight="400" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">Cookie 없음</text>
-<text x="400" y="280.9" font-size="14" font-weight="700" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">200  user: alice</text>
-<text x="400" y="299.1" font-size="14" font-weight="700" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">남이 alice가 됨</text>
+<text x="400" y="280.9" font-size="14" font-weight="700" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">200  user: userA</text>
+<text x="400" y="299.1" font-size="14" font-weight="700" fill="#e0457b" text-anchor="middle" dominant-baseline="middle">남이 userA가 됨</text>
 <text x="560" y="42" font-size="22" font-weight="700" fill="#111111">Session ID로 사람을 구분하면</text>
 <rect x="560" y="90" width="150" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
-<text x="635.0" y="122.0" font-size="17" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">A (alice)</text>
+<text x="635.0" y="122.0" font-size="17" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">A (userA)</text>
 <rect x="560" y="270" width="150" height="64" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
 <text x="635.0" y="292.2" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">B</text>
 <text x="635.0" y="311.8" font-size="15" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">(로그인 안 함)</text>
 <rect x="830" y="180" width="170" height="70" fill="#ffffff" stroke="#111111" stroke-width="1.6"/>
 <text x="915.0" y="204.6" font-size="16" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">MicroHTTP</text>
-<text x="915.0" y="225.4" font-size="16" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">sid X = alice</text>
+<text x="915.0" y="225.4" font-size="16" font-weight="700" fill="#111111" text-anchor="middle" dominant-baseline="middle">sid X = userA</text>
 <line x1="710" y1="122" x2="828" y2="200" stroke="#2f6fe4" stroke-width="1.6" marker-end="url(#blue)"/>
 <text x="800" y="101.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">어느 연결이든</text>
 <text x="800" y="118.5" font-size="13" font-weight="400" fill="#2f6fe4" text-anchor="middle" dominant-baseline="middle">Cookie: sid=X → 200</text>

@@ -20,7 +20,7 @@ import traceback
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SERVER = os.path.join(ROOT, "server")
 WWW = os.path.join(ROOT, "www")
-USERS = os.path.join(ROOT, "tests", "functional", "users.txt")   # alice / alice-test-pw, bob / bob-test-pw
+USERS = os.path.join(ROOT, "tests", "functional", "users.txt")   # userA / userA-test-pw, userB / userB-test-pw
 PORT = 18080
 IDLE_TIMEOUT = 5
 REQUEST_TIMEOUT = 10
@@ -574,7 +574,7 @@ def me(cookie_header=None, sock=None):
 
 
 def test_auth_login_cookie_attributes_and_new_connections(server):
-    status, headers, sid = login("alice", "alice-test-pw")
+    status, headers, sid = login("userA", "userA-test-pw")
     assert status == 303 and headers["location"] == "/me" and sid
     cookie = headers["set-cookie"]
     for attribute in ("HttpOnly", "SameSite=Lax", "Path=/"):
@@ -583,26 +583,26 @@ def test_auth_login_cookie_attributes_and_new_connections(server):
     # 로그인한 연결은 이미 닫혔다. 새 TCP 연결 3개에서 같은 Cookie로 인증이 유지되어야 한다.
     for _ in range(3):
         status, headers, body = me(f"theme=dark; sid={sid}")
-        assert status == 200 and body == b"user: alice\n" and headers["cache-control"] == "no-store"
+        assert status == 200 and body == b"user: userA\n" and headers["cache-control"] == "no-store"
     assert sid not in server.logs()                     # Session ID를 로그에 남기지 않음
 
 
 def test_auth_rejects_missing_wrong_and_forged_credentials(server):
     assert me()[0] == 401                                                # Cookie 없음
-    assert login("alice", "wrong")[0] == 401                             # 틀린 비밀번호
-    assert login("mallory", "alice-test-pw")[0] == 401                   # 없는 사용자
-    assert login("alice", "")[0] == 401
-    _, _, sid = login("alice", "alice-test-pw")
+    assert login("userA", "wrong")[0] == 401                             # 틀린 비밀번호
+    assert login("mallory", "userA-test-pw")[0] == 401                   # 없는 사용자
+    assert login("userA", "")[0] == 401
+    _, _, sid = login("userA", "userA-test-pw")
     tampered = sid[:-1] + ("0" if sid[-1] != "0" else "1")
     assert me(f"sid={tampered}")[0] == 401                               # 한 글자 바꾼 ID
     assert me("sid=" + "a" * 64)[0] == 401                               # 형식만 맞춘 위조 ID
-    assert me("user=alice; logged_in=true; role=admin")[0] == 401        # 상태를 담은 위조 Cookie
-    assert me("sid=alice")[0] == 401                                     # 사용자 이름을 ID로
+    assert me("user=userA; logged_in=true; role=admin")[0] == 401        # 상태를 담은 위조 Cookie
+    assert me("sid=userA")[0] == 401                                     # 사용자 이름을 ID로
     assert me(f"sid={sid}")[0] == 200                                    # 원래 ID는 여전히 유효
 
 
 def test_auth_logout_invalidates_on_server(server):
-    _, _, sid = login("bob", "bob-test-pw")
+    _, _, sid = login("userB", "userB-test-pw")
     assert me(f"sid={sid}")[0] == 200
     raw = f"POST /logout HTTP/1.1\r\nHost: a\r\nCookie: sid={sid}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     status, headers, _ = request(raw.encode())
@@ -612,8 +612,8 @@ def test_auth_logout_invalidates_on_server(server):
 
 
 def test_auth_login_reissues_session_id(server):
-    _, _, first = login("alice", "alice-test-pw")
-    status, _, second = login("alice", "alice-test-pw", cookie=first)
+    _, _, first = login("userA", "userA-test-pw")
+    status, _, second = login("userA", "userA-test-pw", cookie=first)
     assert status == 303 and second and second != first                 # 로그인마다 새 ID
     assert me(f"sid={first}")[0] == 401                                 # 이전 ID는 폐기 (Session 고정 방지)
     assert me(f"sid={second}")[0] == 200
@@ -623,12 +623,12 @@ def test_auth_is_per_request_not_per_connection(server):
     """하나의 keep-alive 연결에서도 인증은 요청마다 Cookie로 판단한다."""
     with connect() as sock:
         assert me(sock=sock)[0] == 401
-        _, _, sid = login("alice", "alice-test-pw", sock=sock)
+        _, _, sid = login("userA", "userA-test-pw", sock=sock)
         assert me(f"sid={sid}", sock=sock)[0] == 200
         assert me(sock=sock)[0] == 401                                   # 같은 연결이라도 Cookie가 없으면 401
-        _, _, bob = login("bob", "bob-test-pw", sock=sock)
-        assert me(f"sid={bob}", sock=sock)[2] == b"user: bob\n"          # 같은 연결에서 다른 사용자
-        assert me(f"sid={sid}", sock=sock)[2] == b"user: alice\n"
+        _, _, userB = login("userB", "userB-test-pw", sock=sock)
+        assert me(f"sid={userB}", sock=sock)[2] == b"user: userB\n"          # 같은 연결에서 다른 사용자
+        assert me(f"sid={sid}", sock=sock)[2] == b"user: userA\n"
 
 
 def test_auth_methods(server):
