@@ -1,6 +1,6 @@
 /* test_rproxy.c — Reverse Proxy(rproxy) + 공통 부품(proxy_core) 순수 함수 단위 테스트:
  * 라우트 규칙 해석, 경로 매칭(가장 긴 prefix·경계·dot-segment), 백엔드로 보낼 요청 머리 다시 쓰기,
- * 백엔드 응답 머리 검사·다시 쓰기. 소켓 I/O(rproxy_handle · pxy_exchange)는 test_functional 이 실제 백엔드로 검사한다. */
+ * 백엔드 응답 머리 검사·다시 쓰기, 죽은 백엔드 표시(닫힌 포트). 나머지 소켓 I/O(rproxy_handle · pxy_exchange)는 test_functional 이 실제 백엔드로 검사한다. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -9,7 +9,9 @@
 #include "rproxy.h"      /* 테스트 대상: 리버스 프록시 */
 #include "test.h"        /* CHECK, CHECK_INT, CHECK_STR, TEST_REPORT */
 #include <arpa/inet.h>   /* ntohs, inet_ntop */
-#include <string.h>      /* strstr, strlen, strcpy */
+#include <string.h>      /* strstr, strlen, strcpy, memset */
+#include <sys/socket.h>  /* socket, bind, getsockname */
+#include <unistd.h>      /* close */
 
 static rproxy_table g_t; /* 큼 → 전역 */
 
@@ -250,11 +252,59 @@ static void test_response_head(void)
     CHECK_INT(pxy_rewrite_response_head(out, 20, h, strlen(h), 1), -1); /* 버퍼 부족 */
 }
 
+/* 닫힌 포트 하나 (bind 후 바로 닫음 → connect 하면 거절) */
+static unsigned closed_port(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(s, (struct sockaddr *)&a, sizeof(a));
+    socklen_t l = sizeof(a);
+    getsockname(s, (struct sockaddr *)&a, &l);
+    close(s);
+    return ntohs(a.sin_port);
+}
+
+/* connect 실패한 백엔드는 "죽음" 표시 → 다음 요청들은 건너뜀. 전부 죽으면 표시를 무시하고 다시 시도 */
+static void test_down_marking(void)
+{
+    char spec[128];
+    unsigned d1 = closed_port(), d2 = closed_port();
+    snprintf(spec, sizeof(spec), "/x/=127.0.0.1:%u,127.0.0.1:%u", d1, d2);
+    rproxy_init(&g_t);
+    g_t.timeout_ms = 200;
+    CHECK_INT(rproxy_add_route(&g_t, spec, NULL), 0);
+    rproxy_route *rt = &g_t.routes[0];
+    CHECK(atomic_load(&rt->backends[0].down_until) == 0);
+
+    char raw[] = "GET /x/a HTTP/1.1\r\nHost: h\r\n\r\n";
+    http_request req;
+    CHECK_INT(http_parse_request(raw, strlen(raw), &req), 0);
+    int keep = 1, status = 0;
+    CHECK_INT(rproxy_handle(&g_t, rt, -1, &req, "1.2.3.4", &keep, &status, 100), 502); /* 둘 다 거절 → 502 (cfd 안 씀) */
+    CHECK(atomic_load(&rt->backends[0].down_until) > 0);
+    CHECK(atomic_load(&rt->backends[1].down_until) > 0);
+    long long first = atomic_load(&rt->backends[0].down_until);
+    CHECK_INT(rproxy_handle(&g_t, rt, -1, &req, "1.2.3.4", &keep, &status, 100), 502); /* 전부 죽음 → 표시 무시하고 다시 시도 */
+    CHECK(atomic_load(&rt->backends[0].down_until) >= first);                       /* 다시 시도했으니 표시 갱신 */
+
+    /* 하나만 죽음: 살아 있는 쪽만 시도하고 죽은 쪽 표시는 그대로 (다시 connect 안 함) */
+    atomic_store(&rt->backends[1].down_until, 0);
+    long long mark = 1LL << 60;                                                     /* 먼 미래 */
+    atomic_store(&rt->backends[0].down_until, mark);
+    rproxy_handle(&g_t, rt, -1, &req, "1.2.3.4", &keep, &status, 100);
+    CHECK(atomic_load(&rt->backends[0].down_until) == mark);                        /* 건너뜀 → 값 안 바뀜 */
+    CHECK(atomic_load(&rt->backends[1].down_until) > 0);                            /* 시도했고 실패 → 표시 */
+}
+
 int main(void)
 {
     test_add_route();
     test_match();
     test_build_request();
     test_response_head();
+    test_down_marking();
     return TEST_REPORT();
 }

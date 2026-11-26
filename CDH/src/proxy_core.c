@@ -17,11 +17,13 @@
 #include <errno.h>      /* errno, ETIMEDOUT */
 #include <string.h>     /* memcpy, memcmp, memmove, memset, memchr, strlen */
 #include <sys/uio.h>    /* struct iovec */
+#include <time.h>       /* clock_gettime, CLOCK_MONOTONIC */
 #include <unistd.h>     /* close */
 
 #define PXY_REQ_HEAD_MAX 12288 /* 상대로 보낼 요청 머리 버퍼 (클라이언트 헤더 최대 8KB + 추가 헤더) */
 #define PXY_RESP_HEAD_MAX 8192 /* 상대 응답 머리 최대 크기 (넘으면 502) */
 #define PXY_RELAY_BUF 16384    /* 본문 중계 버퍼 */
+#define PXY_MAX_1XX 8          /* 진짜 응답 전에 참아 줄 1xx 응답 수 (넘으면 502) */
 
 /* ---- 작은 도우미 ---- */
 
@@ -306,6 +308,26 @@ int pxy_rewrite_response_head(char *out, size_t cap, const char *buf, size_t hea
 
 /* ---- 요청 하나 주고받기 ---- */
 
+static long long mono_ms(void) /* 단조 시계 ms */
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* 다음 recv 를 얼마나 기다릴지. 최저 속도가 꺼져 있으면 resp_to 그대로.
+ * 켜져 있으면 "start 부터 grace + got/rate 초" 안에서 남은 시간과 resp_to 중 작은 값, 이미 넘었으면 -1 (중단) */
+static int rate_wait(const pxy_req_opts *o, long long start, unsigned long long got, int resp_to)
+{
+    if (o->min_rate_bps <= 0)
+        return resp_to;
+    long long allowed = (long long)o->rate_grace_ms + (long long)(got * 1000ULL / (unsigned long long)o->min_rate_bps);
+    long long left = start + allowed - mono_ms();
+    if (left <= 0)
+        return -1;
+    return left < resp_to ? (int)left : resp_to;
+}
+
 int pxy_exchange(int bfd, int cfd, const http_request *req, const pxy_req_opts *o, int backend_timeout_ms,
                  int client_timeout_ms, int *keep, int *status)
 {
@@ -329,12 +351,16 @@ int pxy_exchange(int bfd, int cfd, const http_request *req, const pxy_req_opts *
         return e == ETIMEDOUT ? 504 : 502;
     }
 
-    /* 2. 응답 머리 (1xx 정보 응답은 버리고 다음 머리를 기다림) */
+    /* 2. 응답 머리 (1xx 정보 응답은 버리고 다음 머리를 기다림 — 끝없이 1xx 만 보내는 상대는 PXY_MAX_1XX 에서 502) */
     char rbuf[PXY_RESP_HEAD_MAX];
     size_t used = 0, hlen = 0;
     ssize_t n;
     pxy_resp_info info;
-    for (;;) {
+    for (int round = 0;; round++) {
+        if (round > PXY_MAX_1XX) {
+            close(bfd);
+            return 502;
+        }
         n = tcp_recv_request(bfd, rbuf, sizeof(rbuf), used, resp_to, &hlen);
         if (n < 0) {
             int e = errno;
@@ -393,26 +419,33 @@ int pxy_exchange(int bfd, int cfd, const http_request *req, const pxy_req_opts *
         return -1;                                                         /* 클라이언트가 끊김 */
     }
 
-    /* 5. 나머지 본문 중계: 상대에서 받은 만큼 바로 클라이언트로 (큰 응답도 메모리 16KB 로) */
+    /* 5. 나머지 본문 중계: 상대에서 받은 만큼 바로 클라이언트로 (큰 응답도 메모리 16KB 로).
+     * 받을 때마다 resp_to 가 새로 시작되므로, 최저 속도(o->min_rate_bps)가 켜져 있으면 전체 진척도 따로 본다 */
     char relay[PXY_RELAY_BUF];
     int rc = 0;
+    long long start = mono_ms();                                           /* 최저 속도 계산의 기준 시각 (본문 시작) */
+    unsigned long long got = have;                                        /* 지금까지 중계한 본문 바이트 */
     while (mode == BODY_LENGTH && left > 0) {
+        int wait = rate_wait(o, start, got, resp_to);
         size_t want = left < sizeof(relay) ? (size_t)left : sizeof(relay);
-        ssize_t k = tcp_recv_some(bfd, relay, want, resp_to);
+        ssize_t k = wait < 0 ? -1 : tcp_recv_some(bfd, relay, want, wait);
         if (k <= 0 || tcp_send_all(cfd, relay, (size_t)k, client_timeout_ms) < 0) {
-            rc = -1;                                                       /* 상대가 덜 보내고 닫음/멈춤, 또는 클라이언트 끊김 → 잘린 응답이니 연결 끊기 */
+            rc = -1;                                                       /* 상대가 덜 보내고 닫음/멈춤/너무 느림, 또는 클라이언트 끊김 → 잘린 응답이니 연결 끊기 */
             break;
         }
         left -= (unsigned long long)k;
+        got += (unsigned long long)k;
     }
     while (mode == BODY_EOF) {
-        ssize_t k = tcp_recv_some(bfd, relay, sizeof(relay), resp_to);
+        int wait = rate_wait(o, start, got, resp_to);
+        ssize_t k = wait < 0 ? -1 : tcp_recv_some(bfd, relay, sizeof(relay), wait);
         if (k == 0)                                                        /* 상대가 다 보내고 닫음 = 본문 끝 */
             break;
         if (k < 0 || tcp_send_all(cfd, relay, (size_t)k, client_timeout_ms) < 0) {
             rc = -1;
             break;
         }
+        got += (unsigned long long)k;
     }
     close(bfd);
     return rc;

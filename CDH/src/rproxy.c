@@ -1,7 +1,8 @@
 /* rproxy.c — Reverse Proxy (선언·설명은 include/rproxy.h).
  *
  * 요청 하나의 흐름 (워커 스레드):
- *   1. 라우트의 백엔드를 라운드 로빈으로 고르고 connect (실패하면 다음 백엔드로 넘어감 = 단순 failover)
+ *   1. 라우트의 백엔드를 라운드 로빈으로 고르고 connect (실패하면 다음 백엔드로 넘어감 = 단순 failover,
+ *      실패한 백엔드는 RPROXY_DOWN_MS 동안 건너뜀 = 수동적 헬스 체크)
  *   2. 나머지(요청 전송, 응답 검사·중계)는 proxy_core 의 pxy_exchange
  *
  * 오류 매핑: 백엔드에 연결 못 함 → 502 (모두 타임아웃이면 504). 그 뒤는 pxy_exchange 를 따른다. */
@@ -16,6 +17,14 @@
 #include <netdb.h>      /* getaddrinfo, freeaddrinfo, struct addrinfo */
 #include <string.h>     /* memcpy, memcmp, memset, strchr, strlen, strncmp, strrchr */
 #include <sys/socket.h> /* AF_INET, SOCK_STREAM */
+#include <time.h>       /* clock_gettime, CLOCK_MONOTONIC */
+
+static long long mono_ms(void) /* 단조 시계 ms (시스템 시각이 바뀌어도 거꾸로 가지 않음) */
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* ---- 라우팅 규칙 ---- */
 
@@ -122,6 +131,7 @@ int rproxy_add_route(rproxy_table *t, const char *spec, const char **why)
         }
         if (parse_backend(p, len, &rt->backends[rt->nbackends], why) < 0)
             return -1;
+        atomic_init(&rt->backends[rt->nbackends].down_until, 0);
         rt->nbackends++;
         if (comma == NULL)
             break;
@@ -190,21 +200,33 @@ int rproxy_handle(const rproxy_table *t, rproxy_route *rt, int cfd, const http_r
     int resp_to = t->timeout_ms;                                           /* 백엔드 응답 대기 */
     int conn_to = resp_to < PXY_CONNECT_TIMEOUT_MS ? resp_to : PXY_CONNECT_TIMEOUT_MS;
 
-    /* 백엔드 고르기: 라운드 로빈 시작점부터 차례로, connect 가 되는 첫 백엔드 */
+    /* 백엔드 고르기: 라운드 로빈 시작점부터 차례로, connect 가 되는 첫 백엔드.
+     * 최근에 connect 가 실패한 백엔드는 건너뜀 (전부 그렇다면 표시를 무시하고 모두 시도) */
     unsigned start = atomic_fetch_add(&rt->rr, 1u);                        /* 여러 워커가 동시에 불러도 안전 */
     unsigned nb = (unsigned)rt->nbackends;
-    int bfd = -1, timeouts = 0;
-    const rproxy_backend *be = NULL;
+    long long now = mono_ms();
+    int alive = 0;
+    for (unsigned i = 0; i < nb; i++)
+        alive += atomic_load(&rt->backends[i].down_until) <= now;
+    int bfd = -1, tried = 0, timeouts = 0;
+    rproxy_backend *be = NULL;
     for (unsigned i = 0; i < nb && bfd < 0; i++) {
-        const rproxy_backend *cand = &rt->backends[(start + i) % nb];
+        rproxy_backend *cand = &rt->backends[(start + i) % nb];
+        if (alive > 0 && atomic_load(&cand->down_until) > now)
+            continue;                                                      /* 죽음 표시 → 이번엔 건너뜀 */
+        tried++;
         bfd = tcp_connect(&cand->addr, conn_to);
-        if (bfd >= 0)
+        if (bfd >= 0) {
             be = cand;
-        else if (errno == ETIMEDOUT)
-            timeouts++;
+            atomic_store(&cand->down_until, 0);                            /* 되살아남 */
+        } else {
+            if (errno == ETIMEDOUT)
+                timeouts++;
+            atomic_store(&cand->down_until, mono_ms() + RPROXY_DOWN_MS);   /* 한동안 건너뜀 */
+        }
     }
     if (bfd < 0)
-        return timeouts == rt->nbackends ? 504 : 502;                      /* 전부 응답 없음 → 504, 거절 등 → 502 */
+        return tried > 0 && timeouts == tried ? 504 : 502;                 /* 전부 응답 없음 → 504, 거절 등 → 502 */
 
     /* URI 는 그대로, Host 는 클라이언트 것 (없으면 백엔드 이름으로) */
     pxy_req_opts o = {.target = req->uri, .client_ip = client_ip, .host = be->name, .replace_host = 0};

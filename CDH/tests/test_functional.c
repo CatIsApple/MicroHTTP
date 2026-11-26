@@ -249,6 +249,18 @@ static void backend_loop(int lfd, char id)
         } else if (strcmp(uri, "/api/continue") == 0) {
             const char *r = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
             write_all(c, r, strlen(r));
+        } else if (strcmp(uri, "/api/trickle") == 0) {                /* 1바이트씩 100ms 간격 (최저 속도 검사용) */
+            const char *h = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+            write_all(c, h, strlen(h));
+            for (int i = 0; i < 100; i++) {
+                sleep_ms(100);
+                if (send(c, "x", 1, MSG_NOSIGNAL) != 1)          /* 프록시가 끊으면 멈춤 */
+                    break;
+            }
+        } else if (strcmp(uri, "/api/many1xx") == 0) {                /* 1xx 를 끝없이(20개) 보냄 */
+            for (int i = 0; i < 20; i++)
+                write_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+            write_all(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 40);
         } else if (strcmp(uri, "/api/short") == 0) {
             const char *r = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789";
             write_all(c, r, strlen(r));
@@ -1085,6 +1097,24 @@ int main(void)
             CHECK_INT(status(), 504);
             sleep_ms(1300);                                       /* B 가 slow 처리에서 풀릴 때까지 */
 
+            /* 1바이트씩 흘리는 목적지: 읽을 때마다 -T 는 안 넘지만 최저 속도 미달 → 잘린 채 곧 끊김 */
+            {
+                long long t1 = now_ms();
+                snprintf(req, sizeof(req), "GET http://127.0.0.1:%u/api/trickle HTTP/1.1\r\nHost: t\r\n\r\n", pb);
+                send_str(req);
+                long long dt1 = now_ms() - t1;
+                CHECK_INT(status(), 200);
+                CHECK(!framing_ok());                             /* 100바이트를 다 못 받음 */
+                CHECK(dt1 < 2000);                                /* 끝까지 가면 10초 */
+                if (dt1 >= 2000)
+                    fprintf(stderr, "trickle cut after %lld ms\n", dt1);
+                sleep_ms(300);                                    /* B 가 끊김을 알아챌 때까지 */
+            }
+            /* 1xx 만 계속 보내는 목적지 → 502 */
+            snprintf(req, sizeof(req), "GET http://127.0.0.1:%u/api/many1xx HTTP/1.1\r\nHost: t\r\n\r\n", pb);
+            send_str(req);
+            CHECK_INT(status(), 502);
+
             /* CONNECT 터널: 200 뒤에 보낸 바이트가 그대로 A 에 가고, A 의 응답이 그대로 돌아옴 */
             {
                 int fd = connect_server();
@@ -1136,6 +1166,50 @@ int main(void)
             CHECK_INT(status(), 200);
             send_str("DELETE /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
             CHECK_INT(status(), 501);
+            CHECK(stop_server(2000));
+        }
+
+        /* ---- 터널 수 상한: -t 2 → 터널 최대 1개. 두 번째 CONNECT 는 503 (워커를 다 차지하지 못함) ---- */
+        const char *cextra[] = {"-F", "local", "-T", "300", NULL};
+        if (ba <= 0 || start_server_ex(bin, "2", NULL, cextra) != 0) {
+            CHECK(!"cannot start tunnel-cap server");
+        } else {
+            char req[256];
+            int t1 = connect_server();
+            CHECK(t1 >= 0);
+            snprintf(req, sizeof(req), "CONNECT 127.0.0.1:%u HTTP/1.1\r\nHost: x\r\n\r\n", pa);
+            write_all(t1, req, strlen(req));
+            char got[64] = "";
+            ssize_t gr = read(t1, got, sizeof(got) - 1);           /* 첫 터널 성립 확인 */
+            CHECK(gr > 0 && strncmp(got, "HTTP/1.1 200 ", 13) == 0);
+            send_str(req);                                        /* 두 번째 터널 → 503 */
+            CHECK_INT(status(), 503);
+            send_str("GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n"); /* 남은 워커로 일반 요청은 처리됨 */
+            CHECK_INT(status(), 200);
+            close(t1);
+            sleep_ms(700);                                        /* 터널이 끊김을 알아채고 자리를 비울 때까지 */
+            send_str("GET /style.css HTTP/1.1\r\nHost: t\r\n\r\n");
+            CHECK_INT(status(), 200);
+            CHECK(stop_server(2000));
+        }
+        sleep_ms(300);                                            /* A 가 끊긴 터널 연결을 정리할 때까지 */
+
+        /* ---- -F any: 목적지 제한 (내부 주소 금지 = SSRF 방지, CONNECT 는 443 만) ---- */
+        const char *aextra[] = {"-F", "any", "-T", "300", NULL};
+        if (start_server_ex(bin, NULL, NULL, aextra) != 0) {
+            CHECK(!"cannot start -F any server");
+        } else {
+            char req[256];
+            snprintf(req, sizeof(req), "GET http://127.0.0.1:%u/x HTTP/1.1\r\nHost: t\r\n\r\n", pa);
+            send_str(req);
+            CHECK_INT(status(), 403);                             /* 루프백 목적지 */
+            snprintf(req, sizeof(req), "CONNECT 127.0.0.1:%u HTTP/1.1\r\nHost: x\r\n\r\n", pa);
+            send_str(req);
+            CHECK_INT(status(), 403);
+            send_str("GET http://localhost:6379/ HTTP/1.1\r\nHost: t\r\n\r\n"); /* 이름으로 가리켜도 해석 뒤 검사 */
+            CHECK_INT(status(), 403);
+            send_str("GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: t\r\n\r\n"); /* 클라우드 메타데이터 */
+            CHECK_INT(status(), 403);
             CHECK(stop_server(2000));
         }
         if (ba > 0) {

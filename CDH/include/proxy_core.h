@@ -20,6 +20,11 @@ typedef struct {
     const char *client_ip; /* X-Forwarded-For 에 덧붙일 클라이언트 IP */
     const char *host;      /* Host 값: 클라이언트가 Host 를 안 보냈을 때, 또는 replace_host 일 때 씀 */
     int replace_host;      /* 1 = 클라이언트 Host 를 버리고 host 로 (포워드, RFC 7230 5.4) / 0 = 클라이언트 것 유지 (리버스) */
+    /* 최저 속도 (pxy_exchange 만 씀). 0 = 끔. 믿을 수 없는 상대(포워드 목적지)가 1바이트씩 흘려
+     * 워커를 영원히 붙잡지 못하게: 응답 시작부터 경과 시간이 rate_grace_ms + (받은 바이트 / min_rate_bps) 초를
+     * 넘으면 중단한다 (받을 때마다 다시 시작되는 timeout 만으로는 못 막음) */
+    int min_rate_bps;      /* 최저 평균 속도 (바이트/초) */
+    int rate_grace_ms;     /* 처음 이만큼은 속도를 따지지 않음 */
 } pxy_req_opts;
 
 /* 상대 서버로 보낼 요청 머리를 out 에 쓴다 (본문은 따로 보냄):

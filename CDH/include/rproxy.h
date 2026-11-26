@@ -26,10 +26,12 @@
 #define RPROXY_PREFIX_MAX 256            /* prefix 최대 길이 ('\0' 포함) */
 #define RPROXY_NAME_MAX 300              /* "host:port" 원문 최대 길이 ('\0' 포함) */
 #define RPROXY_DEFAULT_TIMEOUT_MS 10000  /* 백엔드 응답 기다리는 시간 기본값 (-T 로 변경) */
+#define RPROXY_DOWN_MS 5000              /* connect 에 실패한 백엔드를 건너뛰는 시간 (그 뒤 다시 시도) */
 
 typedef struct {
     char name[RPROXY_NAME_MAX]; /* 규칙에 적힌 "host:port" 그대로 (로그, Host 헤더가 없는 요청의 Host 값) */
     struct sockaddr_in addr;    /* 시작할 때 한 번 해석해 둔 주소 (요청마다 DNS 조회 안 함) */
+    atomic_llong down_until;    /* 이 시각(단조 시계 ms)까지는 죽은 것으로 보고 건너뜀. 0 = 정상 (여러 워커가 원자적으로 읽고 씀) */
 } rproxy_backend;
 
 typedef struct {
@@ -60,6 +62,8 @@ rproxy_route *rproxy_match(rproxy_table *t, const char *uri);
 
 /* 요청 하나를 라우트의 백엔드로 전달하고 응답을 클라이언트(cfd)에 중계한다 (워커 스레드에서 호출).
  * 백엔드 선택: 라운드 로빈, connect 가 실패하면 다음 백엔드로 (모두 실패하면 502, 모두 타임아웃이면 504).
+ * connect 에 실패한 백엔드는 RPROXY_DOWN_MS 동안 건너뛴다 (모든 요청이 죽은 백엔드의 connect 시간을 물지 않게).
+ * 라우트의 백엔드가 전부 "죽음" 표시면 표시를 무시하고 다 시도한다 (되살아났는지 확인).
  * 나머지(*keep, *status, 반환값)는 pxy_exchange 와 같음: 0 = 다 중계, >0 = 이 코드로 오류 응답, -1 = 연결 끊기 */
 int rproxy_handle(const rproxy_table *t, rproxy_route *rt, int cfd, const http_request *req,
                   const char *client_ip, int *keep, int *status, int client_timeout_ms);

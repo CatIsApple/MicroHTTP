@@ -13,22 +13,35 @@
  *      → host 에 연결, "200 Connection Established" 를 보낸 뒤 양쪽 바이트를 그대로 넘겨 준다 (터널)
  *
  * 보안: 아무나 쓰는 프록시(open proxy)는 스팸·공격의 경유지가 된다 → 기본은 로컬(127.x) 클라이언트만 허용.
+ *   -F any 일 때는 목적지도 제한한다 (SSRF 방지): 루프백·사설망·링크 로컬 등 내부 주소 금지, CONNECT 는 443 만.
+ * 자원 보호 (워커 스레드를 오래 붙잡는 일 막기):
+ *   - 동시 터널 수 상한 (max_tunnels, 넘으면 503)
+ *   - 이름 해석(DNS)은 별도 스레드에서 하고 FPROXY_DNS_TIMEOUT_MS 만 기다림 (넘으면 504, 진행 중 해석이 많으면 503)
+ *   - 목적지 응답 본문은 최저 속도(FPROXY_MIN_RATE_BPS) 아래로 떨어지면 끊음 (1바이트씩 흘리는 서버 대비)
  * 접두사: fproxy_ */
 
 #ifndef FPROXY_H /* 인클루드 가드 */
 #define FPROXY_H
 
 #include "http_parser.h" /* http_request, HTTP_MAX_URI_LEN */
+#include <netinet/in.h>  /* struct sockaddr_in */
+#include <stdatomic.h>   /* atomic_int (동시 터널 수) */
 #include <stddef.h>      /* size_t */
 
 #define FPROXY_HOST_MAX 256              /* 호스트 이름 최대 길이 ('\0' 포함) */
 #define FPROXY_DEFAULT_TIMEOUT_MS 10000  /* 목적지 응답 기다리는 시간 기본값 (-T 로 변경) */
 #define FPROXY_TUNNEL_IDLE_MS 60000      /* CONNECT 터널에서 양쪽 다 조용하면 닫는 시간 */
+#define FPROXY_DEFAULT_MAX_TUNNELS 8     /* 동시 터널 수 기본 상한 (main 이 워커 수의 절반으로 다시 정함) */
+#define FPROXY_DNS_TIMEOUT_MS 3000       /* 이름 해석을 기다리는 최대 시간 */
+#define FPROXY_MAX_DNS 32                /* 동시에 진행 중인 이름 해석 수 상한 (해석 스레드 수 상한) */
+#define FPROXY_MIN_RATE_BPS 1024         /* 목적지 응답 본문 최저 평균 속도 (바이트/초, 처음 timeout_ms 동안은 봐줌) */
 
 typedef struct {
     int any_client;     /* 1 = 모든 클라이언트 허용 (-F any) / 0 = 127.x 만 (-F local) */
     int timeout_ms;     /* 목적지 응답 타임아웃 (머리가 올 때까지 / 본문 조각 사이) */
     int tunnel_idle_ms; /* 터널 무활동 타임아웃 */
+    int max_tunnels;    /* 동시 터널 수 상한 (터널 하나 = 워커 하나를 끝날 때까지 점유) */
+    atomic_int tunnels; /* 지금 열린 터널 수 (여러 워커가 원자적으로 증감) */
 } fproxy_config;
 
 /* 요청 대상을 쪼갠 결과 */
@@ -55,8 +68,13 @@ int fproxy_parse_authority(const char *uri, fproxy_target *t);
 /* 이 클라이언트 IP 가 프록시를 써도 되는지 (안 되면 403) */
 int fproxy_client_allowed(const fproxy_config *cfg, const char *client_ip);
 
+/* 해석된 목적지로 연결해도 되는지 (안 되면 403). -F local 이면 항상 1 (로컬 사용자는 원래 내부망에 닿음).
+ * -F any 면: 0.0.0.0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16, 224/4 이상 금지,
+ *            is_connect 면 포트 443 만 허용 */
+int fproxy_dest_allowed(const fproxy_config *cfg, const struct sockaddr_in *addr, int is_connect);
+
 /* absolute-form 요청 하나를 목적지로 전달하고 응답을 중계한다 (워커 스레드에서 호출).
- * 반환·*keep·*status: pxy_exchange 와 같음 (0 = 다 중계, >0 = 이 코드로 오류 응답(400/502/504), -1 = 연결 끊기) */
+ * 반환·*keep·*status: pxy_exchange 와 같음 (0 = 다 중계, >0 = 이 코드로 오류 응답(400/403/502/503/504), -1 = 연결 끊기) */
 int fproxy_handle(const fproxy_config *cfg, int cfd, const http_request *req, const char *client_ip, int *keep,
                   int *status, int client_timeout_ms);
 
@@ -65,9 +83,9 @@ int fproxy_handle(const fproxy_config *cfg, int cfd, const http_request *req, co
  * should_stop(arg) 이 1 이면 (서버 종료 중) 터널을 닫는다. NULL 이면 무시
  * *bytes: 양방향으로 넘긴 총 바이트 (로그용)
  * 반환: 0  = 터널을 열었고 끝남 (연결은 닫아야 함)
- *       >0 = 아직 아무것도 안 보냄 → 이 상태 코드로 오류 응답 (400 / 502 / 504)
+ *       >0 = 아직 아무것도 안 보냄 → 이 상태 코드로 오류 응답 (400 / 403 / 502 / 503(터널 수 상한) / 504)
  *       -1 = 200 을 보내지 못함 (클라이언트 끊김) */
-int fproxy_tunnel(const fproxy_config *cfg, int cfd, const http_request *req, const char *pre, size_t pre_len,
+int fproxy_tunnel(fproxy_config *cfg, int cfd, const http_request *req, const char *pre, size_t pre_len,
                   int client_timeout_ms, int (*should_stop)(void *), void *arg, unsigned long long *bytes);
 
 #endif /* FPROXY_H */

@@ -8,7 +8,8 @@
 #include "http_parser.h" /* http_parse_request */
 #include "proxy_core.h"  /* pxy_build_request (replace_host) */
 #include "test.h"        /* CHECK, CHECK_INT, CHECK_STR, TEST_REPORT */
-#include <string.h>      /* strstr, strlen, strcpy */
+#include <arpa/inet.h>   /* inet_pton, htons */
+#include <string.h>      /* strstr, strlen, strcpy, memset */
 
 static void test_is_absolute(void)
 {
@@ -101,6 +102,51 @@ static void test_client_allowed(void)
     CHECK(!fproxy_client_allowed(&cfg, NULL));
     cfg.any_client = 1;
     CHECK(fproxy_client_allowed(&cfg, "10.0.0.1"));
+    CHECK_INT(cfg.max_tunnels, FPROXY_DEFAULT_MAX_TUNNELS);
+}
+
+static struct sockaddr_in addr_of(const char *ip, unsigned port)
+{
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    inet_pton(AF_INET, ip, &a.sin_addr);
+    return a;
+}
+
+/* -F any 일 때 목적지 제한 (SSRF 방지). -F local 은 제한 없음 */
+static void test_dest_allowed(void)
+{
+    fproxy_config cfg;
+    fproxy_init(&cfg);
+    struct sockaddr_in lo = addr_of("127.0.0.1", 6379);
+    CHECK(fproxy_dest_allowed(&cfg, &lo, 1));                     /* local: 로컬 사용자는 원래 내부망에 닿음 */
+
+    cfg.any_client = 1;
+    const char *blocked[] = {"0.0.0.0", "10.1.2.3", "100.64.0.1", "100.127.255.255", "127.0.0.1", "127.9.9.9",
+                             "169.254.169.254", "172.16.0.1", "172.31.255.255", "192.168.0.1", "224.0.0.1",
+                             "255.255.255.255"};
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        struct sockaddr_in a = addr_of(blocked[i], 80);
+        int r = fproxy_dest_allowed(&cfg, &a, 0);
+        CHECK_INT(r, 0);
+        if (r != 0)
+            fprintf(stderr, "allowed internal dest: %s\n", blocked[i]);
+    }
+    const char *open[] = {"8.8.8.8", "93.184.216.34", "100.63.255.255", "100.128.0.1", "172.15.0.1", "172.32.0.1",
+                          "192.167.0.1", "11.0.0.1"};
+    for (size_t i = 0; i < sizeof(open) / sizeof(open[0]); i++) {
+        struct sockaddr_in a = addr_of(open[i], 80);
+        int r = fproxy_dest_allowed(&cfg, &a, 0);
+        CHECK_INT(r, 1);
+        if (r != 1)
+            fprintf(stderr, "refused public dest: %s\n", open[i]);
+    }
+    struct sockaddr_in pub443 = addr_of("8.8.8.8", 443), pub25 = addr_of("8.8.8.8", 25);
+    CHECK(fproxy_dest_allowed(&cfg, &pub443, 1));                 /* CONNECT 는 443 만 */
+    CHECK(!fproxy_dest_allowed(&cfg, &pub25, 1));                 /* SMTP 중계 금지 */
+    CHECK(fproxy_dest_allowed(&cfg, &pub25, 0));                  /* absolute-form 은 포트 제한 없음 */
 }
 
 /* 포워드용 다시 쓰기: 요청 줄은 origin-form, Host 는 대상 것으로, Proxy-* 헤더 제거 */
@@ -135,6 +181,7 @@ int main(void)
     test_parse_absolute();
     test_parse_authority();
     test_client_allowed();
+    test_dest_allowed();
     test_build_forward();
     return TEST_REPORT();
 }

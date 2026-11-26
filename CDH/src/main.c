@@ -196,11 +196,13 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
                             "  -P  reverse proxy route: requests whose path starts with prefix go to the backends\n"
                             "      (round-robin, next backend on connect failure). Longest prefix wins.\n"
                             "  -F  forward proxy: \"GET http://host/...\" and \"CONNECT host:port\" go where the client asks.\n"
-                            "      local = only 127.x clients (default choice), any = everyone (open proxy, be careful)\n",
+                            "      local = only 127.x clients (default choice), any = everyone; then internal destinations\n"
+                            "      are refused and CONNECT is limited to port 443. Tunnels are capped at threads/2.\n",
                     argv[0], MAX_THREADS, DEFAULT_THREADS, DEFAULT_IDLE_MS, RPROXY_DEFAULT_TIMEOUT_MS);
             return EXIT_FAILURE;                                      /* 종료 코드 1 */
         }
     }
+    fproxy.max_tunnels = threads / 2 > 0 ? (int)(threads / 2) : 1; /* 터널은 워커의 절반까지만 (나머지는 일반 요청용) */
 
     if (install_signal_handlers() < 0) { /* Ctrl+C·kill 처리, SIGPIPE 무시 등록 (스레드를 만들기 전에) */
         perror("sigaction");
@@ -269,8 +271,8 @@ int main(int argc, char *argv[]) /* argc: 인자 개수, argv: 인자 문자열 
         printf(" (timeout %d ms)\n", rproxy.timeout_ms);
     }
     if (forward_on)
-        printf("forward proxy on (%s clients, timeout %d ms)\n", fproxy.any_client ? "all" : "127.x only",
-               fproxy.timeout_ms);
+        printf("forward proxy on (%s clients, timeout %d ms, max %d tunnels)\n", fproxy.any_client ? "all" : "127.x only",
+               fproxy.timeout_ms, fproxy.max_tunnels);
     fflush(stdout);
 
     struct pollfd pfd[2] = {                         /* 메인 스레드가 기다리는 두 가지 */

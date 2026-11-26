@@ -26,7 +26,7 @@ typedef struct {
     thread_pool *pool;      /* 워커 풀 (부하 판단·poller 에서 되돌려 보낼 곳) */
     idle_poller *idle;      /* 쉬는 연결을 맡길 곳 */
     rproxy_table *rproxy;   /* Reverse Proxy 라우트 (-P). NULL 이면 없음. 라운드 로빈 카운터만 원자적으로 바뀜 */
-    const fproxy_config *fproxy; /* Forward Proxy 설정 (-F). NULL 이면 꺼짐 (absolute-form 은 정적 파일, CONNECT 는 501) */
+    fproxy_config *fproxy;  /* Forward Proxy 설정 (-F). NULL 이면 꺼짐 (absolute-form 은 정적 파일, CONNECT 는 501). 터널 수만 원자적으로 바뀜 */
 } server_ctx;
 
 /* tp_job_fn: 워커에서 호출. job->fd 의 소유권을 받는다 → 끝날 때 close 하거나 idle poller 에 넘긴다.
