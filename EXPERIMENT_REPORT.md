@@ -4,6 +4,8 @@
 실제로 실행한 결과만 적고, 실행하지 않은 것은 "미실행"으로 표시합니다.
 원시 결과 파일은 [docs/results/](docs/results/)에 있습니다.
 
+> 테스트 계정 이름은 발표 가독성을 위해 `alice`/`bob`에서 `userA`/`userB`로 바꿨습니다. `docs/results/`의 원시 기록은 실제 실행 당시 출력이라 옛 이름 그대로 두었습니다.
+
 ## 공통 환경
 
 | 항목 | 값 |
@@ -171,15 +173,15 @@ python3 tests/functional/test_server.py auth         # 인증 기능 테스트 6
 | 단계 | Session ID 방식 (`./server`) | fd 방식 (`build/server_fd_demo`) |
 |---|---|---|
 | 1) A 로그인 | 303 `logged in` | 200 `logged in (fd demo)` |
-| 2) **B: 자격 증명 없이 /me** | **401** `not logged in` | **200 `user: alice (identified by fd 5)`** |
-| 3) A: 새 연결로 /me | 200 `user: alice` (Cookie) | 200 (우연히 같은 fd) |
+| 2) **B: 자격 증명 없이 /me** | **401** `not logged in` | **200 `user: userA (identified by fd 5)`** |
+| 3) A: 새 연결로 /me | 200 `user: userA` (Cookie) | 200 (우연히 같은 fd) |
 
 인증 기능 테스트(`tests/functional/test_server.py`, 6개 모두 PASS):
-로그인 후 **새 TCP 연결 3개**에서 같은 Cookie로 200 · Cookie 없음/틀린 비밀번호/없는 사용자/한 글자 바꾼 ID/형식만 맞춘 ID/`user=alice; logged_in=true; role=admin` 위조 Cookie 모두 401 ·
+로그인 후 **새 TCP 연결 3개**에서 같은 Cookie로 200 · Cookie 없음/틀린 비밀번호/없는 사용자/한 글자 바꾼 ID/형식만 맞춘 ID/`user=userA; logged_in=true; role=admin` 위조 Cookie 모두 401 ·
 로그아웃 후 옛 Cookie 401 · 재로그인 시 새 ID 발급·이전 ID 401 · **하나의 keep-alive 연결 안에서도 Cookie 없는 요청은 401, 다른 사용자 Cookie면 그 사용자** · 서버 로그에 Session ID 없음.
 
 ### 해석
-- fd 방식에서 B는 아무것도 보내지 않았는데 alice가 되었습니다. fd는 "지금 이 순간의 연결 번호"일 뿐 사람을 가리키지 않습니다.
+- fd 방식에서 B는 아무것도 보내지 않았는데 userA가 되었습니다. fd는 "지금 이 순간의 연결 번호"일 뿐 사람을 가리키지 않습니다.
 - 반대로 연결이 닫힐 때 fd 표를 지우면 이 사고는 막지만, A가 새 연결로 오는 순간 로그인이 풀립니다. 어느 쪽이든 fd는 식별자가 될 수 없습니다.
 
 ### 한계
@@ -194,7 +196,7 @@ python3 tests/functional/test_server.py auth         # 인증 기능 테스트 6
 - 설계: 조회할 때 만료면 그 자리에서 삭제하고 갱신하지 않음(Passive, `session_lookup`) + main의 accept 루프가 1초마다 `session_expire()`(Active).
   이 서버는 이벤트 루프가 없는 스레드 풀 구조라, 지침의 "기존 이벤트 루프 활용" 대신 **이미 1초마다 깨어나는 accept 루프의 `poll(1000ms)`**를 타이머로 썼습니다(지침과의 차이, IMPLEMENTATION_REPORT 10절).
 - 단위 테스트(`test_session.c`, 시각을 인자로 주입): Idle 59초 사용 → 갱신, 60초 미사용 → 만료 · Absolute는 계속 써도 300초에 만료 · **만료 시점의 조회가 수명을 늘리지 않음** · Active 정리 개수 정확.
-- 실서버 (`docs/results/step2_expiration.txt`, `-I 3`): Session 6개(alice 5 + bob 1), bob만 t=2s에 사용 → **요청 없이** 로그에 `expired 2, remaining 4` → `expired 3, remaining 1` → `expired 1, remaining 0`, 만료 후 bob의 `/me` 401.
+- 실서버 (`docs/results/step2_expiration.txt`, `-I 3`): Session 6개(userA 5 + userB 1), userB만 t=2s에 사용 → **요청 없이** 로그에 `expired 2, remaining 4` → `expired 3, remaining 1` → `expired 1, remaining 0`, 만료 후 userB의 `/me` 401.
 - 한계: Active 정리는 main 스레드에서 돌기 때문에, 큐가 가득 차 `queue_push`가 기다리는 동안은 정리가 늦어집니다. 정리 자체는 저장소 락을 잡으므로 Session이 매우 많으면 그동안 조회가 기다립니다(연결 리스트 O(n)).
 
 ### 2-2. Use-After-Free 재현 → 수정 전후 비교

@@ -14,7 +14,7 @@ trap 'kill $BP $FP 2>/dev/null; wait 2>/dev/null' EXIT
 sleep 0.5
 
 login() {  # login <port> → sid 출력, 헤더는 /tmp/step3_headers
-    curl -s -o /dev/null -D /tmp/step3_headers -d 'username=alice&password=alice-test-pw' http://127.0.0.1:$1/login
+    curl -s -o /dev/null -D /tmp/step3_headers -d 'username=userA&password=userA-test-pw' http://127.0.0.1:$1/login
     sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p' /tmp/step3_headers | tr -d '\r'
 }
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }

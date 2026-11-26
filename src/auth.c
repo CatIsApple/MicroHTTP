@@ -76,7 +76,7 @@ static int hex_digit(char c)
 }
 
 /*
- * application/x-www-form-urlencoded 본문 "username=alice&password=p%40ss"에서 name의 값을 꺼냅니다.
+ * application/x-www-form-urlencoded 본문 "username=userA&password=p%40ss"에서 name의 값을 꺼냅니다.
  * '+'는 공백, %XX는 바이트로 풉니다. 찾으면 1, 없거나 너무 길거나 잘못된 인코딩이면 0.
  */
 static int form_value(const unsigned char *body, size_t length, const char *name,

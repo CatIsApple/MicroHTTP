@@ -303,12 +303,12 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
 - **What**: TCP 연결은 바이트를 나르는 통로이고, Session은 "누가 로그인했는가"라는 서버 측 상태입니다. 둘을 잇는 것은 클라이언트가 매 요청에 실어 보내는 Cookie의 Session ID입니다.
 - **Why**: HTTP는 요청마다 독립적(Stateless)이고, 연결은 수시로 닫히고 새로 열립니다. 로그인 상태를 연결에 묶으면 새 연결에서 로그인이 풀리거나, 다른 사람이 그 연결 번호를 물려받습니다.
 - **How**: 로그인 성공 → `session_create`가 256비트 난수 ID를 만들어 저장소에 넣음 → `Set-Cookie: sid=…` → 브라우저가 이후 모든 요청에 `Cookie: sid=…` → `session_lookup`이 ID로 사용자를 찾음. 연결(fd)은 어디에도 쓰지 않습니다.
-- **Without**: `build/server_fd_demo`(fd로 식별)에서 A가 로그인하고 연결을 닫자, 아무 자격 증명도 없는 B가 같은 fd 5를 받아 `user: alice`로 인증됨(`docs/results/step1_fd_reuse.md`).
+- **Without**: `build/server_fd_demo`(fd로 식별)에서 A가 로그인하고 연결을 닫자, 아무 자격 증명도 없는 B가 같은 fd 5를 받아 `user: userA`로 인증됨(`docs/results/step1_fd_reuse.md`).
 - **Code**: `src/session.c` `session_create`/`session_lookup`, `src/auth.c` `auth_handle_request`/`cookie_session_id`, `src/http.c` `http_find_header`
 - 테스트: `test_auth_is_per_request_not_per_connection`(한 연결 안에서도 요청마다 판단), `test_auth_login_cookie_attributes_and_new_connections`
 
 **확인 질문**
-- keep-alive 연결 하나로 alice와 bob이 번갈아 요청하면 서버는 누구로 응답하는가? 근거가 되는 테스트는?
+- keep-alive 연결 하나로 userA와 userB이 번갈아 요청하면 서버는 누구로 응답하는가? 근거가 되는 테스트는?
 - fd 표를 연결이 닫힐 때 지우면 FD 재사용 사고는 막힌다. 그런데도 fd가 식별자로 부적합한 이유는?
 
 ## 14. Cookie 속성과 Session ID (인증 STEP 1·4·5)
@@ -316,7 +316,7 @@ Code 항목의 함수는 모두 실제로 존재하며, 흐름은 [CODE_FLOW.md]
 - **What**: `HttpOnly`(JavaScript가 못 읽음), `SameSite=Lax`(다른 사이트에서 시작된 POST 등에 안 실림), `Path=/`, `Secure`(HTTPS에서만 전송 — 이 서버는 아직 미적용).
 - **Why**: Session ID를 가진 사람이 곧 그 사용자이므로, ID는 추측할 수 없어야 하고(CSPRNG), 새어 나가기 어려워야 하며(HttpOnly, 로그에 미기록), 로그인 때마다 바뀌어야 합니다(Session 고정 방지).
 - **How**: `randombytes_buf` 32바이트 → 16진수 64자. 조회 전 형식 검사, `sodium_memcmp` 상수 시간 비교. 비밀번호는 argon2id 해시(`crypto_pwhash_str_verify`)로만 비교.
-- **Without**: 순번 ID면 남의 ID를 추측, `user=alice; logged_in=true` 같은 Cookie를 믿으면 누구나 위조(기능 테스트에서 401 확인).
+- **Without**: 순번 ID면 남의 ID를 추측, `user=userA; logged_in=true` 같은 Cookie를 믿으면 누구나 위조(기능 테스트에서 401 확인).
 - **한계**: HTTPS와 Cookie 속성은 **이미 탈취된** ID의 재사용은 막지 못합니다. 만료 시간을 짧게 두는 것이 피해 범위를 줄이는 방법입니다.
 - **Code**: `src/session.c` `session_create`, `valid_id`; `src/auth.c` `COOKIE_ATTRIBUTES`, `check_password`; `tools/hashpw.c`
 

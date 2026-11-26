@@ -17,14 +17,14 @@ static void test_create_lookup_destroy(void)
     session_clear();
     session_set_timeouts(60, 600);
     char a[SESSION_ID_LENGTH + 1], b[SESSION_ID_LENGTH + 1];
-    assert(session_create("alice", 1000, a) == 0);
-    assert(session_create("alice", 1000, b) == 0);
+    assert(session_create("userA", 1000, a) == 0);
+    assert(session_create("userA", 1000, b) == 0);
     assert(strlen(a) == SESSION_ID_LENGTH && strcmp(a, b) != 0); /* 같은 사용자라도 매번 다른 난수 ID */
     assert(session_count() == 2);
 
     SessionInfo info;
     assert(session_lookup(a, 1010, &info) == 1);
-    assert(strcmp(info.user, "alice") == 0 && info.created == 1000 && info.last_seen == 1010);
+    assert(strcmp(info.user, "userA") == 0 && info.created == 1000 && info.last_seen == 1010);
 
     assert(session_destroy(a) == 1);
     assert(session_lookup(a, 1011, &info) == 0);                /* 로그아웃한 ID는 다시 못 씀 */
@@ -39,7 +39,7 @@ static void test_invalid_ids(void)
     memset(forged, 'a', SESSION_ID_LENGTH);
     forged[SESSION_ID_LENGTH] = '\0';
     assert(session_lookup(forged, 1000, &info) == 0);           /* 형식은 맞지만 없는 ID */
-    assert(session_lookup("alice", 1000, &info) == 0);          /* 사용자 이름을 ID처럼 */
+    assert(session_lookup("userA", 1000, &info) == 0);          /* 사용자 이름을 ID처럼 */
     assert(session_lookup("", 1000, &info) == 0);
     forged[10] = 'G';
     assert(session_lookup(forged, 1000, &info) == 0);           /* 16진수가 아닌 문자 */
@@ -57,14 +57,14 @@ static void test_idle_and_absolute_timeout(void)
     SessionInfo info;
 
     /* Idle: 마지막 사용 후 60초 */
-    assert(session_create("bob", 1000, id) == 0);
+    assert(session_create("userB", 1000, id) == 0);
     assert(session_lookup(id, 1059, &info) == 1);                /* 59초 뒤 사용 → 갱신 */
     assert(session_lookup(id, 1118, &info) == 1);                /* 갱신 덕분에 아직 유효 */
     assert(session_lookup(id, 1178, &info) == 0);                /* 60초 동안 사용 안 함 → 만료 */
     assert(session_count() == 0);                                /* Passive Expiration: 조회하면서 지움 */
 
     /* Absolute: 계속 써도 생성 후 300초면 끝 */
-    assert(session_create("bob", 2000, id) == 0);
+    assert(session_create("userB", 2000, id) == 0);
     for (time_t t = 2050; t < 2300; t += 50) assert(session_lookup(id, t, &info) == 1);
     assert(session_lookup(id, 2300, &info) == 0);
 }

@@ -44,7 +44,7 @@ for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:18200/ && break; 
 python3 tests/functional/edge_probe.py 18200 > /tmp/probe.log 2>&1; PROBE=$?
 grep -E 'FAIL|passed' /tmp/probe.log
 # 인증 경로도 Valgrind 아래에서: 로그인 → /me → 로그아웃 → /me
-SID=$(curl -s -o /dev/null -D - -d 'username=alice&password=alice-test-pw' http://127.0.0.1:18200/login | tr -d '\r' | sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p')
+SID=$(curl -s -o /dev/null -D - -d 'username=userA&password=userA-test-pw' http://127.0.0.1:18200/login | tr -d '\r' | sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p')
 AUTH="$(curl -s -o /dev/null -w '%{http_code}' -b sid=$SID http://127.0.0.1:18200/me) $(curl -s -o /dev/null -w '%{http_code}' -d '' -b sid=$SID http://127.0.0.1:18200/logout) $(curl -s -o /dev/null -w '%{http_code}' -b sid=$SID http://127.0.0.1:18200/me)"
 echo "auth under valgrind (me logout me): $AUTH"
 [ "$AUTH" = "200 200 401" ] && result PASS "auth flow under valgrind" || result FAIL "auth flow under valgrind ($AUTH)"

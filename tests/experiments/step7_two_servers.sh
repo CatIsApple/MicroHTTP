@@ -13,7 +13,7 @@ RR=127.0.0.1:18841,127.0.0.1:18842
 ./server -p 18840 -r ./www -R /login=$RR -R /logout=$RR -R /me=$RR 2>/dev/null & P=$!
 trap 'kill $A $B $P 2>/dev/null; wait 2>/dev/null' EXIT
 sleep 0.5
-sid() { curl -s -o /dev/null -D - -d 'username=alice&password=alice-test-pw' "$1" | tr -d '\r' | sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p'; }
+sid() { curl -s -o /dev/null -D - -d 'username=userA&password=userA-test-pw' "$1" | tr -d '\r' | sed -n 's/^Set-Cookie: sid=\([0-9a-f]*\);.*/\1/p'; }
 code() { curl -s -o /dev/null -w '%{http_code}' -b "sid=$1" "$2"; }
 
 SID=$(sid http://127.0.0.1:18841/login)
